@@ -96,10 +96,12 @@ Acceptance rate and output identity are the meaningful signals.
 | PTI — SSQ HIP kernel (projected) | ~42 | **2.00×** | fused weight load |
 | PTI + MTP (projected) | ~75–85 | **~3.6–4.0×** | fused + Qwen3.6 MTP k=2 |
 
-The gap from 1.38× (llama.cpp) to 2× (SSQ kernel): llama.cpp reads A and B KV
-caches separately. The SSQ HIP kernel shares one HBM weight load for both
-matmuls — on bandwidth-bound hardware, that's the bottleneck, and it's already
-shared.
+**The 1.38× → 2× gap** comes from duplicate KV cache reads — A and B each read
+their full KV history per attention layer, even though their KV is identical for
+all accepted positions. Fix: register each accepted token under both `seq_id 0`
+and `seq_id 1` simultaneously so the shared prefix is stored and read once.
+Projected gain after this fix: ~1.7–1.8× on llama.cpp. The SSQ HIP kernel
+reaches the full 2× by fusing both matmuls behind a single HBM weight load.
 
 ---
 

@@ -262,11 +262,49 @@ NVIDIA: nvcc  -O3 -arch=sm_89 -x cu     -o pti_test pti_kernel.hip
 
 The gap from 1.38× to 2×: llama.cpp reads two separate KV caches per step (A and B). The SSQ HIP kernel eliminates this by fusing both matmuls behind one HBM weight load — weight bandwidth is the bottleneck, and it's shared.
 
+---
+
+## The 1.38× → 2× Gap: Root Cause and Fix
+
+### What's costing us
+
+Each dual-batch decode step runs twice for:
+1. **KV cache reads** — for every attention layer, seq 0 reads its full KV history
+   and seq 1 reads its own. These are separate HBM reads on identical data for
+   all positions up to `pos_a - 1`.
+2. **Softmax + logit projection** — computed for both sequences.
+
+The weights are already shared (one load). KV for the shared prefix is the waste.
+
+### Fix: shared-prefix KV via dual seq_id assignment
+
+A and B have identical KV for every token from position 0 through `pos_a - 1`.
+The divergence is only at the most recent 1–2 positions. If each token is
+registered under **both** seq_id 0 and seq_id 1 simultaneously, llama.cpp's
+attention naturally reads the shared KV once and serves both sequences:
+
+```c
+// Prefill and every accepted token: write to BOTH sequences at the same position
+batch_add(&batch, tok, pos, 0, false);
+batch_add(&batch, tok, pos, 1, false);  // same pos, both seq_ids
+```
+
+This means:
+- Shared prefix KV is stored once (not copied)
+- Attention reads it once and fan-outs to both decode heads
+- Only the diverged tail (pos_a and pos_b) has separate KV entries
+
+Combined with the 2-token-per-accept emit, this should push measured throughput
+toward ~1.7–1.8× baseline on llama.cpp, closing most of the remaining gap to 2×.
+
+The irreducible floor: the diverged tail (1–2 positions) and the separate softmax
+passes. The SSQ HIP kernel eliminates even these by fusing into a single pass.
+
 ### Not yet built
+- Shared-prefix KV via dual seq_id (next step — see above)
 - Full inference loop using pti_kernel.hip (kernel exists, loop not wired)
 - MTP-aware PTI loop (Qwen3.6 MTP heads)
 - TSQ side-car benchmark (TSQ-* GGUF files exist in ../gguf/)
-- KV cache packing for dual-session (SSQ applied to K/V tensors)
 
 ---
 
@@ -275,5 +313,6 @@ The gap from 1.38× to 2×: llama.cpp reads two separate KV caches per step (A a
 1. **Acceptance rate**: 100% greedy on identical twins — proved on Qwen3-1.7B, Qwen3.5-0.8B, Qwen3.6-27B
 2. **Output identity**: PTI output identical to baseline greedy — proved on text, SVG, and GGUF 27B
 3. **Measured throughput**: 28.9 tok/s PTI vs 21.1 tok/s baseline on Qwen3.6-27B Q5_K_M MI50 (1.38×)
+4. **KV sharing**: registering each accepted token under both seq_ids eliminates duplicate KV reads for the shared prefix — next optimization step
 4. **2× gap explained**: llama.cpp dual-KV overhead; fused SSQ HIP kernel eliminates it → true 2×
 5. **CUDA portability**: pti_kernel.hip compiles for both AMD (hipcc) and NVIDIA (nvcc -x cu)
