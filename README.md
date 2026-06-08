@@ -96,7 +96,7 @@ Acceptance rate and output identity are the meaningful signals.
 | Baseline | UD-Q6_K_XL | 19.4 | 1.00× | single stream |
 | PTI — llama.cpp | UD-Q6_K_XL | **30.5** | **1.57×** | 2 tokens per accept |
 | PTI — SSQ HIP kernel | any Q8 | ~42 | **2.00×** | fused weight load (projected) |
-| PTI + MTP (llama.cpp, 3-seq) | UD-Q6_K_XL | ~33 | **~1.7×** | triple-batch overhead reduces gain (C++) |
+| PTI + MTP (llama.cpp, 3-seq) | UD-Q6_K_XL | **33.9** | **1.75×** | triple-batch, 3 tokens/accept (C++) |
 | PTI + MTP (SSQ kernel) | UD-Q6_K_XL | ~65 | **~3.4×** | fused kernel + MTP k=1 |
 
 The UD-Q6_K_XL has `nextn_predict_layers=1` (MTP head present). PTI on this model
@@ -130,7 +130,7 @@ On bandwidth-bound hardware (MI50, 1 TB/s HBM2), all compute overhead is hidden.
 | ② PTI — llama.cpp | 2 per accept | **1.38–1.57×** | ✓ measured: 28.9 / 30.5 tok/s |
 | ② PTI — SSQ kernel | 1 + accept | **2.00×** | ✓ projected; kernel ready |
 | ③ MTP only (UD-Q6_K_XL) | k = 1 | **~1.9×** | MTP head is 1 extra layer (~free) |
-| ④ PTI + MTP — llama.cpp | 3-seq triple-batch | **~1.7×** | triple-batch overhead, see note below |
+| ④ PTI + MTP — llama.cpp | 3-seq triple-batch | **1.75×** | ✓ measured: 33.9 tok/s (UD-Q6_K_XL) |
 | ⑤ PTI + MTP — SSQ kernel | (1+accept)×k | **~3.4×** | fused weight load; gains multiply |
 
 Qwen3.6 has Multi-Token Prediction (MTP) built in — the model head predicts

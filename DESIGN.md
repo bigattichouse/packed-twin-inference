@@ -381,7 +381,7 @@ This costs 2 extra decode steps before the main loop begins (done once).
 |---|---|---|
 | Baseline UD-Q6_K_XL | 19.4 | 1.00× |
 | PTI 2-seq (pti_llama.c) | 30.5 | 1.57× |
-| PTI 3-seq (pti_mtp.cpp) | TBD | ~1.7× projected |
+| PTI 3-seq (pti_mtp.cpp) | **33.9** | **1.75×** |
 
 ---
 
@@ -390,6 +390,6 @@ This costs 2 extra decode steps before the main loop begins (done once).
 1. **Acceptance rate**: 100% greedy on identical twins — proved on Qwen3-1.7B, Qwen3.5-0.8B, Qwen3.6-27B
 2. **Output identity**: PTI output identical to baseline greedy — proved on text, SVG, and GGUF 27B
 3. **Measured throughput (2-seq)**: 28.9 tok/s PTI vs 21.1 tok/s baseline on Q5_K_M MI50 (1.38×); 30.5 vs 19.4 on UD-Q6_K_XL (1.57×)
-4. **3-seq projected**: ~1.67× baseline on llama.cpp; gains don't multiply vs 2-seq because triple-batch overhead grows
+4. **Measured throughput (3-seq)**: 33.9 tok/s PTI vs 19.4 tok/s baseline on UD-Q6_K_XL MI50 (1.75×); 100% B+C accept on greedy
 5. **2× gap explained**: llama.cpp dual-KV overhead; fused SSQ HIP kernel eliminates it → true 2×
 6. **CUDA portability**: pti_kernel.hip compiles for both AMD (hipcc) and NVIDIA (nvcc -x cu)
