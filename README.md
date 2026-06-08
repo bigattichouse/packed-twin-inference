@@ -87,21 +87,26 @@ Acceptance rate and output identity are the meaningful signals.
 
 ---
 
-## Measured Throughput (MI50, Qwen3.6-27B Q5_K_M)
+## Measured Throughput (MI50, Qwen3.6-27B)
 
-| Config | tok/s | multiplier | notes |
-|---|---|---|---|
-| Baseline | 21.1 | 1.00× | single stream |
-| PTI — llama.cpp two-seq batch | **28.9** | **1.38×** | 2 tokens emitted per accept |
-| PTI — SSQ HIP kernel (projected) | ~42 | **2.00×** | fused weight load |
-| PTI + MTP (projected) | ~75–85 | **~3.6–4.0×** | fused + Qwen3.6 MTP k=2 |
+| Config | Model | tok/s | multiplier | notes |
+|---|---|---|---|---|
+| Baseline | Q5_K_M | 21.1 | 1.00× | single stream |
+| PTI — llama.cpp | Q5_K_M | **28.9** | **1.38×** | 2 tokens per accept |
+| Baseline | UD-Q6_K_XL | 19.4 | 1.00× | single stream |
+| PTI — llama.cpp | UD-Q6_K_XL | **30.5** | **1.57×** | 2 tokens per accept |
+| PTI — SSQ HIP kernel | any Q8 | ~42 | **2.00×** | fused weight load (projected) |
+| PTI + MTP | UD-Q6_K_XL | ~65 | **~3.4×** | PTI × MTP k=1 (planned, C++) |
 
-**The 1.38× → 2× gap** comes from duplicate KV cache reads — A and B each read
-their full KV history per attention layer, even though their KV is identical for
-all accepted positions. Fix: register each accepted token under both `seq_id 0`
-and `seq_id 1` simultaneously so the shared prefix is stored and read once.
-Projected gain after this fix: ~1.7–1.8× on llama.cpp. The SSQ HIP kernel
-reaches the full 2× by fusing both matmuls behind a single HBM weight load.
+The UD-Q6_K_XL has `nextn_predict_layers=1` (MTP head present). PTI on this model
+yields 1.57× vs 1.38× on Q5_K_M — the dual-batch is proportionally more efficient.
+
+**Gap to 2×**: dual-batch runs 2 separate KV attention paths per layer. SSQ HIP
+kernel fuses both matmuls behind one HBM weight load, eliminating that overhead.
+
+**MTP integration**: requires C++ and `common/speculative.cpp` to extract hidden
+states via `llama_set_embeddings_pre_norm` (internal API). Planned as `pti_mtp.cpp`.
+With MTP k=1 + PTI: each step confirms ~3 tokens → ~65 tok/s projected on MI50.
 
 ---
 
@@ -111,11 +116,11 @@ On bandwidth-bound hardware (MI50, 1 TB/s HBM2), all compute overhead is hidden.
 
 | Config | Tokens per weight load | Multiplier | Status |
 |---|---|---|---|
-| ① Baseline | 1 | 1.00× | ✓ measured: 21.1 tok/s |
-| ② PTI — llama.cpp | 2 per accept | **1.38×** | ✓ measured: 28.9 tok/s |
+| ① Baseline | 1 | 1.00× | ✓ measured: 21.1 (Q5_K_M) / 19.4 (UD) |
+| ② PTI — llama.cpp | 2 per accept | **1.38–1.57×** | ✓ measured: 28.9 / 30.5 tok/s |
 | ② PTI — SSQ kernel | 1 + accept | **2.00×** | ✓ projected; kernel ready |
-| ③ MTP only (Qwen3.6 built-in) | k ≈ 2 | **~1.8×** | needs llama.cpp |
-| ④ PTI + MTP | k × (1 + accept) | **~3.6–4.0×** | planned |
+| ③ MTP only (UD-Q6_K_XL) | k = 1 | **~1.7×** | needs pti_mtp.cpp (C++) |
+| ④ PTI + MTP | (1 + accept) × k | **~3.4×** | planned |
 
 Qwen3.6 has Multi-Token Prediction (MTP) built in — the model head predicts
 k≈2 tokens per forward pass. PTI doubles streams per weight load. Combined,

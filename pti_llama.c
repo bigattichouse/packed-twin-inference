@@ -93,7 +93,7 @@ static int run_pti(const PTIArgs *args) {
     int32_t n_vocab = llama_vocab_n_tokens(vocab);
     fprintf(stderr, "Vocab size: %d\n", n_vocab);
 
-    // ── Create context (two sequences) ──────────────────────────────────────
+    // ── Create main context (two sequences for PTI) ─────────────────────────
     struct llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx      = DEFAULT_CTX * 2;  // room for both sequences
     cparams.n_batch    = DEFAULT_CTX;
@@ -102,6 +102,10 @@ static int run_pti(const PTIArgs *args) {
 
     struct llama_context *ctx = llama_init_from_model(model, cparams);
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return 1; }
+
+    // MTP note: llama.cpp's MTP draft requires feeding hidden states from the
+    // main context into the MTP head via llama_set_embeddings_pre_norm(), which
+    // is not in the public C API. MTP integration requires C++ + common/speculative.cpp.
 
     llama_memory_t mem = llama_get_memory(ctx);
 
@@ -159,7 +163,7 @@ static int run_pti(const PTIArgs *args) {
     int n_accept  = 0;
     int n_reject  = 0;
 
-    // Re-use a 2-token batch for the main loop
+    // 2-token batch: A + B
     struct llama_batch step_batch = llama_batch_init(2, 0, 2);
 
     double t_start = now_sec();
@@ -171,7 +175,7 @@ static int run_pti(const PTIArgs *args) {
         if (llama_vocab_is_eog(vocab, tok_a)) break;
 
         // ── Dual-stream decode: A at pos_a, B at pos_b ──────────────────────
-        // (Two tokens processed in one llama_decode call — shared weight loads)
+        // (Two tokens in one llama_decode call — shared weight loads)
         batch_clear(&step_batch);
         batch_add(&step_batch, tok_a, pos_a, 0, true);  // Twin A
         batch_add(&step_batch, tok_b, pos_b, 1, true);  // Twin B
@@ -184,11 +188,11 @@ static int run_pti(const PTIArgs *args) {
         float *la = llama_get_logits_ith(ctx, 0);
         float *lb = llama_get_logits_ith(ctx, 1);
 
-        llama_token actual_next    = (llama_token)argmax_f(la, n_vocab);
-        llama_token next_from_b    = (llama_token)argmax_f(lb, n_vocab);
+        llama_token actual_next = (llama_token)argmax_f(la, n_vocab);
+        llama_token next_from_b = (llama_token)argmax_f(lb, n_vocab);
 
-        pos_a++;   // A wrote to pos_a, next is pos_a+1
-        pos_b++;   // B wrote to pos_b
+        pos_a++;
+        pos_b++;
 
         // ── Verify ───────────────────────────────────────────────────────────
         if (tok_b == actual_next) {
@@ -203,26 +207,18 @@ static int run_pti(const PTIArgs *args) {
             print_token(vocab, actual_next);
             n_gen++;
 
-            // next_from_b is also confirmed: B's context was correct (tok_b == actual_next)
-            // so B's output is identical to what A would have produced.
-            // Emit it now; A will process actual_next next step to build its KV,
-            // then produce actual_next2 == next_from_b (guaranteed on identical twins).
             if (!llama_vocab_is_eog(vocab, next_from_b)) {
                 print_token(vocab, next_from_b);
                 n_gen++;
             }
 
-            // No B-only re-decode: positions and tokens are already set correctly.
-            // Next step: A decodes actual_next at pos_a (= P+1), B decodes next_from_b at pos_b (= P+2).
-            tok_a = actual_next;   // A still needs to decode actual_next for correct KV
-            tok_b = next_from_b;   // B speculates next_from_b (already one ahead)
-            // pos_a = P+1, pos_b = P+2 — already set by the pos_a++/pos_b++ above
+            tok_a = actual_next;
+            tok_b = next_from_b;
 
             if (llama_vocab_is_eog(vocab, next_from_b)) break;
 
         } else {
             // REJECT: B's speculation was wrong
-            // Remove B's incorrect KV entry at pos_b-1 (the wrong token)
             n_reject++;
             if (args->verbose)
                 fprintf(stderr, "\n[A pos=%d tok=%d] [B pos=%d tok=%d] REJECT",
@@ -233,16 +229,15 @@ static int run_pti(const PTIArgs *args) {
 
             // Trim B back: remove the wrong token from seq 1
             llama_memory_seq_rm(mem, 1, pos_b - 1, -1);
-            pos_b = pos_a;  // B is now at same position as A
+            pos_b = pos_a;
 
             // Re-run B at pos_b to produce correct speculation
-            // (B processes actual_next at the now-correct position)
             batch_clear(&step_batch);
             batch_add(&step_batch, actual_next, pos_b, 1, true);
             if (llama_decode(ctx, step_batch) == 0) {
                 float *lb2 = llama_get_logits_ith(ctx, 0);
                 tok_b = (llama_token)argmax_f(lb2, n_vocab);
-                pos_b++;   // B wrote actual_next, now one ahead again
+                pos_b++;
             }
 
             tok_a = actual_next;
