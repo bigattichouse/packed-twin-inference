@@ -303,8 +303,85 @@ passes. The SSQ HIP kernel eliminates even these by fusing into a single pass.
 ### Not yet built
 - Shared-prefix KV via dual seq_id (next step — see above)
 - Full inference loop using pti_kernel.hip (kernel exists, loop not wired)
-- MTP-aware PTI loop (Qwen3.6 MTP heads)
 - TSQ side-car benchmark (TSQ-* GGUF files exist in ../gguf/)
+
+---
+
+## pti_mtp.cpp: 3-Sequence PTI with MTP Re-Init
+
+`pti_mtp.cpp` extends the 2-seq dual-batch of `pti_llama.c` to 3 sequences:
+
+```
+Seq 0 (Twin A): verifier at pos_a
+Seq 1 (Twin B): 1-step drafter at pos_b = pos_a + 1
+Seq 2 (Twin C): 2-step drafter at pos_c = pos_a + 2
+
+Triple-batch each step: one llama_decode, one weight load, three predictions.
+```
+
+### 3-accept: 3 tokens per step
+
+```
+actual_next = argmax(A's logits)    ← verified
+next_from_b = argmax(B's logits)    ← confirmed when tok_b == actual_next
+next_from_c = argmax(C's logits)    ← confirmed when tok_c == next_from_b
+```
+
+On 100% greedy accept: emit 3 tokens per step.
+
+### Why PTI × MTP doesn't multiply on llama.cpp
+
+```
+pti_llama.c 2-seq dual-batch:
+  step cost    = 1.47× baseline (measured)
+  tokens/step  = 2
+  throughput   = 2 / 1.47 = 1.36× ≈ measured 1.38–1.57×
+
+pti_mtp.cpp 3-seq triple-batch:
+  step cost    ≈ 1.8× baseline (estimated; more sequences = more attention)
+  tokens/step  = 3
+  throughput   = 3 / 1.8 = ~1.67× baseline
+
+Naïve 1.38× × 1.7× = 2.35× is wrong. The gains don't compound because
+the overhead grows with each added sequence.
+```
+
+On the SSQ fused kernel, adding C IS free (one weight load for all sequences,
+only negligible attention overhead at short positions), so gains do compound.
+
+### MTP context role
+
+The Qwen3.6-27B UD-Q6_K_XL GGUF has `nextn_predict_layers=1` (one MTP head,
+layer 64 of 65). `LLAMA_CONTEXT_TYPE_MTP` creates a context that only runs
+this head, not the full 65-layer transformer.
+
+MTP inputs: (token ID, hidden state H from main context at that position)  
+MTP output: logits for the next token  
+MTP cost: ~1/65 of a main context decode (negligible on bandwidth-bound hardware)
+
+In `pti_mtp.cpp`, MTP is used **only on the reject path** to re-init C:
+- After reject: run B-init (1 full pass) → get H_b
+- MTP(tok_b, H_b) → tok_c, no extra full pass needed
+- Without MTP: B-init + C-init = 2 full passes
+
+On 100% greedy (no rejects), MTP fires zero times. Its primary value is
+for sampling mode where rejects occur on ~5–15% of steps.
+
+### C initialization
+
+Two-stage init to ensure C's KV is populated before the main loop:
+1. C decodes tok_gen_0 at pos_a (seq 2) — fills C's KV at pos_a
+2. C decodes tok_b at pos_b (seq 2) — fills C's KV at pos_b, gives tok_c
+
+This costs 2 extra decode steps before the main loop begins (done once).
+
+### Measured throughput (to be filled after benchmarking)
+
+| Config | tok/s | multiplier |
+|---|---|---|
+| Baseline UD-Q6_K_XL | 19.4 | 1.00× |
+| PTI 2-seq (pti_llama.c) | 30.5 | 1.57× |
+| PTI 3-seq (pti_mtp.cpp) | TBD | ~1.7× projected |
 
 ---
 
@@ -312,7 +389,7 @@ passes. The SSQ HIP kernel eliminates even these by fusing into a single pass.
 
 1. **Acceptance rate**: 100% greedy on identical twins — proved on Qwen3-1.7B, Qwen3.5-0.8B, Qwen3.6-27B
 2. **Output identity**: PTI output identical to baseline greedy — proved on text, SVG, and GGUF 27B
-3. **Measured throughput**: 28.9 tok/s PTI vs 21.1 tok/s baseline on Qwen3.6-27B Q5_K_M MI50 (1.38×)
-4. **KV sharing**: registering each accepted token under both seq_ids eliminates duplicate KV reads for the shared prefix — next optimization step
-4. **2× gap explained**: llama.cpp dual-KV overhead; fused SSQ HIP kernel eliminates it → true 2×
-5. **CUDA portability**: pti_kernel.hip compiles for both AMD (hipcc) and NVIDIA (nvcc -x cu)
+3. **Measured throughput (2-seq)**: 28.9 tok/s PTI vs 21.1 tok/s baseline on Q5_K_M MI50 (1.38×); 30.5 vs 19.4 on UD-Q6_K_XL (1.57×)
+4. **3-seq projected**: ~1.67× baseline on llama.cpp; gains don't multiply vs 2-seq because triple-batch overhead grows
+5. **2× gap explained**: llama.cpp dual-KV overhead; fused SSQ HIP kernel eliminates it → true 2×
+6. **CUDA portability**: pti_kernel.hip compiles for both AMD (hipcc) and NVIDIA (nvcc -x cu)

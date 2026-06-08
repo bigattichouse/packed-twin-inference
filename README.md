@@ -177,7 +177,9 @@ High acceptance on the target domain; falling acceptance signals off-domain.
 | `pack.py` | Pack a model with itself as SSQ twin streams |
 | `pti_kernel.hip` | HIP/ROCm kernel — packed matmul, attention, verify |
 | `pti_hip.py` | Python wrapper for the compiled HIP kernel (ctypes) |
-| `Makefile` | Build the HIP kernel for gfx906 (MI50) or gfx1100 |
+| `pti_llama.c` | 2-seq PTI via llama.cpp C API (measured: 1.38–1.57×) |
+| `pti_mtp.cpp` | 3-seq PTI + MTP re-init via llama.cpp C++ API (projected: ~1.7×) |
+| `Makefile` | Build HIP kernel, pti_llama, and pti_mtp |
 | `DESIGN.md` | Full design rationale, math, and implementation details |
 | `diagram-memory-layout.svg` | How uint16 packs two int8 weights — one load, two streams |
 | `diagram-workflow.svg` | Full PTI inference loop: prefill → verify → accept/reject |
