@@ -258,7 +258,8 @@ NVIDIA: nvcc  -O3 -arch=sm_89 -x cu     -o pti_test pti_kernel.hip
 |---|---|---|---|
 | Baseline | 21.1 | 1.00× | single stream, llama.cpp |
 | PTI (llama.cpp, two-seq batch) | 28.9 | **1.38×** | 2 tokens emitted per accept step |
-| PTI (SSQ HIP kernel, projected) | ~42 | **2.00×** | fused weight load, no dual-KV overhead |
+| PTI SSQ HIP kernel (projected) | ~42 | **~2×** | fused weight load, overhead eliminated |
+| PTI SSQ + MTP (target) | **~80–100** | **~4–5×** | 2 streams × MTP k=1 at 55–70% HBM eff |
 
 The gap from 1.38× to 2×: llama.cpp reads two separate KV caches per step (A and B). The SSQ HIP kernel eliminates this by fusing both matmuls behind one HBM weight load — weight bandwidth is the bottleneck, and it's shared.
 
@@ -356,9 +357,30 @@ Measured: 38.1 tok/s on Qwen3.6-27B UD-Q6_K_XL, MI50.
 The sub-linear overhead growth (+0.33 per seq at 4 vs +0.44 at 3) makes each
 added sequence cheaper, but beyond 4 the marginal gain shrinks toward zero.
 
-### Not yet built
-- Full inference loop using pti_kernel.hip (kernel exists, loop not wired)
-- TSQ side-car benchmark (TSQ-* GGUF files exist in ../gguf/)
+### Next target: pti_ssq.cpp — SSQ kernel inference loop
+
+Goal: **~80–100 tok/s** on MI50 Q5_K_M. Math:
+
+```
+Q5_K_M model: 18.6 GB | MI50 HBM: 1000 GB/s
+SSQ 2-stream:   2 tokens per weight load (overhead eliminated)
++ MTP k=1:      × 1.88 MTP accept rate
+= 3.76 tokens per 18.6 GB load → 4.9 GB/token effective
+At 70% HBM efficiency: ~143 tok/s theoretical
+Conservative (55-60%): ~80–100 tok/s — the target
+```
+
+Build plan:
+1. GGUF weight loader in HIP (parse tensor metadata, mmap to GPU)
+2. Qwen3 forward pass: RMSNorm → pti_linear (QKV) → RoPE → GQA attn → pti_linear (FFN SwiGLU)
+3. KV cache for 2 streams (A at pos n, B at pos n+1)
+4. Sampling (argmax for greedy, nucleus for sampled)
+5. Accept/reject + MTP head (1 layer, reuse pti_linear)
+
+`pti_kernel.hip` already has: `pti_linear_tiled`, `pti_attn_scores`, `pti_verify`, `pti_softmax`.
+Still needed: RMSNorm kernel, RoPE kernel, SwiGLU gate kernel, GGUF loader.
+
+- TSQ side-car benchmark (TSQ-* GGUF files exist in ../gguf/) — after SSQ loop is working
 
 ---
 

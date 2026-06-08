@@ -100,12 +100,17 @@ CPU_Mapped weights (embedding table overflow): +0.8 GiB for Q5_K_M, +1.3 GiB for
 | PTI 2-seq — llama.cpp | UD-Q6_K_XL | **30.5** | **1.57×** | 24.0 GiB | +0.3 GiB vs baseline |
 | PTI 3-seq — llama.cpp | UD-Q6_K_XL | **33.9** | **1.75×** | 24.3 GiB | +0.6 GiB vs baseline |
 | PTI 4-seq — llama.cpp | UD-Q6_K_XL | **38.1** | **1.96×** | 24.5 GiB | +0.8 GiB vs baseline |
-| PTI SSQ HIP kernel | Q8 packed | ~40 | **~2×** | ~29 GiB (est.) | two models in one uint16 file |
-| PTI + MTP (SSQ kernel) | UD-Q6_K_XL | ~65 | **~3.4×** | ~29 GiB (est.) | fused kernel + MTP k=1 |
+| PTI SSQ HIP kernel | Q5_K_M | ~42 | **~2×** | ~24 GiB | same weights, fused dual-stream kernel |
+| **PTI + MTP — SSQ kernel (target)** | Q5_K_M | **~80–100** | **~4–5×** | ~24 GiB | SSQ 2-stream × MTP k=1, ~70% HBM eff |
 
 **VRAM note**: PTI on llama.cpp costs almost no extra VRAM — 0.3–0.8 GiB across 2–4 sequences,
 because KV/state per sequence is tiny (~278 MiB) relative to model weights (~23 GiB).
 Standard speculative decoding needs a 2nd draft model: ~4–19 GiB extra depending on size.
+
+**SSQ VRAM**: for same-model PTI (both streams use identical weights), the SSQ kernel loads
+the *original* model file — no packed twin file needed. VRAM ≈ baseline. For TSQ (base +
+fine-tune as stream B), the SSQ file packs two models: needs Q4_K_M (~14 GiB each) to fit
+MI50's 32 GiB VRAM (2 × 14 + overhead ≈ 30 GiB).
 
 The UD-Q6_K_XL has `nextn_predict_layers=1` (MTP head present). PTI on this model
 yields 1.57× vs 1.38× on Q5_K_M — the dual-batch is proportionally more efficient.
@@ -149,16 +154,27 @@ On bandwidth-bound hardware (MI50, 1 TB/s HBM2), all compute overhead is hidden.
 |---|---|---|---|
 | ① Baseline | 1 | 1.00× | ✓ measured: 21.1 (Q5_K_M) / 19.4 (UD) |
 | ② PTI — llama.cpp | 2 per accept | **1.38–1.57×** | ✓ measured: 28.9 / 30.5 tok/s |
-| ② PTI — SSQ kernel | 1 + accept | **2.00×** | ✓ projected; kernel ready |
+| ② PTI — SSQ kernel | 1 + accept | **2.00×** | kernel ready; inference loop = next build |
 | ③ MTP only (UD-Q6_K_XL) | k = 1 | **~1.9×** | MTP head is 1 extra layer (~free) |
 | ④ PTI + MTP — llama.cpp | 3-seq triple-batch | **1.75×** | ✓ measured: 33.9 tok/s (UD-Q6_K_XL) |
 | ④ PTI 4-seq — llama.cpp | 4-seq quad-batch | **1.96×** | ✓ measured: 38.1 tok/s (UD-Q6_K_XL) |
-| ⑤ PTI + MTP — SSQ kernel | (1+accept)×k | **~3.4×** | fused weight load; gains multiply |
+| ⑤ **PTI + MTP — SSQ kernel** | (1+accept)×k | **~4–5×** | **target: ~80–100 tok/s** on MI50 Q5_K_M |
 
-Qwen3.6 has Multi-Token Prediction (MTP) built in — the model head predicts
-k≈2 tokens per forward pass. PTI doubles streams per weight load. Combined,
-one weight load confirms ~4 tokens instead of 1: `1 TB/s / 19 GB × 4 = ~210 tok/s`
-vs baseline's ~52 tok/s for Qwen3.6-27B Q5_K_M on MI50.
+PTI doubles streams per weight load. Qwen3.6's MTP head adds k=1 extra token per
+forward pass at ~1.5% overhead. Combined on the SSQ kernel (where overhead is
+eliminated and weight load is shared):
+
+```
+Step cost:  18.6 GB (one Q5_K_M model load)
+Tokens out: 2 (PTI streams) × ~1.88 (MTP accept rate) ≈ 3.76 tokens/step
+Bandwidth per token: 18.6 / 3.76 ≈ 4.9 GB/token
+Theoretical tok/s: 1000 GB/s / 4.9 ≈ 204 tok/s
+At 70% HBM efficiency (realistic for custom kernel): ~143 tok/s
+Conservative target (55–60% efficiency):  ~80–100 tok/s
+```
+
+The llama.cpp floor (overhead ~2×) caps PTI there at ~2×. The SSQ kernel removes
+that floor: one weight load, N streams, overhead ≈ 1.0×.
 
 ---
 
