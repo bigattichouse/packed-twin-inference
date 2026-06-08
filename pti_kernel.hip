@@ -536,6 +536,305 @@ void pti_linear4_q8_flat_launch(
         d_scales, d_wts, dxa, dxb, dxc, dxd, dya, dyb, dyc, dyd, M, K);
 }
 
+// ── Weight-only GEMV bandwidth test (no activation reads) ────────────────────
+// Identical to flat GEMV but x[k]=1.0 computed, not loaded.  Isolates weight BW.
+__global__ void weight_only_gemv(
+    const __half*  __restrict__ scales,
+    const int8_t*  __restrict__ wts,
+    float*         __restrict__ out,
+    int M, int K)
+{
+    int row = blockIdx.x, tid = threadIdx.x;
+    int n_blocks = K / Q8_BLOCK_SIZE;
+    float acc = 0;
+    const int8_t* rw = wts    + (size_t)row * K;
+    const __half* rs = scales + (size_t)row * n_blocks;
+    for (int k = tid; k < K; k += blockDim.x) {
+        float sc = __half2float(rs[k >> 5]);
+        acc += sc * (float)rw[k];  // no activation read — x[k] = 1.0 implicitly
+    }
+    __shared__ float r[256];
+    r[tid]=acc; __syncthreads();
+    for (int s=blockDim.x/2;s>0;s>>=1){if(tid<s)r[tid]+=r[tid+s];__syncthreads();}
+    if (tid==0) out[row]=r[0];
+}
+
+// ── Raw int8 bandwidth test: pure streaming read, sum-to-prevent-DCE ─────────
+// Measures max achievable int8 read bandwidth on this GPU — no computation.
+__global__ void int8_bw_test(const int8_t* __restrict__ data, int* __restrict__ out, int N) {
+    int sum = 0;
+    for (int i = threadIdx.x; i < N; i += blockDim.x)
+        sum += (int)data[(size_t)blockIdx.x * N + i];
+    if (threadIdx.x == 0) out[blockIdx.x] = sum;
+}
+
+// ── 4-stream register-tiled GEMV (activation-efficient, no sync barriers) ────
+//
+// ROOT CAUSE of 24% bandwidth in flat kernel:
+//   activations xa/xb/xc/xd (80 KB) read from L2 by EVERY output-row block
+//   → 17408 blocks × 80 KB = 1.36 GB L2 traffic.
+//   Measured: L2 activation reads cost ~700 µs vs ~270 µs for HBM weight reads.
+//
+// FIX: register tiling with M_REG rows per THREAD.
+//   Each thread loads xa[k],xb[k],xc[k],xd[k] ONCE into registers and
+//   uses them for all M_REG row accumulators.  Activation L2 traffic: 4× lower.
+//   K_THRD=64 = AMD wavefront size → warp-shuffle reduction, ZERO sync barriers.
+//   Target: match raw int8 bandwidth (330 GB/s = 86% of D2D).
+//
+// Block: (K_THRD=64) = 1 wavefront.  Grid: (M/M_REG).
+// Max occupancy: 40 blocks/CU (thread-limited: 2560/64=40). ✓
+
+#define M_REG  4    // rows per thread (register-tiled)
+#define K_THRD 64   // threads per block = 1 AMD wavefront
+
+__global__ void pti_linear4_q8_regtile(
+    const __half*  __restrict__ scales,    // [M × n_blocks]
+    const int8_t*  __restrict__ wts,       // [M × K] row-major flat int8
+    const float*   __restrict__ xa,
+    const float*   __restrict__ xb,
+    const float*   __restrict__ xc,
+    const float*   __restrict__ xd,
+    float*         __restrict__ ya,
+    float*         __restrict__ yb,
+    float*         __restrict__ yc,
+    float*         __restrict__ yd,
+    int M, int K)
+{
+    int tile     = blockIdx.x;
+    int tid      = threadIdx.x;          // 0..K_THRD-1
+    int row_base = tile * M_REG;
+    int n_blocks = K / Q8_BLOCK_SIZE;
+
+    const int8_t* rw[M_REG];
+    const __half* rs[M_REG];
+    #pragma unroll
+    for (int r = 0; r < M_REG; r++) {
+        rw[r] = wts    + (size_t)(row_base + r) * K;
+        rs[r] = scales + (size_t)(row_base + r) * n_blocks;
+    }
+
+    float acca[M_REG], accb[M_REG], accc[M_REG], accd[M_REG];
+    #pragma unroll
+    for (int r = 0; r < M_REG; r++) acca[r]=accb[r]=accc[r]=accd[r]=0.f;
+
+    for (int k = tid; k < K; k += K_THRD) {
+        // Load 4 activations ONCE, reuse for all M_REG rows (eliminates 3× L2 reads)
+        float xav = xa[k], xbv = xb[k], xcv = xc[k], xdv = xd[k];
+        int blk = k >> 5;   // k / Q8_BLOCK_SIZE (Q8_BLOCK_SIZE=32=2^5)
+        #pragma unroll
+        for (int r = 0; r < M_REG; r++) {
+            float sc = __half2float(rs[r][blk]);
+            float wf = sc * (float)rw[r][k];
+            acca[r] += wf * xav;
+            accb[r] += wf * xbv;
+            accc[r] += wf * xcv;
+            accd[r] += wf * xdv;
+        }
+    }
+
+    // Warp-shuffle reduction within wavefront (K_THRD=64, no sync barriers)
+    #pragma unroll
+    for (int offset = K_THRD/2; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int r = 0; r < M_REG; r++) {
+            acca[r] += __shfl_down(acca[r], offset);
+            accb[r] += __shfl_down(accb[r], offset);
+            accc[r] += __shfl_down(accc[r], offset);
+            accd[r] += __shfl_down(accd[r], offset);
+        }
+    }
+
+    if (tid == 0) {
+        #pragma unroll
+        for (int r = 0; r < M_REG; r++) {
+            if (row_base + r < M) {
+                ya[row_base+r] = acca[r];
+                yb[row_base+r] = accb[r];
+                yc[row_base+r] = accc[r];
+                yd[row_base+r] = accd[r];
+            }
+        }
+    }
+}
+
+// ── 4-stream register-tiled with interleaved activations ─────────────────────
+//
+// Same as regtile but activations are pre-interleaved as x_abcd[K][4].
+// Loads all 4 streams with ONE float4 instruction per K element:
+//   4 VMEM → 1 VMEM for activations.  Total: 5 VMEM per outer iter (vs 8).
+// x_abcd is passed as a single float* with stride-4 layout: [xa0,xb0,xc0,xd0, xa1,...].
+
+__global__ void pti_linear4_q8_intlv(
+    const __half*  __restrict__ scales,
+    const int8_t*  __restrict__ wts,
+    const float*   __restrict__ x_abcd,  // [K][4] interleaved
+    float*         __restrict__ ya,
+    float*         __restrict__ yb,
+    float*         __restrict__ yc,
+    float*         __restrict__ yd,
+    int M, int K)
+{
+    int tile     = blockIdx.x;
+    int tid      = threadIdx.x;
+    int row_base = tile * M_REG;
+    int n_blocks = K / Q8_BLOCK_SIZE;
+
+    const int8_t* rw[M_REG];
+    const __half* rs[M_REG];
+    #pragma unroll
+    for (int r = 0; r < M_REG; r++) {
+        rw[r] = wts    + (size_t)(row_base + r) * K;
+        rs[r] = scales + (size_t)(row_base + r) * n_blocks;
+    }
+
+    float acca[M_REG], accb[M_REG], accc[M_REG], accd[M_REG];
+    #pragma unroll
+    for (int r = 0; r < M_REG; r++) acca[r]=accb[r]=accc[r]=accd[r]=0.f;
+
+    for (int k = tid; k < K; k += K_THRD) {
+        // ONE float4 load for all 4 activation streams (1 VMEM instruction)
+        float4 xv = ((const float4*)x_abcd)[k];
+        int blk = k >> 5;
+        #pragma unroll
+        for (int r = 0; r < M_REG; r++) {
+            float sc = __half2float(rs[r][blk]);
+            float wf = sc * (float)rw[r][k];
+            acca[r] += wf * xv.x;
+            accb[r] += wf * xv.y;
+            accc[r] += wf * xv.z;
+            accd[r] += wf * xv.w;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = K_THRD/2; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int r = 0; r < M_REG; r++) {
+            acca[r] += __shfl_down(acca[r], offset);
+            accb[r] += __shfl_down(accb[r], offset);
+            accc[r] += __shfl_down(accc[r], offset);
+            accd[r] += __shfl_down(accd[r], offset);
+        }
+    }
+
+    if (tid == 0) {
+        #pragma unroll
+        for (int r = 0; r < M_REG; r++) {
+            if (row_base + r < M) {
+                ya[row_base+r] = acca[r];
+                yb[row_base+r] = accb[r];
+                yc[row_base+r] = accc[r];
+                yd[row_base+r] = accd[r];
+            }
+        }
+    }
+}
+
+void pti_linear4_q8_intlv_launch(
+    const __half* d_scales, const int8_t* d_wts,
+    const float* d_x_abcd,  // [K×4] interleaved
+    float* dya, float* dyb, float* dyc, float* dyd,
+    int M, int K)
+{
+    dim3 grid((M + M_REG - 1) / M_REG), block(K_THRD);
+    hipLaunchKernelGGL(pti_linear4_q8_intlv, grid, block, 0, 0,
+        d_scales, d_wts, d_x_abcd, dya, dyb, dyc, dyd, M, K);
+}
+
+void pti_linear4_q8_regtile_launch(
+    const __half* d_scales, const int8_t* d_wts,
+    const float* dxa, const float* dxb, const float* dxc, const float* dxd,
+    float* dya, float* dyb, float* dyc, float* dyd,
+    int M, int K)
+{
+    dim3 grid((M + M_REG - 1) / M_REG), block(K_THRD);
+    hipLaunchKernelGGL(pti_linear4_q8_regtile, grid, block, 0, 0,
+        d_scales, d_wts, dxa, dxb, dxc, dxd, dya, dyb, dyc, dyd, M, K);
+}
+
+// ── 4-stream flat-Q8 vectorized (128-bit loads, 4× fewer VMEM instructions) ──
+//
+// Same semantics as pti_linear4_q8_flat but loads 4 int8 weights and
+// 4 float activations per outer iteration using 32-bit and 128-bit
+// vector loads. Reduces VMEM instruction count 4×, relaxing MSHR pressure.
+// Requires K divisible by 4 (satisfied for all Qwen3.6 dims: K=5120, 17408).
+
+__global__ void pti_linear4_q8_vec(
+    const __half*  __restrict__ scales,    // [M × n_blocks]
+    const int8_t*  __restrict__ wts,       // [M × K]  row-major flat int8
+    const float*   __restrict__ xa,
+    const float*   __restrict__ xb,
+    const float*   __restrict__ xc,
+    const float*   __restrict__ xd,
+    float*         __restrict__ ya,
+    float*         __restrict__ yb,
+    float*         __restrict__ yc,
+    float*         __restrict__ yd,
+    int M, int K)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int n_blocks = K / Q8_BLOCK_SIZE;  // K divisible by 32
+
+    float acca=0, accb=0, accc=0, accd=0;
+    const int8_t* rw = wts    + (size_t)row * K;
+    const __half* rs = scales + (size_t)row * n_blocks;
+
+    // Each thread processes 4 weights per outer iteration using 32-bit load.
+    // Activation loads use float4 (128-bit, 4 floats at a time).
+    // K/4 groups of 4, stride blockDim.x groups per outer step.
+    int K4 = K / 4;
+    for (int kg = tid; kg < K4; kg += blockDim.x) {
+        int k0 = kg * 4;
+        // 32-bit weight load: 4 consecutive int8 values
+        int wi = *((const int*)(rw + k0));
+        // float4 activation loads (128-bit each)
+        float4 a4 = *((const float4*)(xa + k0));
+        float4 b4 = *((const float4*)(xb + k0));
+        float4 c4 = *((const float4*)(xc + k0));
+        float4 d4 = *((const float4*)(xd + k0));
+
+        // Unpack and accumulate 4 weights
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int k = k0 + j;
+            float sc = __half2float(rs[k / Q8_BLOCK_SIZE]);
+            int8_t wb = (int8_t)((wi >> (j*8)) & 0xFF);
+            float wf = sc * (float)wb;
+            float av = ((const float*)&a4)[j];
+            float bv = ((const float*)&b4)[j];
+            float cv = ((const float*)&c4)[j];
+            float dv = ((const float*)&d4)[j];
+            acca += wf * av;
+            accb += wf * bv;
+            accc += wf * cv;
+            accd += wf * dv;
+        }
+    }
+
+    __shared__ float ra[MAX_THREADS], rb[MAX_THREADS],
+                     rc[MAX_THREADS], rd_[MAX_THREADS];
+    ra[tid]=acca; rb[tid]=accb; rc[tid]=accc; rd_[tid]=accd;
+    __syncthreads();
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid<s) { ra[tid]+=ra[tid+s]; rb[tid]+=rb[tid+s];
+                     rc[tid]+=rc[tid+s]; rd_[tid]+=rd_[tid+s]; }
+        __syncthreads();
+    }
+    if (tid==0) { ya[row]=ra[0]; yb[row]=rb[0]; yc[row]=rc[0]; yd[row]=rd_[0]; }
+}
+
+void pti_linear4_q8_vec_launch(
+    const __half* d_scales, const int8_t* d_wts,
+    const float* dxa, const float* dxb, const float* dxc, const float* dxd,
+    float* dya, float* dyb, float* dyc, float* dyd,
+    int M, int K)
+{
+    dim3 grid(M), block(256);
+    hipLaunchKernelGGL(pti_linear4_q8_vec, grid, block, 0, 0,
+        d_scales, d_wts, dxa, dxb, dxc, dxd, dya, dyb, dyc, dyd, M, K);
+}
+
 void pti_linear4_q8_launch(
     const uint8_t* d_W,
     const float* d_xa, const float* d_xb,
@@ -838,6 +1137,53 @@ int main(void) {
     printf("  Theoretical (Q5_K_M, 18.6 GB, 383 GB/s): 4-stream=%.0f  +MTP=%.0f tok/s\n",
            4.f / (18.6f / measured_bw), 4.f * 1.88f / (18.6f / measured_bw));
 
+    // ── Weight-only GEMV (no activation reads) ───────────────────────────────
+    printf("\n── Weight-only GEMV (no activation reads, establishes weight-read floor) ─\n");
+    {
+        int wM=17408, wK=5120;
+        size_t wt_b=(size_t)wM*wK, sc_b=(size_t)wM*(wK/Q8_BLOCK_SIZE)*sizeof(__half);
+        int8_t* d_w2; __half* d_s2; float* d_o2;
+        CHECK_HIP(hipMalloc(&d_w2,wt_b)); CHECK_HIP(hipMalloc(&d_s2,sc_b)); CHECK_HIP(hipMalloc(&d_o2,wM*sizeof(float)));
+        { int8_t* h=(int8_t*)malloc(wt_b); for(size_t i=0;i<wt_b;i++) h[i]=(int8_t)rand(); CHECK_HIP(hipMemcpy(d_w2,h,wt_b,hipMemcpyHostToDevice)); free(h); }
+        { __half* h=(__half*)malloc(sc_b); for(size_t i=0;i<sc_b/2;i++) h[i]=__float2half(randf()); CHECK_HIP(hipMemcpy(d_s2,h,sc_b,hipMemcpyHostToDevice)); free(h); }
+        dim3 wg(wM), wb(256);
+        for(int i=0;i<3;i++) hipLaunchKernelGGL(weight_only_gemv,wg,wb,0,0,d_s2,d_w2,d_o2,wM,wK);
+        CHECK_HIP(hipDeviceSynchronize());
+        hipEvent_t e0,e1; CHECK_HIP(hipEventCreate(&e0)); CHECK_HIP(hipEventCreate(&e1));
+        CHECK_HIP(hipEventRecord(e0));
+        for(int i=0;i<200;i++) hipLaunchKernelGGL(weight_only_gemv,wg,wb,0,0,d_s2,d_w2,d_o2,wM,wK);
+        CHECK_HIP(hipEventRecord(e1)); CHECK_HIP(hipEventSynchronize(e1));
+        float wms; CHECK_HIP(hipEventElapsedTime(&wms,e0,e1));
+        float wbw=(float)wt_b/(wms/200*1e-3f)/1e9f;
+        printf("  Weight-only [%d×%d]: %.1f µs  BW=%.0f GB/s  (%.0f%% of D2D)\n",
+               wM,wK,wms*1000.f/200,wbw,wbw/383.f*100.f);
+        hipFree(d_w2); hipFree(d_s2); hipFree(d_o2); hipEventDestroy(e0); hipEventDestroy(e1);
+    }
+
+    // ── Raw int8 bandwidth diagnostic ────────────────────────────────────────
+    printf("\n── Raw int8 streaming bandwidth (no compute, sum-to-sink) ─────────\n");
+    {
+        int bM=17408, bK=5120;
+        size_t bsz = (size_t)bM * bK;
+        int8_t* d_raw; int* d_sums;
+        CHECK_HIP(hipMalloc(&d_raw, bsz));
+        CHECK_HIP(hipMalloc(&d_sums, bM * sizeof(int)));
+        { int8_t* h=(int8_t*)malloc(bsz); for(size_t i=0;i<bsz;i++) h[i]=(int8_t)i; CHECK_HIP(hipMemcpy(d_raw,h,bsz,hipMemcpyHostToDevice)); free(h); }
+        dim3 bg(bM), bb(256);
+        for(int w=0;w<3;w++) hipLaunchKernelGGL(int8_bw_test,bg,bb,0,0,d_raw,d_sums,bK);
+        CHECK_HIP(hipDeviceSynchronize());
+        hipEvent_t e0,e1; CHECK_HIP(hipEventCreate(&e0)); CHECK_HIP(hipEventCreate(&e1));
+        int BITER=200;
+        CHECK_HIP(hipEventRecord(e0));
+        for(int i=0;i<BITER;i++) hipLaunchKernelGGL(int8_bw_test,bg,bb,0,0,d_raw,d_sums,bK);
+        CHECK_HIP(hipEventRecord(e1)); CHECK_HIP(hipEventSynchronize(e1));
+        float bms; CHECK_HIP(hipEventElapsedTime(&bms,e0,e1));
+        float rbw = (float)bsz / (bms/BITER*1e-3f) / 1e9f;
+        printf("  [%d×%d] int8 stream read: %.1f µs  BW=%.0f GB/s  (%.0f%% of D2D)\n",
+               bM, bK, bms*1000.f/BITER, rbw, rbw/383.f*100.f);
+        hipFree(d_raw); hipFree(d_sums); hipEventDestroy(e0); hipEventDestroy(e1);
+    }
+
     // ── Flat-Q8 coalesced kernel benchmark ───────────────────────────────────
     printf("\n── Flat-Q8 coalesced 4-stream kernel (unit-stride int8 weights) ────\n");
     {
@@ -881,10 +1227,89 @@ int main(void) {
         printf("    4-stream:       %.0f tok/s\n",   4.f / (q5_gb/bw));
         printf("    4-stream + MTP: %.0f tok/s  ← 80-100 tok/s target\n",   4.f*1.88f / (q5_gb/bw));
 
+        // ── vectorized variant (4× fewer VMEM instructions) ─────────────────
+        printf("\n  Vectorized (128-bit loads, 4× fewer VMEM):\n");
+        for(int w=0;w<3;w++) pti_linear4_q8_vec_launch(d_sc,d_wt,dxa,dxb,dxc,dxd,dya,dyb,dyc,dyd,lM,lK);
+        CHECK_HIP(hipDeviceSynchronize());
+
+        hipEvent_t e2,e3; CHECK_HIP(hipEventCreate(&e2)); CHECK_HIP(hipEventCreate(&e3));
+        CHECK_HIP(hipEventRecord(e2));
+        for(int i=0;i<NITER;i++) pti_linear4_q8_vec_launch(d_sc,d_wt,dxa,dxb,dxc,dxd,dya,dyb,dyc,dyd,lM,lK);
+        CHECK_HIP(hipEventRecord(e3)); CHECK_HIP(hipEventSynchronize(e3));
+        float vms; CHECK_HIP(hipEventElapsedTime(&vms,e2,e3));
+
+        float vus=vms*1000.f/NITER;
+        float vbw=(float)wt_bytes/(vms/NITER*1e-3f)/1e9f;
+        printf("  [%d×%d]: %.1f µs/call  BW=%.0f GB/s  (%.1f MB weights)\n",
+               lM, lK, vus, vbw, (float)wt_bytes/1e6f);
+        printf("  %.0f%% of MI50 D2D BW (383 GB/s)\n", vbw/383.f*100.f);
+        printf("  Speedup vs scalar: %.2f×\n", bw > 0 ? vbw/bw : 0.f);
+        printf("\n  4-stream projected at this BW (Q5_K_M = %.1f GB):\n", q5_gb);
+        printf("    4-stream:       %.0f tok/s\n",   4.f / (q5_gb/vbw));
+        printf("    4-stream + MTP: %.0f tok/s  ← 80-100 tok/s target\n",   4.f*1.88f / (q5_gb/vbw));
+
+        // ── register-tiled kernel (M_REG rows/thread, warp-shuffle, no sync) ──
+        printf("\n  Register-tiled (M_REG=%d rows/thread, warp-shuffle reduction, 4× less L2):\n", M_REG);
+        for(int w=0;w<3;w++) pti_linear4_q8_regtile_launch(d_sc,d_wt,dxa,dxb,dxc,dxd,dya,dyb,dyc,dyd,lM,lK);
+        CHECK_HIP(hipDeviceSynchronize());
+
+        hipEvent_t e4,e5; CHECK_HIP(hipEventCreate(&e4)); CHECK_HIP(hipEventCreate(&e5));
+        CHECK_HIP(hipEventRecord(e4));
+        for(int i=0;i<NITER;i++) pti_linear4_q8_regtile_launch(d_sc,d_wt,dxa,dxb,dxc,dxd,dya,dyb,dyc,dyd,lM,lK);
+        CHECK_HIP(hipEventRecord(e5)); CHECK_HIP(hipEventSynchronize(e5));
+        float tms; CHECK_HIP(hipEventElapsedTime(&tms,e4,e5));
+
+        float tus=tms*1000.f/NITER;
+        float tbw=(float)wt_bytes/(tms/NITER*1e-3f)/1e9f;
+        printf("  [%d×%d]: %.1f µs/call  BW=%.0f GB/s  (%.1f MB weights)\n",
+               lM, lK, tus, tbw, (float)wt_bytes/1e6f);
+        printf("  %.0f%% of MI50 D2D BW (383 GB/s)\n", tbw/383.f*100.f);
+        printf("  Speedup vs scalar: %.2f×\n", bw > 0 ? tbw/bw : 0.f);
+        printf("\n  4-stream projected at this BW (Q5_K_M = %.1f GB):\n", q5_gb);
+        printf("    4-stream:       %.0f tok/s\n",   4.f / (q5_gb/tbw));
+        printf("    4-stream + MTP: %.0f tok/s  ← 80-100 tok/s target\n",   4.f*1.88f / (q5_gb/tbw));
+
+        // ── interleaved float4 activation loads (1 VMEM per activation, not 4) ──
+        printf("\n  Interleaved [K×4] activations (float4 load = 1 VMEM per K elem):\n");
+        // Build interleaved activation array
+        float* d_xabcd; CHECK_HIP(hipMalloc(&d_xabcd, (size_t)lK * 4 * sizeof(float)));
+        {
+            float* h = (float*)malloc((size_t)lK * 4 * sizeof(float));
+            float* ha=(float*)malloc(xx_bytes); float* hb=(float*)malloc(xx_bytes);
+            for(int i=0;i<lK;i++) ha[i]=hb[i]=randf();
+            for(int k=0;k<lK;k++) { h[k*4+0]=ha[k]; h[k*4+1]=ha[k]; h[k*4+2]=hb[k]; h[k*4+3]=hb[k]; }
+            CHECK_HIP(hipMemcpy(d_xabcd,h,(size_t)lK*4*sizeof(float),hipMemcpyHostToDevice));
+            free(h); free(ha); free(hb);
+        }
+
+        for(int w=0;w<3;w++) pti_linear4_q8_intlv_launch(d_sc,d_wt,d_xabcd,dya,dyb,dyc,dyd,lM,lK);
+        CHECK_HIP(hipDeviceSynchronize());
+
+        hipEvent_t e6,e7; CHECK_HIP(hipEventCreate(&e6)); CHECK_HIP(hipEventCreate(&e7));
+        CHECK_HIP(hipEventRecord(e6));
+        for(int i=0;i<NITER;i++) pti_linear4_q8_intlv_launch(d_sc,d_wt,d_xabcd,dya,dyb,dyc,dyd,lM,lK);
+        CHECK_HIP(hipEventRecord(e7)); CHECK_HIP(hipEventSynchronize(e7));
+        float ims; CHECK_HIP(hipEventElapsedTime(&ims,e6,e7));
+
+        float ius=ims*1000.f/NITER;
+        float ibw=(float)wt_bytes/(ims/NITER*1e-3f)/1e9f;
+        printf("  [%d×%d]: %.1f µs/call  BW=%.0f GB/s  (%.1f MB weights)\n",
+               lM, lK, ius, ibw, (float)wt_bytes/1e6f);
+        printf("  %.0f%% of MI50 D2D BW (383 GB/s)\n", ibw/383.f*100.f);
+        printf("  Speedup vs scalar: %.2f×\n", bw > 0 ? ibw/bw : 0.f);
+        printf("\n  4-stream projected at this BW (Q5_K_M = %.1f GB):\n", q5_gb);
+        printf("    4-stream:       %.0f tok/s\n",   4.f / (q5_gb/ibw));
+        printf("    4-stream + MTP: %.0f tok/s  ← 80-100 tok/s target\n",   4.f*1.88f / (q5_gb/ibw));
+
+        hipFree(d_xabcd);
+
         hipFree(d_sc); hipFree(d_wt);
         hipFree(dxa); hipFree(dxb); hipFree(dxc); hipFree(dxd);
         hipFree(dya); hipFree(dyb); hipFree(dyc); hipFree(dyd);
         hipEventDestroy(e0); hipEventDestroy(e1);
+        hipEventDestroy(e2); hipEventDestroy(e3);
+        hipEventDestroy(e4); hipEventDestroy(e5);
+        hipEventDestroy(e6); hipEventDestroy(e7);
     }
 
     return 0;
