@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="640" viewBox="0 0 900 640">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <marker id="arr-grn" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#16a34a"/>
+    </marker>
+    <marker id="arr-red" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-org" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d97706"/>
+    </marker>
+    <filter id="shadow">
+      <feDropShadow dx="1" dy="2" stdDeviation="2" flood-color="#00000018"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="640" fill="#f8fafc" rx="8"/>
+
+  <!-- Title -->
+  <text x="450" y="34" text-anchor="middle" font-family="monospace" font-size="17" font-weight="bold" fill="#1e293b">Packed Twin Inference — Speculative Decoding Loop</text>
+  <text x="450" y="52" text-anchor="middle" font-family="monospace" font-size="11" fill="#64748b">Twin A (verifier at n) and Twin B (drafter at n+1) share one SSQ weight load per step</text>
+
+  <!-- ── Legend ───────────────────────────────────────────────── -->
+  <rect x="30" y="65" width="840" height="24" rx="4" fill="#f1f5f9"/>
+  <rect x="44" y="72" width="14" height="10" rx="2" fill="#2563eb"/>
+  <text x="62" y="81" font-family="monospace" font-size="10" fill="#1e40af">Twin A (verifier)</text>
+  <rect x="184" y="72" width="14" height="10" rx="2" fill="#d97706"/>
+  <text x="202" y="81" font-family="monospace" font-size="10" fill="#92400e">Twin B (drafter)</text>
+  <rect x="324" y="72" width="14" height="10" rx="2" fill="#16a34a"/>
+  <text x="342" y="81" font-family="monospace" font-size="10" fill="#166534">Accept path</text>
+  <rect x="444" y="72" width="14" height="10" rx="2" fill="#dc2626"/>
+  <text x="462" y="81" font-family="monospace" font-size="10" fill="#991b1b">Reject path</text>
+  <rect x="554" y="72" width="14" height="10" rx="2" fill="#7c3aed"/>
+  <text x="572" y="81" font-family="monospace" font-size="10" fill="#4c1d95">Shared weight load</text>
+  <text x="700" y="81" font-family="monospace" font-size="10" fill="#64748b">KV_A = Twin A cache, KV_B = Twin B cache</text>
+
+  <!-- ── Step 0: PREFILL ──────────────────────────────────────── -->
+  <rect x="30" y="102" width="840" height="60" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="450" y="122" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="#166534">PREFILL  (prompt tokens 0 … P-1)</text>
+  <text x="450" y="140" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Both twins prefill independently on the same prompt.</text>
+  <text x="450" y="155" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Twin B gets a deep-copy of Twin A's KV cache after prefill.  (copy.deepcopy)</text>
+
+  <!-- Arrow down -->
+  <line x1="450" y1="162" x2="450" y2="184" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="460" y="178" font-family="monospace" font-size="9" fill="#64748b">step n=0</text>
+
+  <!-- ── STEP CYCLE ─────────────────────────────────────────── -->
+
+  <!-- Step box header -->
+  <rect x="30" y="185" width="840" height="24" rx="4" fill="#7c3aed" opacity="0.9"/>
+  <text x="450" y="201" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="white">STEP n  (repeats every token)  —  ONE SSQ WEIGHT LOAD FROM HBM</text>
+
+  <!-- ── Phase 1: Load packed weights ── -->
+  <rect x="30" y="210" width="840" height="38" rx="4" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="155" y="228" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#4c1d95">① HBM load</text>
+  <text x="450" y="228" text-anchor="middle" font-family="monospace" font-size="10" fill="#4c1d95">W_packed = load uint16 block from VRAM  (68 bytes / 32 weights)</text>
+  <text x="450" y="242" text-anchor="middle" font-family="monospace" font-size="9" fill="#6d28d9">wa = int8(pw &gt;&gt; 8)  ←  Twin A weight  │  wb = int8(pw &amp; 0xFF)  ←  Twin B weight</text>
+
+  <!-- ── Phase 2: Two parallel matmuls ── -->
+  <!-- Dividing line -->
+  <line x1="450" y1="250" x2="450" y2="315" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,2"/>
+
+  <!-- Twin A box -->
+  <rect x="30" y="250" width="415" height="65" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="237" y="268" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#1e40af">② Twin A — position n</text>
+  <text x="237" y="284" text-anchor="middle" font-family="monospace" font-size="10" fill="#1d4ed8">Input: confirmed_token[n],  KV_A</text>
+  <text x="237" y="298" text-anchor="middle" font-family="monospace" font-size="9" fill="#3b82f6">acc_a += scale_a * float(wa) * x_a[k]</text>
+  <text x="237" y="310" text-anchor="middle" font-family="monospace" font-size="10" fill="#1e40af">→ logits_a  →  actual_next = argmax(logits_a)</text>
+
+  <!-- Twin B box -->
+  <rect x="455" y="250" width="415" height="65" rx="4" fill="#fffbeb" stroke="#d97706" stroke-width="2" filter="url(#shadow)"/>
+  <text x="662" y="268" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#92400e">③ Twin B — position n+1 (speculative)</text>
+  <text x="662" y="284" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">Input: speculated_token[n],  KV_B</text>
+  <text x="662" y="298" text-anchor="middle" font-family="monospace" font-size="9" fill="#d97706">acc_b += scale_b * float(wb) * x_b[k]</text>
+  <text x="662" y="310" text-anchor="middle" font-family="monospace" font-size="10" fill="#92400e">→ speculation = argmax(logits_b)</text>
+
+  <!-- ── Phase 3: Verify ── -->
+  <!-- Arrows converging to verify diamond -->
+  <line x1="237" y1="315" x2="380" y2="342" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="662" y1="315" x2="520" y2="342" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Diamond verify -->
+  <polygon points="450,342 560,362 450,382 340,362" fill="#fef9c3" stroke="#ca8a04" stroke-width="2" filter="url(#shadow)"/>
+  <text x="450" y="358" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#713f12">④ VERIFY</text>
+  <text x="450" y="372" text-anchor="middle" font-family="monospace" font-size="9" fill="#92400e">B's last speculation == actual_next?</text>
+
+  <!-- ── ACCEPT path (left) ── -->
+  <text x="290" y="375" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#16a34a">YES  (accept)</text>
+  <line x1="340" y1="362" x2="90" y2="410" stroke="#16a34a" stroke-width="2" marker-end="url(#arr-grn)"/>
+
+  <rect x="30" y="410" width="260" height="80" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="2" filter="url(#shadow)"/>
+  <text x="160" y="430" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#166534">ACCEPT</text>
+  <text x="160" y="447" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">emit actual_next</text>
+  <text x="160" y="463" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">B's speculation is ready</text>
+  <text x="160" y="480" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">advance: n += 1,  no reset</text>
+
+  <!-- ── REJECT path (right) ── -->
+  <text x="610" y="375" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#dc2626">NO  (reject)</text>
+  <line x1="560" y1="362" x2="800" y2="410" stroke="#dc2626" stroke-width="2" marker-end="url(#arr-red)"/>
+
+  <rect x="620" y="410" width="260" height="80" rx="5" fill="#fff1f2" stroke="#dc2626" stroke-width="2" filter="url(#shadow)"/>
+  <text x="750" y="430" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#991b1b">REJECT</text>
+  <text x="750" y="447" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">emit actual_next</text>
+  <text x="750" y="463" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">clone A's KV cache → B</text>
+  <text x="750" y="480" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">reset B to position n+1</text>
+
+  <!-- ── Emit output ── -->
+  <rect x="330" y="410" width="240" height="35" rx="4" fill="#1e293b"/>
+  <text x="450" y="432" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="white">⑤ emit actual_next</text>
+
+  <!-- ── Loop back arrow ── -->
+  <!-- From accept -->
+  <line x1="160" y1="490" x2="160" y2="530" stroke="#16a34a" stroke-width="1.5"/>
+  <line x1="160" y1="530" x2="450" y2="530" stroke="#94a3b8" stroke-width="1.5"/>
+  <!-- From reject -->
+  <line x1="750" y1="490" x2="750" y2="530" stroke="#dc2626" stroke-width="1.5"/>
+  <line x1="750" y1="530" x2="450" y2="530" stroke="#94a3b8" stroke-width="1.5"/>
+  <!-- Up to next step -->
+  <line x1="450" y1="530" x2="450" y2="556" stroke="#94a3b8" stroke-width="1.5"/>
+  <!-- Loop label -->
+  <text x="450" y="545" text-anchor="middle" font-family="monospace" font-size="9" fill="#64748b">n += 1  →  back to  ①</text>
+  <line x1="450" y1="556" x2="450" y2="572" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ── Done check ── -->
+  <rect x="310" y="572" width="280" height="30" rx="4" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1"/>
+  <text x="450" y="591" text-anchor="middle" font-family="monospace" font-size="10" fill="#475569">n == max_new_tokens?  →  DONE</text>
+
+  <!-- ── Throughput callout ── -->
+  <rect x="290" y="445" width="320" height="58" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="450" y="462" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#166534">Greedy (identical twins):  100% accept</text>
+  <text x="450" y="478" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">→ emit 2 confirmed tokens per weight load</text>
+  <text x="450" y="494" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#16a34a">→ 2× throughput  vs single-stream baseline</text>
+
+  <!-- Key insight footer -->
+  <rect x="30" y="608" width="840" height="26" rx="4" fill="#1e293b"/>
+  <text x="450" y="625" text-anchor="middle" font-family="monospace" font-size="10" fill="#94a3b8">Draft cost = zero.  One weight load per step feeds both A (n) and B (n+1).  No extra VRAM.  No quality loss.</text>
+</svg>

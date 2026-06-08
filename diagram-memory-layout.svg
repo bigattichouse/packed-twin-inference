@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="540" viewBox="0 0 860 540">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#444"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-orange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97706"/>
+    </marker>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="2" dy="2" stdDeviation="3" flood-color="#00000022"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="540" fill="#f8fafc" rx="8"/>
+
+  <!-- Title -->
+  <text x="430" y="36" text-anchor="middle" font-family="monospace" font-size="18" font-weight="bold" fill="#1e293b">PTI Memory Layout — One HBM Load, Two Compute Streams</text>
+  <text x="430" y="56" text-anchor="middle" font-family="monospace" font-size="12" fill="#64748b">SSQ mode 16 block format: 68 bytes per 32-weight block</text>
+
+  <!-- ── HBM section ─────────────────────────────────────────────────── -->
+  <rect x="30" y="75" width="800" height="54" rx="6" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="430" y="95" text-anchor="middle" font-family="monospace" font-size="11" fill="#475569">HBM2 (High Bandwidth Memory — 1 TB/s)</text>
+
+  <!-- Packed weight rows -->
+  <rect x="60" y="101" width="122" height="22" rx="3" fill="#3b82f6" opacity="0.7"/>
+  <text x="121" y="116" text-anchor="middle" font-family="monospace" font-size="10" fill="white">block 0</text>
+  <rect x="184" y="101" width="122" height="22" rx="3" fill="#3b82f6" opacity="0.5"/>
+  <text x="245" y="116" text-anchor="middle" font-family="monospace" font-size="10" fill="white">block 1</text>
+  <rect x="308" y="101" width="122" height="22" rx="3" fill="#3b82f6" opacity="0.3"/>
+  <text x="369" y="116" text-anchor="middle" font-family="monospace" font-size="10" fill="#1e3a8a">block 2</text>
+  <text x="480" y="116" font-family="monospace" font-size="12" fill="#94a3b8">· · ·</text>
+  <rect x="580" y="101" width="188" height="22" rx="3" fill="#cbd5e1" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="674" y="116" text-anchor="middle" font-family="monospace" font-size="10" fill="#64748b">blocks 3 … N-1</text>
+
+  <!-- ── Block 0 exploded view ──────────────────────────────────────── -->
+  <text x="430" y="162" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="#334155">Block 0 — 68 bytes</text>
+
+  <!-- Block layout bar -->
+  <!-- scale_a: 2 bytes -->
+  <rect x="60" y="172" width="52" height="42" rx="4" fill="#2563eb" filter="url(#shadow)"/>
+  <text x="86" y="188" text-anchor="middle" font-family="monospace" font-size="10" fill="white" font-weight="bold">scale_a</text>
+  <text x="86" y="202" text-anchor="middle" font-family="monospace" font-size="9" fill="#bfdbfe">f16 · 2B</text>
+  <text x="86" y="212" text-anchor="middle" font-family="monospace" font-size="9" fill="#bfdbfe">[0-1]</text>
+
+  <!-- scale_b: 2 bytes -->
+  <rect x="116" y="172" width="52" height="42" rx="4" fill="#d97706" filter="url(#shadow)"/>
+  <text x="142" y="188" text-anchor="middle" font-family="monospace" font-size="10" fill="white" font-weight="bold">scale_b</text>
+  <text x="142" y="202" text-anchor="middle" font-family="monospace" font-size="9" fill="#fde68a">f16 · 2B</text>
+  <text x="142" y="212" text-anchor="middle" font-family="monospace" font-size="9" fill="#fde68a">[2-3]</text>
+
+  <!-- 32 × uint16 weights -->
+  <!-- Group them as 8 slots (labeling every 4th) -->
+  <rect x="172" y="172" width="628" height="42" rx="4" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/>
+  <text x="486" y="183" text-anchor="middle" font-family="monospace" font-size="10" fill="#475569">32 × uint16  (64 bytes, indices [4-67])</text>
+  <!-- Individual uint16 slots, 8 shown -->
+  <g font-family="monospace" font-size="9">
+    <rect x="174" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="190" y="201" text-anchor="middle" fill="#4c1d95">w[0]</text>
+    <rect x="209" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="225" y="201" text-anchor="middle" fill="#4c1d95">w[1]</text>
+    <rect x="244" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="260" y="201" text-anchor="middle" fill="#4c1d95">w[2]</text>
+    <rect x="279" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="295" y="201" text-anchor="middle" fill="#4c1d95">w[3]</text>
+    <text x="328" y="201" text-anchor="middle" fill="#94a3b8">· · ·</text>
+    <rect x="345" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="361" y="201" text-anchor="middle" fill="#4c1d95">w[28]</text>
+    <rect x="380" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="396" y="201" text-anchor="middle" fill="#4c1d95">w[29]</text>
+    <rect x="415" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="431" y="201" text-anchor="middle" fill="#4c1d95">w[30]</text>
+    <rect x="450" y="189" width="33" height="22" rx="2" fill="#ddd6fe" stroke="#7c3aed" stroke-width="1"/>
+    <text x="466" y="201" text-anchor="middle" fill="#4c1d95">w[31]</text>
+  </g>
+
+  <!-- ── uint16 zoom ──────────────────────────────────────────────── -->
+  <!-- Arrow from w[0] down -->
+  <line x1="190" y1="211" x2="190" y2="258" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+
+  <text x="430" y="256" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="#334155">uint16 zoomed — one weight slot</text>
+
+  <!-- uint16 detail box -->
+  <rect x="80" y="265" width="700" height="68" rx="6" fill="#fafafa" stroke="#475569" stroke-width="1.5"/>
+
+  <!-- bit ruler -->
+  <text x="430" y="282" text-anchor="middle" font-family="monospace" font-size="9" fill="#94a3b8">bit 15 ──────────────── 8  |  7 ──────────────── 0</text>
+
+  <!-- Hi byte (Twin A) -->
+  <rect x="92" y="286" width="328" height="36" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="256" y="305" text-anchor="middle" font-family="monospace" font-size="13" font-weight="bold" fill="#1e40af">Twin A  int8  (hi byte)</text>
+  <text x="256" y="319" text-anchor="middle" font-family="monospace" font-size="10" fill="#3b82f6">wa = (int8_t)(pw &gt;&gt; 8)</text>
+
+  <!-- Lo byte (Twin B) -->
+  <rect x="440" y="286" width="328" height="36" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text x="604" y="305" text-anchor="middle" font-family="monospace" font-size="13" font-weight="bold" fill="#92400e">Twin B  int8  (lo byte)</text>
+  <text x="604" y="319" text-anchor="middle" font-family="monospace" font-size="10" fill="#d97706">wb = (int8_t)(pw &amp; 0xFF)</text>
+
+  <!-- Divider line -->
+  <line x1="430" y1="286" x2="430" y2="322" stroke="#475569" stroke-width="2"/>
+  <text x="430" y="283" text-anchor="middle" font-family="monospace" font-size="9" fill="#475569">|</text>
+
+  <!-- ── Compute streams ─────────────────────────────────────────── -->
+  <!-- Arrow Twin A -->
+  <line x1="200" y1="322" x2="130" y2="388" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)"/>
+  <!-- Arrow Twin B -->
+  <line x1="600" y1="322" x2="700" y2="388" stroke="#d97706" stroke-width="2" marker-end="url(#arr-orange)"/>
+
+  <!-- Twin A compute box -->
+  <rect x="30" y="388" width="280" height="88" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="170" y="410" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="#1e40af">Twin A  (position n)</text>
+  <text x="170" y="428" text-anchor="middle" font-family="monospace" font-size="10" fill="#1e40af">Verifier — confirms token n</text>
+  <text x="170" y="448" text-anchor="middle" font-family="monospace" font-size="10" fill="#1d4ed8">acc_a += scale_a</text>
+  <text x="170" y="462" text-anchor="middle" font-family="monospace" font-size="10" fill="#1d4ed8">        * float(wa) * x_a[k]</text>
+  <text x="170" y="476" text-anchor="middle" font-family="monospace" font-size="10" fill="#64748b">→ produces token n+1</text>
+
+  <!-- Twin B compute box -->
+  <rect x="550" y="388" width="280" height="88" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="2" filter="url(#shadow)"/>
+  <text x="690" y="410" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold" fill="#92400e">Twin B  (position n+1)</text>
+  <text x="690" y="428" text-anchor="middle" font-family="monospace" font-size="10" fill="#92400e">Drafter — speculates token n+1</text>
+  <text x="690" y="448" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">acc_b += scale_b</text>
+  <text x="690" y="462" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">        * float(wb) * x_b[k]</text>
+  <text x="690" y="476" text-anchor="middle" font-family="monospace" font-size="10" fill="#64748b">→ predicts token n+2</text>
+
+  <!-- Center annotation: ONE LOAD -->
+  <rect x="330" y="393" width="200" height="78" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="2" filter="url(#shadow)"/>
+  <text x="430" y="415" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#166534">One HBM load</text>
+  <text x="430" y="432" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">68 bytes / block</text>
+  <text x="430" y="449" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">serves both streams</text>
+  <text x="430" y="466" text-anchor="middle" font-family="monospace" font-size="13" font-weight="bold" fill="#16a34a">→ 2× throughput</text>
+
+  <!-- Footer -->
+  <text x="430" y="524" text-anchor="middle" font-family="monospace" font-size="10" fill="#94a3b8">Draft is free — it rides the same memory load as the verifier</text>
+</svg>
