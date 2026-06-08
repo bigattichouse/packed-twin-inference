@@ -120,6 +120,23 @@ mtp-run: pti_mtp
 mtp-run-base: pti_mtp
 	./pti_mtp -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
 
+# ── pti_4seq: 4-sequence PTI ──────────────────────────────────────────────────
+#   make 4seq              build pti_4seq
+#   make 4seq-run          run 4-seq PTI on UD-Q6_K_XL (target: ~2×)
+#   make 4seq-run-base     run baseline on UD-Q6_K_XL
+
+4seq: pti_4seq
+
+pti_4seq: pti_4seq.cpp
+	g++ $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built pti_4seq"
+
+4seq-run: pti_4seq
+	./pti_4seq -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
+
+4seq-run-base: pti_4seq
+	./pti_4seq -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
 # ── Utility ───────────────────────────────────────────────────────────────────
 clean:
 	rm -f $(TARGET_BIN) $(TARGET_BIN_CUDA) $(TARGET_SO) $(TARGET_SO_CUDA) pti_llama *.o

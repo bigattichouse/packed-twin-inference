@@ -97,6 +97,7 @@ Acceptance rate and output identity are the meaningful signals.
 | PTI — llama.cpp | UD-Q6_K_XL | **30.5** | **1.57×** | 2 tokens per accept |
 | PTI — SSQ HIP kernel | any Q8 | ~42 | **2.00×** | fused weight load (projected) |
 | PTI + MTP (llama.cpp, 3-seq) | UD-Q6_K_XL | **33.9** | **1.75×** | triple-batch, 3 tokens/accept (C++) |
+| PTI 4-seq (llama.cpp) | UD-Q6_K_XL | **38.1** | **1.96×** | quad-batch, 4 tokens/accept |
 | PTI + MTP (SSQ kernel) | UD-Q6_K_XL | ~65 | **~3.4×** | fused kernel + MTP k=1 |
 
 The UD-Q6_K_XL has `nextn_predict_layers=1` (MTP head present). PTI on this model
@@ -104,6 +105,17 @@ yields 1.57× vs 1.38× on Q5_K_M — the dual-batch is proportionally more effi
 
 **Gap to 2×**: dual-batch runs 2 separate KV attention paths per layer. SSQ HIP
 kernel fuses both matmuls behind one HBM weight load, eliminating that overhead.
+
+**Overhead scaling (measured, UD-Q6_K_XL MI50)**:
+
+| N seqs | tok/s | multiplier | step overhead | overhead increment |
+|---|---|---|---|---|
+| 1 (baseline) | 19.4 | 1.00× | 1.00× | — |
+| 2 | 30.5 | 1.57× | 1.27× | +0.27 |
+| 3 | 33.9 | 1.75× | 1.71× | +0.44 |
+| 4 | 38.1 | **1.96×** | 2.04× | +0.33 |
+
+Overhead grows sub-linearly per sequence added. 4 tokens / 2.04× overhead ≈ 1.96×. Adding a 5th sequence would cost another ~0.3× overhead → 5/2.35 ≈ 2.1× — marginal gain.
 
 **Why PTI × MTP ≠ 1.57 × 1.9 on llama.cpp**: PTI's 1.57× is already capped by
 dual-batch overhead (2× attention per step). Adding MTP as a 3rd sequence
@@ -131,6 +143,7 @@ On bandwidth-bound hardware (MI50, 1 TB/s HBM2), all compute overhead is hidden.
 | ② PTI — SSQ kernel | 1 + accept | **2.00×** | ✓ projected; kernel ready |
 | ③ MTP only (UD-Q6_K_XL) | k = 1 | **~1.9×** | MTP head is 1 extra layer (~free) |
 | ④ PTI + MTP — llama.cpp | 3-seq triple-batch | **1.75×** | ✓ measured: 33.9 tok/s (UD-Q6_K_XL) |
+| ④ PTI 4-seq — llama.cpp | 4-seq quad-batch | **1.96×** | ✓ measured: 38.1 tok/s (UD-Q6_K_XL) |
 | ⑤ PTI + MTP — SSQ kernel | (1+accept)×k | **~3.4×** | fused weight load; gains multiply |
 
 Qwen3.6 has Multi-Token Prediction (MTP) built in — the model head predicts
@@ -178,7 +191,8 @@ High acceptance on the target domain; falling acceptance signals off-domain.
 | `pti_kernel.hip` | HIP/ROCm kernel — packed matmul, attention, verify |
 | `pti_hip.py` | Python wrapper for the compiled HIP kernel (ctypes) |
 | `pti_llama.c` | 2-seq PTI via llama.cpp C API (measured: 1.38–1.57×) |
-| `pti_mtp.cpp` | 3-seq PTI + MTP re-init via llama.cpp C++ API (projected: ~1.7×) |
+| `pti_mtp.cpp` | 3-seq PTI + MTP re-init via llama.cpp C++ API (measured: 1.75×) |
+| `pti_4seq.cpp` | 4-seq PTI via llama.cpp C API (measured: **1.96×**, ~2× target) |
 | `Makefile` | Build HIP kernel, pti_llama, and pti_mtp |
 | `DESIGN.md` | Full design rationale, math, and implementation details |
 | `diagram-memory-layout.svg` | How uint16 packs two int8 weights — one load, two streams |
