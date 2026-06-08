@@ -202,7 +202,7 @@ static int run_pti3(const PTIArgs *args) {
     if (n_prompt < 0) { fprintf(stderr, "Tokenize failed\n"); return 1; }
     fprintf(stderr, "Prompt: %d tokens\n\n", n_prompt);
 
-    // ── Prefill (seq 0, all prompt tokens) ─────────────────────────────────
+    // ── Prefill: seq 0, then copy to seqs 1 and 2 ──────────────────────────
     struct llama_batch batch = llama_batch_init(n_prompt + 8, 0, 3);
     batch_clear(&batch);
     for (int i = 0; i < n_prompt; i++)
@@ -216,7 +216,6 @@ static int run_pti3(const PTIArgs *args) {
     float *lp = llama_get_logits_ith(ctx, batch.n_tokens - 1);
     llama_token tok_gen_0 = (llama_token)argmax_f(lp, n_vocab);
 
-    // Copy seq 0 KV into seqs 1 and 2
     llama_memory_seq_cp(mem, 0, 1, 0, -1);
     llama_memory_seq_cp(mem, 0, 2, 0, -1);
 
@@ -224,38 +223,24 @@ static int run_pti3(const PTIArgs *args) {
     fprintf(stderr, "Output: ");
     print_token(vocab, tok_gen_0);
 
-    // ── B-init: B processes tok_gen_0 at pos_a (seq 1) ─────────────────────
+    // ── B+C init stage 1: both process tok_gen_0 at pos_a ──────────────────
+    // Two separate entries (n_seq_id=1 each): B gets logits, C fills its KV.
     batch_clear(&batch);
-    batch_add(&batch, tok_gen_0, pos_a, 1, true);
-    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "B init failed\n"); return 1; }
+    batch_add(&batch, tok_gen_0, pos_a, 1, true);   // B: want logits
+    batch_add(&batch, tok_gen_0, pos_a, 2, false);  // C: fill KV at pos_a
+    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "B+C init stage 1 failed\n"); return 1; }
 
     llama_token tok_b = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
     llama_pos   pos_b = pos_a + 1;
 
-    // ── C-init: C processes tok_gen_0 at pos_a (seq 2), then tok_b at pos_b ─
-    // Stage 1: C gets KV at pos_a (needed before C can attend at pos_a+1)
+    // ── C-init stage 2: C processes tok_b at pos_b to produce tok_c ────────
+    // Full decode only: partial-range cross-stream seq_cp fails on hybrid models,
+    // so MTP cannot be used here (it would need seq_cp to populate C's KV at pos_b).
+    // MTP is only used on the reject path in the main loop (full-stream seq_cp via -1).
     batch_clear(&batch);
-    batch_add(&batch, tok_gen_0, pos_a, 2, true);
-    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "C init stage 1 failed\n"); return 1; }
-    // Stage 2: C processes tok_b at pos_b to produce tok_c speculation
-    // Try MTP first (saves a full forward pass)
-    llama_token tok_c = -1;
-    if (ctx_mtp) {
-        // batch_idx_b=0 from the B-init batch (tok_b was at index 0)
-        // But we need H_b from B-init which happened in a previous decode call.
-        // The pre-norm embeddings from the most recent decode are the C-init stage1
-        // (not B-init). So MTP on stage1 gives H for tok_gen_0 at pos_a for seq 2.
-        // Use MTP on stage1's H to warm-start, then fall through to full C decode.
-        // NOTE: For simplicity, always do the full C decode on init.
-        tok_c = -1;  // force fallback
-    }
-    if (tok_c < 0) {
-        // Fall back: full C decode at pos_b
-        batch_clear(&batch);
-        batch_add(&batch, tok_b, pos_b, 2, true);
-        if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "C init stage 2 failed\n"); return 1; }
-        tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-    }
+    batch_add(&batch, tok_b, pos_b, 2, true);
+    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "C init stage 2 failed\n"); return 1; }
+    llama_token tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
     llama_pos pos_c = pos_b + 1;
 
     // Main loop state
@@ -325,25 +310,16 @@ static int run_pti3(const PTIArgs *args) {
                 tok_a = actual_next;
                 tok_b = next_from_b;
 
-                // Trim C back to B's current position, then re-seed tok_c
+                // Trim C back to B's current position, then re-seed tok_c via full decode.
+                // (Partial cross-stream seq_cp fails on hybrid models — no MTP shortcut here.)
                 llama_memory_seq_rm(mem, 2, pos_c - 1, -1);
                 pos_c = pos_b;
 
-                // Try MTP (batch_idx 1 = B in the triple-batch we just ran)
-                tok_c = mtp_predict_next(ctx_mtp, ctx, /*batch_idx_b=*/1,
-                                         tok_b, pos_b - 1, n_embd, n_vocab);
-                if (tok_c < 0) {
-                    // Fallback: full C decode
-                    batch_clear(&step_batch);
-                    batch_add(&step_batch, next_from_b, pos_c, 2, true);
-                    if (llama_decode(ctx, step_batch) == 0) {
-                        tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                        pos_c++;
-                    }
-                } else {
-                    // MTP predicted tok_c; C's KV via seq_cp from B
-                    llama_memory_seq_cp(mem, 1, 2, pos_b - 1, pos_b);
-                    pos_c = pos_b + 1;
+                batch_clear(&step_batch);
+                batch_add(&step_batch, next_from_b, pos_c, 2, true);
+                if (llama_decode(ctx, step_batch) == 0) {
+                    tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
+                    pos_c++;
                 }
 
                 if (llama_vocab_is_eog(vocab, next_from_b)) break;
@@ -370,20 +346,12 @@ static int run_pti3(const PTIArgs *args) {
                 tok_b = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
                 pos_b++;
 
-                // Re-init C: try MTP on B's H from the re-init decode (batch_idx 0)
-                tok_c = mtp_predict_next(ctx_mtp, ctx, /*batch_idx_b=*/0,
-                                         actual_next, pos_b - 1, n_embd, n_vocab);
-                if (tok_c < 0) {
-                    // Fallback: full C decode at pos_b
-                    batch_clear(&step_batch);
-                    batch_add(&step_batch, tok_b, pos_b, 2, true);
-                    if (llama_decode(ctx, step_batch) == 0) {
-                        tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                        pos_c = pos_b + 1;
-                    }
-                } else {
-                    // MTP predicted tok_c; update C's KV via seq_cp from B
-                    llama_memory_seq_cp(mem, 1, 2, pos_b - 1, pos_b);
+                // Re-init C via full decode at pos_b.
+                // (Partial cross-stream seq_cp fails on hybrid models — no MTP shortcut here.)
+                batch_clear(&step_batch);
+                batch_add(&step_batch, tok_b, pos_b, 2, true);
+                if (llama_decode(ctx, step_batch) == 0) {
+                    tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
                     pos_c = pos_b + 1;
                 }
             }
