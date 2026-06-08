@@ -89,31 +89,40 @@ Acceptance rate and output identity are the meaningful signals.
 
 ## Measured Throughput (MI50, Qwen3.6-27B)
 
-| Config | Model | tok/s | multiplier | notes |
-|---|---|---|---|---|
-| Baseline | Q5_K_M | 21.1 | 1.00× | single stream |
-| PTI — llama.cpp | Q5_K_M | **28.9** | **1.38×** | 2 tokens per accept |
-| Baseline | UD-Q6_K_XL | 19.4 | 1.00× | single stream |
-| PTI — llama.cpp | UD-Q6_K_XL | **30.5** | **1.57×** | 2 tokens per accept |
-| PTI — SSQ HIP kernel | any Q8 | ~42 | **2.00×** | fused weight load (projected) |
-| PTI + MTP (llama.cpp, 3-seq) | UD-Q6_K_XL | **33.9** | **1.75×** | triple-batch, 3 tokens/accept (C++) |
-| PTI 4-seq (llama.cpp) | UD-Q6_K_XL | **38.1** | **1.96×** | quad-batch, 4 tokens/accept |
-| PTI + MTP (SSQ kernel) | UD-Q6_K_XL | ~65 | **~3.4×** | fused kernel + MTP k=1 |
+VRAM = GPU-resident memory only (model weights on ROCm0 + KV/state + compute buffer).
+CPU_Mapped weights (embedding table overflow): +0.8 GiB for Q5_K_M, +1.3 GiB for UD-Q6_K_XL.
+
+| Config | Model | tok/s | multiplier | GPU VRAM | notes |
+|---|---|---|---|---|---|
+| Baseline | Q5_K_M | 21.1 | 1.00× | 18.1 GiB | 17.3 model + 0.3 KV/state + 0.5 compute |
+| PTI 2-seq — llama.cpp | Q5_K_M | **28.9** | **1.38×** | 18.4 GiB | +0.3 GiB vs baseline |
+| Baseline | UD-Q6_K_XL | 19.4 | 1.00× | 23.7 GiB | 22.9 model + 0.3 KV/state + 0.5 compute |
+| PTI 2-seq — llama.cpp | UD-Q6_K_XL | **30.5** | **1.57×** | 24.0 GiB | +0.3 GiB vs baseline |
+| PTI 3-seq — llama.cpp | UD-Q6_K_XL | **33.9** | **1.75×** | 24.3 GiB | +0.6 GiB vs baseline |
+| PTI 4-seq — llama.cpp | UD-Q6_K_XL | **38.1** | **1.96×** | 24.5 GiB | +0.8 GiB vs baseline |
+| PTI SSQ HIP kernel | Q8 packed | ~40 | **~2×** | ~29 GiB (est.) | two models in one uint16 file |
+| PTI + MTP (SSQ kernel) | UD-Q6_K_XL | ~65 | **~3.4×** | ~29 GiB (est.) | fused kernel + MTP k=1 |
+
+**VRAM note**: PTI on llama.cpp costs almost no extra VRAM — 0.3–0.8 GiB across 2–4 sequences,
+because KV/state per sequence is tiny (~278 MiB) relative to model weights (~23 GiB).
+Standard speculative decoding needs a 2nd draft model: ~4–19 GiB extra depending on size.
 
 The UD-Q6_K_XL has `nextn_predict_layers=1` (MTP head present). PTI on this model
 yields 1.57× vs 1.38× on Q5_K_M — the dual-batch is proportionally more efficient.
 
-**Gap to 2×**: dual-batch runs 2 separate KV attention paths per layer. SSQ HIP
-kernel fuses both matmuls behind one HBM weight load, eliminating that overhead.
+**How PTI works on llama.cpp**: no special tricks — one model, one context, one
+`llama_decode` call per step with a 4-token batch (one per sequence). llama.cpp
+already shares weight loads across all tokens in a batch. The gain comes entirely
+from emitting N tokens per step while paying only ~2× the single-token step cost.
 
 **Overhead scaling (measured, UD-Q6_K_XL MI50)**:
 
-| N seqs | tok/s | multiplier | step overhead | overhead increment |
-|---|---|---|---|---|
-| 1 (baseline) | 19.4 | 1.00× | 1.00× | — |
-| 2 | 30.5 | 1.57× | 1.27× | +0.27 |
-| 3 | 33.9 | 1.75× | 1.71× | +0.44 |
-| 4 | 38.1 | **1.96×** | 2.04× | +0.33 |
+| N seqs | tok/s | multiplier | step overhead | overhead increment | GPU VRAM |
+|---|---|---|---|---|---|
+| 1 (baseline) | 19.4 | 1.00× | 1.00× | — | 23.7 GiB |
+| 2 | 30.5 | 1.57× | 1.27× | +0.27 | 24.0 GiB |
+| 3 | 33.9 | 1.75× | 1.71× | +0.44 | 24.3 GiB |
+| 4 | 38.1 | **1.96×** | 2.04× | +0.33 | 24.5 GiB |
 
 Overhead grows sub-linearly per sequence added. 4 tokens / 2.04× overhead ≈ 1.96×. Adding a 5th sequence would cost another ~0.3× overhead → 5/2.35 ≈ 2.1× — marginal gain.
 

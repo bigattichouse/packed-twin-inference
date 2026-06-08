@@ -264,6 +264,44 @@ The gap from 1.38× to 2×: llama.cpp reads two separate KV caches per step (A a
 
 ---
 
+## How PTI Works on llama.cpp (No Special Tricks)
+
+`pti_4seq.cpp` achieves 1.96× with standard llama.cpp API:
+
+1. Load one model once
+2. Create one context with `n_seq_max=4`
+3. Each step: submit a 4-token batch — one token per sequence — to a single `llama_decode`
+4. llama.cpp shares the weight load internally across all tokens in the batch
+
+There are no custom kernels, no model modifications, no format changes. The throughput
+gain comes entirely from the batch API: llama.cpp loads each weight tensor once and
+computes against all 4 tokens simultaneously.
+
+**Why it works**: batch=1 LLM inference is memory-bandwidth-bound. The weight tensors
+are loaded from HBM once per layer regardless of how many tokens are in the batch
+(up to some capacity limit). Adding 3 more sequences adds attention computation and
+KV cache reads for the divergent tail — but those are small relative to the weight load.
+
+**VRAM cost**: almost free.
+
+| Config | GPU VRAM | vs baseline |
+|---|---|---|
+| Baseline 1-seq | 23.7 GiB | — |
+| PTI 2-seq | 24.0 GiB | +0.3 GiB |
+| PTI 3-seq | 24.3 GiB | +0.6 GiB |
+| PTI 4-seq | 24.5 GiB | +0.8 GiB |
+
+KV + recurrent state per sequence = ~278 MiB (tiny vs 22.9 GiB model). Standard
+speculative decoding would require a 2nd draft model: +4–19 GiB depending on size.
+
+**The ceiling**: at 4 sequences, step overhead is 2.04× single-batch → 4/2.04 ≈ 1.96×.
+A 5th sequence adds ~1 more token but costs another ~0.3× overhead → 5/2.35 ≈ 2.1×.
+Returns diminish. The SSQ fused kernel is the path beyond 2× because it eliminates
+the per-sequence overhead entirely: all N sequences share ONE weight load, so adding
+a sequence costs only the divergent-tail attention — which is negligible.
+
+---
+
 ## The 1.38× → 2× Gap: Root Cause and Fix
 
 ### What's costing us
