@@ -6,3 +6,4 @@ pti_test_cuda
 libpti.so
 libpti_cuda.so
 pti_llama
+pti_mtp

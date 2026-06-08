@@ -80,19 +80,21 @@ LLAMA_DIR    ?= ../llama.cpp
 LLAMA_INC    := $(LLAMA_DIR)/include $(LLAMA_DIR)/ggml/include
 LLAMA_LIBDIR := $(LLAMA_DIR)/build/bin
 LLAMA_CFLAGS := -O2 $(addprefix -I,$(LLAMA_INC))
-LLAMA_LDFLAGS := -L$(LLAMA_LIBDIR) -lllama -Wl,-rpath,$(abspath $(LLAMA_LIBDIR)) -lm -lstdc++
+LLAMA_CXXFLAGS := -O2 -std=c++17 $(addprefix -I,$(LLAMA_INC)) -I$(LLAMA_DIR)/src
+LLAMA_LDFLAGS := -L$(LLAMA_LIBDIR) -lllama -Wl,-rpath,$(abspath $(LLAMA_LIBDIR)) -lm
 
 TEST_MODEL   ?= ../gguf/Qwen3.6-27B-Q5_K_M.gguf
+MTP_MODEL    ?= ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf
 TEST_PROMPT  ?= The key to faster LLM inference is
 TEST_TOKENS  ?= 80
 NGL          ?= 99
 
-.PHONY: llama llama-run-pti llama-run-base
+.PHONY: llama llama-run-pti llama-run-base mtp mtp-run mtp-run-base
 
 llama: pti_llama
 
 pti_llama: pti_llama.c
-	gcc $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	gcc $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS) -lstdc++
 	@echo "Built pti_llama"
 
 llama-run-pti: pti_llama
@@ -100,6 +102,23 @@ llama-run-pti: pti_llama
 
 llama-run-base: pti_llama
 	./pti_llama -m $(TEST_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
+# ── pti_mtp: 3-sequence PTI + MTP re-init ────────────────────────────────────
+#   make mtp                   build pti_mtp (C++, requires UD-Q6_K_XL for MTP)
+#   make mtp-run               run 3-seq PTI on UD-Q6_K_XL
+#   make mtp-run-base          run baseline on UD-Q6_K_XL
+
+mtp: pti_mtp
+
+pti_mtp: pti_mtp.cpp
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built pti_mtp"
+
+mtp-run: pti_mtp
+	./pti_mtp -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
+
+mtp-run-base: pti_mtp
+	./pti_mtp -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 clean:
