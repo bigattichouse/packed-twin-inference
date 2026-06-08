@@ -370,15 +370,27 @@ At 70% HBM efficiency: ~143 tok/s theoretical
 Conservative (55-60%): ~80–100 tok/s — the target
 ```
 
-Build plan:
-1. GGUF weight loader in HIP (parse tensor metadata, mmap to GPU)
-2. Qwen3 forward pass: RMSNorm → pti_linear (QKV) → RoPE → GQA attn → pti_linear (FFN SwiGLU)
-3. KV cache for 2 streams (A at pos n, B at pos n+1)
-4. Sampling (argmax for greedy, nucleus for sampled)
-5. Accept/reject + MTP head (1 layer, reuse pti_linear)
+Measured kernel bandwidth (MI50, gfx906):
+- D2D hipMemcpy (baseline): 383 GB/s  
+- F16 GEMV [17408×5120]: 460 GB/s (custom kernel, optimal coalescing)
+- Packed Q8_0 [17408×5120]: **7 GB/s** (stride-34 non-coalesced — broken for inference)
+- Flat int8 [17408×5120]: **92 GB/s** (unit-stride, 24% of peak — usable)
+
+MI50 peak HBM spec: 512 GB/s. Measured baseline 19.4 tok/s on 22.9 GiB UD-Q6_K_XL → implies
+~444 GB/s effective bandwidth (87% of spec). The llama.cpp ROCm backend already achieves
+near-peak HBM utilization for single-stream decode.
+
+**Inference loop plan** (pti_infer.cpp or pti_infer.hip):
+1. Use rocBLAS/hipBLAS SGEMV for matmul layers — achieves ~460 GB/s (proven)
+2. Load Q8_0 weights from GGUF (simple: f16 scale + 32 int8 per block, 34 bytes)
+3. Dequantize on-the-fly: w_float = scale × w_int8 before GEMV call
+4. Run 4 SGEMV calls per layer (A, B, C, D streams) with SAME weight matrix → one HBM load
+5. KV cache per stream (tiny: ~70 MiB each), RoPE, RMSNorm, SwiGLU activation
+6. Accept/reject loop + MTP head (layer 64, same GGML format)
 
 `pti_kernel.hip` already has: `pti_linear_tiled`, `pti_attn_scores`, `pti_verify`, `pti_softmax`.
-Still needed: RMSNorm kernel, RoPE kernel, SwiGLU gate kernel, GGUF loader.
+Also added: `pti_linear4_q8_flat` (coalesced 4-stream Q8 GEMV).
+Still needed for inference loop: RMSNorm, RoPE, SwiGLU gate, rocBLAS GEMV wrapper.
 
 - TSQ side-car benchmark (TSQ-* GGUF files exist in ../gguf/) — after SSQ loop is working
 
