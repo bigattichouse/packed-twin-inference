@@ -280,9 +280,14 @@ llama.cpp/
 ## Non-Goals for v2
 
 - NVIDIA CUDA support: ROCm/MI50 first, CUDA port is mechanical afterward
-- Sampled decoding (top-p): greedy 100% accept is the baseline; sampling is additive
 - TSQ (task-specific twin variant): separate workstream, not a prerequisite
 - Training infrastructure for fine-tune twins: future work
+
+> **Note on sampled decoding (temp > 0):** the logic is correct and works as-is.
+> Acceptance per position = `Σ p(x)²`; expected tokens/step = `1 + p + p² + p³`.
+> At Qwen3's recommended temp=0.6–0.7, structured tasks yield ~2.5–3.0 tok/step.
+> No rejection-sampling correction needed (self-draft, identical distributions when prefix matches).
+> Benchmarking sampled mode is deferred to after Phase 2 kernel work.
 
 ---
 

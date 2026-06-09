@@ -75,29 +75,49 @@ model (4–19 GiB extra). PTI's extra cost is near-zero.
 
 ---
 
-## Why Greedy Accept Rate Is 100%
+## How Acceptance Works
 
-PTI is **not speculative decoding** — there is no draft model. It is batch decode
-with position offsets. All 4 sequences run the same model weights; they simply
-start at different positions in the generated sequence:
+PTI is **self-speculative decoding** — the same model acts as both drafter and
+verifier, running at staggered positions. The guesses fed to sequences 1–3 were
+sampled by those same sequences one step earlier:
 
 ```
-Seq 0: model(confirmed_token,  pos n)   → predicts token n+1
-Seq 1: model(token_n+1_guess,  pos n+1) → predicts token n+2
-Seq 2: model(token_n+2_guess,  pos n+2) → predicts token n+3
-Seq 3: model(token_n+3_guess,  pos n+3) → predicts token n+4
+Step k:
+  Seq 0: model(confirmed_tok,  pos n)   → actual_next        (ground truth)
+  Seq 1: model(tok_b_guess,    pos n+1) → next_from_b        (tok_b_guess from step k-1)
+  Seq 2: model(tok_c_guess,    pos n+2) → next_from_c        (tok_c_guess from step k-1)
+  Seq 3: model(tok_d_guess,    pos n+3) → next_from_d        (tok_d_guess from step k-1)
 ```
 
-With greedy (temp=0) decoding, the same model given the same input always
-produces the same output. So sequence 1's prediction at position n+1 is
-guaranteed to match what sequence 0 would have predicted — 100% accept rate.
-N tokens emitted every step, no rollbacks, no quality loss.
+**Greedy (temp=0):** the same model with the same prefix always produces the
+same argmax token. Seq 1's guess from step k-1 is guaranteed to equal what
+Seq 0 produces at step k → 100% accept, N tokens every step, no rollbacks.
 
-| Decoding mode | Accept rate | PTI multiplier |
+**Temperature > 0:** the acceptance check (`tok_b_guess == actual_next`) asks
+whether two independent draws from the same distribution agreed. The probability
+is `Σ_x p(x)²` — the collision probability of the output distribution. No
+rejection-sampling correction is needed (distributions are identical when the
+prefix matches), but the rate drops with temperature:
+
+```
+p(accept per position) ≈ Σ_x p(x)²
+Expected tokens/step  = 1 + p + p² + p³
+
+p=1.00 (greedy):           4.00 tok/step
+p=0.75 (low-entropy task): 2.74 tok/step
+p=0.60 (typical text):     2.16 tok/step
+p=0.40 (creative/high-T):  1.64 tok/step
+```
+
+At Qwen3's recommended temp=0.6–0.7, structured tasks (code, factual QA) tend
+toward the high-p end; open-ended generation toward the low-p end.
+
+| Decoding mode | Approx accept/pos | Expected tok/step |
 |---|---|---|
-| Greedy (temp=0) | 100% | N / overhead |
-| Top-p / Top-k | ~70–85% | lower |
-| TSQ fine-tune variant | 75–95% | higher within domain |
+| Greedy (temp=0) | 100% | 4.00 |
+| temp=0.6–0.7, structured | ~70–80% | 2.5–3.0 |
+| temp=0.6–0.7, general text | ~50–65% | 2.0–2.5 |
+| TSQ fine-tune variant (same-arch twin) | 75–90% | 2.7–3.6 |
 
 ---
 

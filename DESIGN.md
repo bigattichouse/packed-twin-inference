@@ -99,13 +99,19 @@ When both twins are the same model (identical weights):
 
 | Decoding mode | Acceptance rate | Notes |
 |---|---|---|
-| Greedy (temp=0) | **100%** | Identical twins always agree — proved empirically |
-| Sampling (top-p) | 70-85% | Depends on model confidence |
-| TSQ side-car (task-tuned B) | 75-95% | Higher within task domain |
+| Greedy (temp=0) | **100%** | Self-draft always agrees at greedy — proved empirically |
+| Sampling (temp=0.6–0.7, structured) | ~70–80% | p(agree) = Σ p(x)², peaked distribution |
+| Sampling (temp=0.6–0.7, general text) | ~50–65% | More diffuse distribution |
+| TSQ side-car (same-arch fine-tune twin) | 75–90% | Higher within task domain |
 
-Identical twins have a **higher acceptance ceiling** than small-model speculative
-decoding (~60-70%) because when the input assumption holds, the result is
-guaranteed identical — same weights, same computation.
+PTI uses **self-draft**: the same model weights run as both drafter and verifier at
+staggered positions. When a guess is correct, the distributions are identical (same
+model, same prefix) so no rejection-sampling correction is needed. Acceptance at
+temperature > 0 is purely the collision probability `Σ_x p(x)²` of each step's output
+distribution — high when the model is confident, lower when the output is ambiguous.
+
+This gives a **higher greedy ceiling** than small-model speculative decoding (~60–70%)
+because the drafter is the same model; the sampling ceiling depends on task entropy.
 
 ---
 
