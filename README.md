@@ -127,15 +127,21 @@ toward the high-p end; open-ended generation toward the low-p end.
 
 ---
 
-## MTP Integration (Qwen3.6-27B UD Model)
+## MTP Analysis (Qwen3.6-27B UD Model)
 
 The UD-Q6_K_XL model includes a Multi-Token Prediction head (`nextn_predict_layers=1`).
-This is why it outperforms Q5_K_M in PTI (1.57× vs 1.38× at 2-seq): the MTP head
-lets the model generate an additional draft token at near-zero cost.
+**Finding**: the MTP head takes `(tok_t, h_t from main model)` → predicts `t+1`.
+It predicts the *same position* the main model already computes — it is NOT a
+"next-next" predictor and cannot add a bonus 5th token to PTI output.
 
-`pti_mtp.cpp` uses the MTP head for faster state re-initialization after rejects.
-The measured 38.1 tok/s uses `pti_4seq.cpp` (no special MTP handling needed — the
-UD model's batch efficiency is inherently higher).
+`pti_4seq.cpp` creates the MTP context for correctness and future sampled-mode work,
+but at 100% greedy it is never invoked — there are no reject calls and D's logits
+already give the t+1 prediction. `pti_mtp.cpp` has the same result: `ctx_mtp` is
+created but never called in the main loop (the comment reads "no MTP shortcut here").
+
+The UD model outperforms Q5_K_M in PTI (1.57× vs 1.38× at 2-seq) due to its higher
+quantization quality per byte (6-bit) being more VRAM-bandwidth-efficient on the
+PTI multi-sequence path, not from the MTP head.
 
 ---
 
@@ -181,19 +187,27 @@ llama.cpp's `mul_mat_vec_q` for Q5_K_M achieves 393 GB/s because:
 2. The kernel already implements multi-row tiling with shared activations
 3. GCN (MI50) path: `nwarps=2`, `rows_per_cuda_block=2` — exactly the tiling we built
 
-### Why N=4 Batch Causes 2× Overhead
+### Why N=4 Batch Causes 2× Overhead (Revised)
 
-When `ncols_dst=4`, `mul_mat_vec_q` loads each activation block 4 times (one per
-sequence) per weight block iteration. The activation tensor grows 4× in L2 traffic
-while the weight reads stay constant. On MI50 with 16 MB L2, 4 × 20 KB activations
-(80 KB) still fits, but the increased L2 pressure and longer reduction tree cause
-the measured 2.04× overhead.
+**What we tested**: interleaving the 4 activation columns before the GEMV call
+(`GGML_PTI_INTERLEAVED=1` patch in `llama.cpp-patch/`). Result: **no speedup**
+(35.6 vs 38.1 tok/s, −6%, within noise).
 
-**The fix**: a PTI-aware kernel that reads 4 activation vectors simultaneously
-(interleaved float4 loads) and uses warp-shuffle reduction across all 4 streams —
-the approach validated in `pti_kernel.hip` at 130 GB/s (Q8 format). Ported to
-Q5_K_M's native format, this eliminates the multi-batch overhead and approaches
-the theoretical 4×/2.04× = 1.96× → ~4× improvement.
+**Root cause**: activation traffic is negligible compared to weight traffic:
+```
+Weight HBM traffic (Q6_K_XL): ~25 GB/step  (dominant)
+Activation L2 traffic (N=4):  ~480 MB/step  (<2% of weight traffic)
+```
+Optimizing activation L2 access cannot move the overall step time.
+
+**Actual root cause**: the `mul_mat_vec_q` inner loop runs 4× the multiply-accumulate
+operations for `ncols_dst=4` vs `ncols_dst=1`. The attention and SSM layers also
+scale linearly with N sequences. The 2.04× overhead is simply 4× more arithmetic
+split across the 64 main layers + 16 SSM layers, hitting a compute (not memory) wall.
+
+**The kernel rewrite target**: a fused PTI kernel that loads each weight block once
+and performs all 4 dot products in a single warp-cooperative pass — eliminating the
+per-column loop that causes the 4× compute scaling. See `PLAN.md` Phase 4 (M4).
 
 ---
 
@@ -202,9 +216,10 @@ the theoretical 4×/2.04× = 1.96× → ~4× improvement.
 ### Current State
 
 PTI at 2× works today using llama.cpp's public API. No patches needed.
-The source is `pti_4seq.cpp` (≈150 lines). The overhead limiting us to 2× comes
-from llama.cpp routing multi-token batches through a batch GEMM path instead of the
-optimal single-pass multi-stream GEMV.
+The source is `pti_4seq.cpp` (~200 lines). N=4 uses `mul_mat_vec_q` (MMVQ, the
+quantized GEMV path) — confirmed via dispatch analysis. The overhead comes from
+the MMVQ inner loop running 4× more multiply-accumulate operations per weight block
+when `ncols_dst=4`. Activation L2 traffic is negligible (<2% of weight traffic).
 
 ### Integration Architecture
 
@@ -218,44 +233,33 @@ llama.cpp
 The `mul_mat_vec_q` kernel already accepts a `c_ncols_dst` template parameter for
 multiple output columns. The GCN (MI50) path uses `nwarps=2` for `ncols_dst=1..4`.
 
-**Three targeted changes to llama.cpp:**
+**Two targeted changes to llama.cpp:**
 
-1. **Add PTI multi-stream kernel variant** (`mmvq.cu`):
-   Replace the N=4 GEMM dispatch with a PTI-aware kernel that loads each weight
-   block once and computes 4 dot products simultaneously with interleaved activation
-   reads. Expected: eliminate the 2.04× overhead → approach 4×.
+1. **Fused PTI GEMV kernel** (`mmvq.cu`):
+   Write a new `mul_mat_vec_q_pti<type, N>` kernel that loads each weight block
+   once and computes all N dot products cooperatively — no per-column inner loop.
+   Eliminates the 2.04× overhead → targets 60–75 tok/s.
 
-2. **Add PTI context API** (`llama.h` / `llama.cpp`):
+2. **PTI context API + decode loop** (`llama.h` / `llama.cpp`):
    ```c
-   // Proposed API addition
    llama_context_set_pti_streams(ctx, n_streams);
-   // Enables N-stream batching with automatic verify/accept in decode loop
+   // --pti 4 in llama-cli
    ```
-
-3. **Add PTI decode loop** (`src/llama.cpp`):
-   The verify/accept logic (currently in `pti_4seq.cpp`) migrates into
-   `llama_decode()` as an optional mode. Users get PTI by passing `--pti 4`
-   to llama-cli.
+   The verify/accept logic migrates from `pti_4seq.cpp` into `llama_decode()`.
 
 ### Expected Throughput After Integration
 
 | Stage | Technique | Expected tok/s | vs today |
 |---|---|---|---|
 | Today | pti_4seq.cpp (external) | 38.1 | — |
-| Step 1 | PTI kernel in mmvq.cu | ~50–60 | +30–60% |
-| Step 2 | PTI + Q5_K_M native format | ~65–75 | +70–100% |
-| Step 3 | PTI × MTP (UD model) | **80–100** | **+110–160%** |
+| **M4** | **Fused PTI GEMV kernel in mmvq.cu** | **60–75** | **+57–97%** |
+| M5 | llama-cli --pti flag, public API | 60–75 | shippable |
 
-**Step 1 estimate**: eliminating the GEMM overhead (2.04× → ~1.1×) at 4-seq gives
-`4 / 1.1 × 19.4 ≈ 70 tok/s`. Conservative at 50–60 accounts for L2 activation
-pressure remaining.
-
-**Step 3 ceiling** (PTI + MTP on Q5_K_M):
+**M4 estimate**: fused kernel eliminates the 4× inner-loop compute scaling
+(2.04× → ~1.1× overhead):
 ```
-Step cost:  18.6 GB (one Q5_K_M model load, native format)
-Tokens out: 2 streams × ~1.88 (MTP accept rate) ≈ 3.76 tokens/step
-Bandwidth per token: 18.6 / 3.76 = 4.9 GB/token
-At 393 GB/s (llama.cpp GEMV efficiency): 393 / 4.9 ≈ 80 tok/s
+4 / 1.1 × 19.4 ≈ 70 tok/s  (optimistic)
+4 / 1.3 × 19.4 ≈ 60 tok/s  (conservative, some compute overhead remains)
 ```
 
 ### Comparison to Standard Speculative Decoding
@@ -266,7 +270,7 @@ At 393 GB/s (llama.cpp GEMV efficiency): 393 / 4.9 ≈ 80 tok/s
 | Draft VRAM | +4–19 GiB | +0.2 GiB/seq | +0.2 GiB/seq |
 | Accept rate (greedy) | ~60–70% | **100%** | **100%** |
 | Quality | Draft model quality | Identical to baseline | Identical |
-| Throughput gain | ~1.6× | **1.96× (measured)** | **4–5× (projected)** |
+| Throughput gain | ~1.6× | **1.96× (measured)** | **3–4× (projected, M4)** |
 | llama.cpp patches | None needed | None needed | 3 targeted changes |
 
 ---
@@ -276,7 +280,7 @@ At 393 GB/s (llama.cpp GEMV efficiency): 393 / 4.9 ≈ 80 tok/s
 | Diagram | What it shows |
 |---|---|
 | `diagram-pti-4seq-step.svg` | One full PTI step: 4-token batch, weight sharing, verify/accept/reject paths, KV layout |
-| `diagram-pti-overhead.svg` | Why overhead is 2× not 4×: weight load shared, activation reads are the cost, throughput bars |
+| `diagram-pti-overhead.svg` | Why overhead is 2× not 4×: weight load shared, 4× inner-loop compute scaling, throughput bars |
 | `diagram-memory-layout.svg` | SSQ uint16 block format — how two int8 weights pack into one word |
 | `diagram-workflow.svg` | High-level PTI inference loop from prefill through accept/reject |
 
@@ -286,8 +290,8 @@ At 393 GB/s (llama.cpp GEMV efficiency): 393 / 4.9 ≈ 80 tok/s
 
 | File | Purpose | Status |
 |---|---|---|
-| `pti_4seq.cpp` | 4-sequence PTI — public llama.cpp API | ✓ measured: 38.1 tok/s |
-| `pti_mtp.cpp` | 3-sequence PTI + MTP re-init | ✓ measured: 33.9 tok/s |
+| `pti_4seq.cpp` | 4-sequence PTI — public llama.cpp API | ✓ 38.1 tok/s steady-state, ~32 amortized |
+| `pti_mtp.cpp` | 3-sequence PTI + MTP context (created, not invoked) | ✓ measured: 33.9 tok/s |
 | `pti_llama.c` | 2-sequence PTI — C API (baseline) | ✓ measured: 28.9–30.5 tok/s |
 | `pti_kernel.hip` | HIP/ROCm Q8 multi-stream kernel + benchmarks | ✓ bandwidth ceiling analysis done |
 | `pti_hip.py` | Python wrapper for HIP kernel | ✓ |
@@ -362,25 +366,27 @@ SSQ enables the **TSQ (Task-Specific Quantization)** variant: pack base model +
 fine-tune as twin pair. High accept rate on the fine-tune's target domain, falling
 acceptance signals off-domain query routing.
 
-The SSQ kernel (`pti_kernel.hip`) is built and benchmarked. The next step is
-integrating it into llama.cpp's kernel dispatch path to replace the multi-batch
-GEMM overhead with a fused single-pass multi-stream GEMV.
+The SSQ kernel (`pti_kernel.hip`) is built and benchmarked. The next step is the
+fused PTI GEMV kernel in `mmvq.cu` (M4) — loading each weight block once, computing
+all N dot products cooperatively. SSQ format would further extend this to handle
+twin-pair quantization for the TSQ variant.
 
 ---
 
 ## Summary: What's Real, What's Next
 
 **Real today (reproducible):**
-- 38.1 tok/s on Qwen3.6-27B using public llama.cpp API — **1.96× baseline**
+- 38.1 tok/s steady-state / ~32 tok/s amortized on Qwen3.6-27B — **1.96× baseline**
 - 100% greedy accept rate — no quality loss vs baseline
 - +0.8 GiB VRAM overhead (vs +4–19 GiB for standard speculative decoding)
-- Measured bandwidth ceilings confirming the overhead source (batch GEMM dispatch)
+- Overhead source confirmed: 4× MMVQ inner-loop compute scaling, NOT activation L2 traffic
+  (activation interleave patch benchmarked — no gain)
 
-**Next (targeted llama.cpp integration):**
-- Add PTI kernel variant to `mmvq.cu` (the quantized GEMV kernel file)
-- The template already supports `ncols_dst=N`; PTI needs interleaved activation reads
-- Eliminates 2.04× overhead → projects to 50–70 tok/s without quality change
-- Full PTI × MTP path projects to **80–100 tok/s** on MI50
+**Next (M4 — fused PTI GEMV kernel):**
+- Write `mul_mat_vec_q_pti<type, N>` in `mmvq.cu`: load each weight block once,
+  compute N dot products cooperatively — eliminates the 4× inner-loop scaling
+- Projected: 2.04× overhead → ~1.1–1.3× → **60–75 tok/s** on MI50
+- No MTP bonus tokens (MTP head predicts t+1, same position as main logits)
 
 ---
 
