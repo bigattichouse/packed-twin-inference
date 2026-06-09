@@ -118,29 +118,33 @@ Four benchmark points, in increasing order of gain:
    Tokens/step: 1
    Multiplier:  1×
 
-② PTI only (identical twins, SSQ kernel)
-   Tokens/step: 1 + acceptance_rate
-   Multiplier:  2× (greedy), ~1.75× (sampled)
+② PTI only (via llama.cpp batch decode, measured)
+   Tokens/step: N (greedy, 100% accept)
+   Multiplier:  N / overhead(N)   — overhead grows sub-linearly
 
-③ MTP only (Qwen3.6 built-in multi-token prediction)
-   Tokens/step: k  (k ≈ 2, MTP acceptance ~88%)
-   Multiplier:  ~1.8×
+③ MTP only (Qwen3.6-UD built-in k=1 MTP head)
+   Tokens/step: ~1.88 (measured accept rate on UD model)
+   Multiplier:  ~1.88× — MTP head is 1 extra layer vs 64 main layers
 
-④ PTI + MTP (one SSQ weight load × k MTP tokens × 2 streams)
-   Tokens/step: k × (1 + acceptance_rate)
-   Multiplier:  ~3.6-4× (greedy, k=2)
+④ PTI + MTP (SSQ kernel, planned — one weight load × N streams × MTP)
+   Tokens/step: N × MTP_accept
+   Multiplier:  4-5× (overhead → 1.0× on SSQ kernel)
 ```
 
-For Qwen3.6-27B Q5_K_M on MI50, at 100% greedy acceptance and MTP k=2:
+Measured on Qwen3.6-27B UD-Q6_K_XL, MI50 (greedy decoding):
 ```
-  baseline:      ~37 tok/s (HBM-bound, 19 GB / 1 TB/s)
-  PTI only:      ~74 tok/s (2×)
-  MTP only:      ~66 tok/s (1.8×, MTP acceptance ~88%)
-  PTI + MTP:     ~133 tok/s (3.6×)
+  baseline (1-seq):  19.4 tok/s  (1.00×)
+  PTI 2-seq:         30.5 tok/s  (1.57×, step overhead 1.27×)
+  PTI 3-seq:         33.9 tok/s  (1.75×, step overhead 1.71×)
+  PTI 4-seq:         38.1 tok/s  (1.96×, step overhead 2.04×)  ← current best
+  PTI + MTP target:  80–100 tok/s (SSQ kernel, overhead 1.0×)
 ```
+
+Note: Q5_K_M baseline = 21.1 tok/s (smaller model, 18.6 GB); UD-Q6_K_XL baseline = 19.4 tok/s.
+The UD model achieves higher PTI gain because the MTP head improves batch decode efficiency.
 
 Bandwidth cost per step: unchanged (one model load).
-Compute cost: 2× per PTI, k× per MTP — both hidden on bandwidth-bound hardware.
+Compute cost for N-seq PTI: N× per step, but overhead is 1.0× on SSQ kernel vs 2× on llama.cpp batch.
 
 ---
 
@@ -250,18 +254,24 @@ NVIDIA: nvcc  -O3 -arch=sm_89 -x cu     -o pti_test pti_kernel.hip
 | Qwen3-1.7B (BF16) | 5 general | 100% | 5/5 ✓ | — |
 | Qwen3.5-0.8B (BF16) | 5 general | 100% | 5/5 ✓ | — |
 | Qwen3.5-0.8B (BF16) | SVG rainbow | 100% | byte-identical ✓ | — |
-| **Qwen3.6-27B Q5_K_M** | general | **100%** | ✓ | **28.9 tok/s (1.38× baseline)** |
+| Qwen3.6-27B Q5_K_M | general | 100% | ✓ | 28.9 tok/s (1.38×) |
+| **Qwen3.6-27B UD-Q6_K_XL** | general | **100%** | ✓ | **38.1 tok/s (1.96×)** |
 
-**Measured throughput on MI50 (Qwen3.6-27B Q5_K_M, 80-token runs):**
+**Measured throughput on MI50 (Qwen3.6-27B, 80-token greedy runs):**
 
-| Config | tok/s | multiplier | notes |
-|---|---|---|---|
-| Baseline | 21.1 | 1.00× | single stream, llama.cpp |
-| PTI (llama.cpp, two-seq batch) | 28.9 | **1.38×** | 2 tokens emitted per accept step |
-| PTI SSQ HIP kernel (projected) | ~42 | **~2×** | fused weight load, overhead eliminated |
-| PTI SSQ + MTP (target) | **~80–100** | **~4–5×** | 2 streams × MTP k=1 at 55–70% HBM eff |
+| Config | Model | tok/s | multiplier | notes |
+|---|---|---|---|---|
+| Baseline | Q5_K_M | 21.1 | 1.00× | single stream, llama.cpp |
+| Baseline | UD-Q6_K_XL | 19.4 | 1.00× | single stream, llama.cpp |
+| PTI 2-seq | Q5_K_M | 28.9 | 1.38× | llama.cpp batch decode |
+| PTI 2-seq | UD-Q6_K_XL | 30.5 | 1.57× | llama.cpp batch decode |
+| PTI 3-seq | UD-Q6_K_XL | 33.9 | 1.75× | llama.cpp batch decode |
+| **PTI 4-seq** | **UD-Q6_K_XL** | **38.1** | **1.96×** | **llama.cpp batch decode** |
+| PTI + MTP target | Q5_K_M | **80–100** | **~4–5×** | SSQ kernel + llama.cpp integration |
 
-The gap from 1.38× to 2×: llama.cpp reads two separate KV caches per step (A and B). The SSQ HIP kernel eliminates this by fusing both matmuls behind one HBM weight load — weight bandwidth is the bottleneck, and it's shared.
+The overhead at N=4 (2.04× step cost) comes from llama.cpp's batch GEMM dispatch being less
+efficient than its GEMV path. See `pti_kernel.hip` benchmarks for full bandwidth analysis:
+raw int8 streaming = 330 GB/s, weight-only GEMV = 254 GB/s, llama.cpp Q5_K_M GEMV = 393 GB/s.
 
 ---
 

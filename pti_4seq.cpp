@@ -9,10 +9,10 @@
  * Quad-batch each step: one llama_decode, one weight load, 4 predictions.
  * On 100% greedy accept: 4 tokens per step.
  *
- * Overhead scaling from measured data:
- *   2-seq: 1.47× baseline step cost → 2/1.47 ≈ 1.36×
- *   3-seq: 1.77× baseline step cost → 3/1.77 ≈ 1.70×
- *   4-seq: ~2.0× estimated           → 4/2.0  ≈ 2.0×  (target)
+ * Overhead scaling (measured, UD-Q6_K_XL, MI50):
+ *   2-seq: 1.27× baseline step cost → 2/1.27 = 1.57×  (30.5 tok/s)
+ *   3-seq: 1.71× baseline step cost → 3/1.71 = 1.75×  (33.9 tok/s)
+ *   4-seq: 2.04× baseline step cost → 4/2.04 = 1.96×  (38.1 tok/s) ← measured
  *
  * Build:
  *   g++ -O2 -std=c++17 -o pti_4seq pti_4seq.cpp \
