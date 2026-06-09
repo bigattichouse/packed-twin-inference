@@ -26,8 +26,8 @@ with a 4-token batch — one per sequence.**
 ```bash
 # Reproduce the 38.1 tok/s result:
 make 4seq && make 4seq-run
-# ./pti_4seq -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf \
-#            -p "The key to faster LLM inference is" -n 80 -ngl 99
+# bin/pti_4seq -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf \
+#              -p "The key to faster LLM inference is" -n 80 -ngl 99
 ```
 
 ---
@@ -267,13 +267,13 @@ At 393 GB/s (llama.cpp GEMV efficiency): 393 / 4.9 ≈ 80 tok/s
 ## Build & Run
 
 ```bash
-# Build pti_4seq (requires llama.cpp built in ../llama.cpp/build)
+# Build pti_4seq → bin/pti_4seq (requires llama.cpp built in ../llama.cpp/build)
 make 4seq
 
 # Run 4-sequence PTI — reproduces 38.1 tok/s headline result
 make 4seq-run
-# Equiv: ./pti_4seq -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf \
-#                   -p "The key to faster LLM inference is" -n 80 -ngl 99
+# Equiv: bin/pti_4seq -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf \
+#                     -p "The key to faster LLM inference is" -n 80 -ngl 99
 
 # Baseline for direct comparison
 make 4seq-run-base
@@ -284,8 +284,14 @@ make mtp && make mtp-run
 # 2-seq PTI (C implementation)
 make llama && make llama-run-pti
 
+# Build all three llama.cpp binaries at once
+make all-llama
+
 # HIP kernel bandwidth benchmarks (requires ROCm)
-make && ./pti_test
+make && bin/pti_test
+
+# Clean all built artifacts
+make clean
 ```
 
 **Prerequisites:**

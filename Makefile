@@ -1,4 +1,4 @@
-# Packed Twin Inference — GPU kernel build
+# Packed Twin Inference — build
 #
 # ── AMD / ROCm ────────────────────────────────────────────────────────────────
 #   make                    MI50  (gfx906, default)
@@ -14,137 +14,178 @@
 #   make cuda SM=86         RTX 3090 / 3080
 #   make cuda SM=75         RTX 2080 Ti / T4
 #
+# ── llama.cpp PTI binaries ────────────────────────────────────────────────────
+#   make llama              pti_llama  (2-seq, C)
+#   make mtp                pti_mtp    (3-seq + MTP re-init, C++)
+#   make 4seq               pti_4seq   (4-seq, C++)   ← headline 38.1 tok/s
+#   make all-llama          all three
+#
+# ── Run shortcuts ─────────────────────────────────────────────────────────────
+#   make 4seq-run           4-seq PTI on UD-Q6_K_XL  (reproduces 38.1 tok/s)
+#   make 4seq-run-base      baseline on UD-Q6_K_XL
+#   make mtp-run / mtp-run-base
+#   make llama-run-pti / llama-run-base
+#
 # ── Other ─────────────────────────────────────────────────────────────────────
-#   make test               build (AMD) + run self-test
-#   make cuda-test          build (CUDA) + run self-test
+#   make test               build HIP kernel + run bandwidth benchmarks
+#   make cuda-test          build CUDA kernel + run benchmarks
 #   make shared             libpti.so for pti_hip.py (AMD)
 #   make clean
 
-# ── AMD defaults ──────────────────────────────────────────────────────────────
-ARCH     ?= gfx906
-HIPCC    ?= hipcc
+# ── Output directory ──────────────────────────────────────────────────────────
+BINDIR := bin
+
+# ── AMD / ROCm ────────────────────────────────────────────────────────────────
+ARCH      ?= gfx906
+HIPCC     ?= hipcc
 HIP_FLAGS := -O3 --offload-arch=$(ARCH) -std=c++14 -lm
 
-# ── CUDA defaults ──────────────────────────────────────────────────────────────
-NVCC     ?= nvcc
-SM       ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
-              | head -1 | tr -d '.' || echo 80)
+# ── NVIDIA / CUDA ─────────────────────────────────────────────────────────────
+NVCC      ?= nvcc
+SM        ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+               | head -1 | tr -d '.' || echo 80)
 CUDA_FLAGS := -O3 -arch=sm_$(SM) -x cu -lm
 
-SHARED   := -shared -fPIC
+SHARED    := -shared -fPIC
 
-TARGET_BIN      := pti_test
-TARGET_BIN_CUDA := pti_test_cuda
-TARGET_SO       := libpti.so
-TARGET_SO_CUDA  := libpti_cuda.so
+# ── Targets ───────────────────────────────────────────────────────────────────
+TARGET_BIN      := $(BINDIR)/pti_test
+TARGET_BIN_CUDA := $(BINDIR)/pti_test_cuda
+TARGET_SO       := $(BINDIR)/libpti.so
+TARGET_SO_CUDA  := $(BINDIR)/libpti_cuda.so
 SRC             := pti_kernel.hip
 
-.PHONY: all cuda test cuda-test shared cuda-shared clean help
+PTI_LLAMA := $(BINDIR)/pti_llama
+PTI_MTP   := $(BINDIR)/pti_mtp
+PTI_4SEQ  := $(BINDIR)/pti_4seq
 
-# ── AMD targets ───────────────────────────────────────────────────────────────
-all: $(TARGET_BIN)
-
-$(TARGET_BIN): $(SRC)
-	$(HIPCC) $(HIP_FLAGS) -o $@ $<
-	@echo "Built $(TARGET_BIN) for $(ARCH)"
-
-shared: $(TARGET_SO)
-$(TARGET_SO): $(SRC)
-	$(HIPCC) $(HIP_FLAGS) $(SHARED) -o $@ $<
-	@echo "Built $(TARGET_SO) for $(ARCH)"
-
-test: $(TARGET_BIN)
-	./$(TARGET_BIN)
-
-# ── CUDA targets ──────────────────────────────────────────────────────────────
-cuda: $(TARGET_BIN_CUDA)
-
-$(TARGET_BIN_CUDA): $(SRC)
-	$(NVCC) $(CUDA_FLAGS) -o $@ $<
-	@echo "Built $(TARGET_BIN_CUDA) for sm_$(SM)"
-
-cuda-shared: $(TARGET_SO_CUDA)
-$(TARGET_SO_CUDA): $(SRC)
-	$(NVCC) $(CUDA_FLAGS) $(SHARED) -Xcompiler -fPIC -o $@ $<
-	@echo "Built $(TARGET_SO_CUDA) for sm_$(SM)"
-
-cuda-test: $(TARGET_BIN_CUDA)
-	./$(TARGET_BIN_CUDA)
-
-# ── llama.cpp PTI binary ─────────────────────────────────────────────────────
-#   make llama           build pti_llama (GGUF inference, no GPU kernel needed)
-#   make llama-run-pti   run PTI on Qwen3.6-27B-Q5_K_M
-#   make llama-run-base  run baseline on Qwen3.6-27B-Q5_K_M
-
+# ── llama.cpp paths ───────────────────────────────────────────────────────────
 LLAMA_DIR    ?= ../llama.cpp
 LLAMA_INC    := $(LLAMA_DIR)/include $(LLAMA_DIR)/ggml/include
 LLAMA_LIBDIR := $(LLAMA_DIR)/build/bin
-LLAMA_CFLAGS := -O2 $(addprefix -I,$(LLAMA_INC))
+LLAMA_CFLAGS   := -O2 $(addprefix -I,$(LLAMA_INC))
 LLAMA_CXXFLAGS := -O2 -std=c++17 $(addprefix -I,$(LLAMA_INC)) -I$(LLAMA_DIR)/src
-LLAMA_LDFLAGS := -L$(LLAMA_LIBDIR) -lllama -Wl,-rpath,$(abspath $(LLAMA_LIBDIR)) -lm
+LLAMA_LDFLAGS  := -L$(LLAMA_LIBDIR) -lllama -Wl,-rpath,$(abspath $(LLAMA_LIBDIR)) -lm
 
-TEST_MODEL   ?= ../gguf/Qwen3.6-27B-Q5_K_M.gguf
-MTP_MODEL    ?= ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf
-TEST_PROMPT  ?= The key to faster LLM inference is
-TEST_TOKENS  ?= 80
-NGL          ?= 99
+# ── Model / run defaults ──────────────────────────────────────────────────────
+TEST_MODEL  ?= ../gguf/Qwen3.6-27B-Q5_K_M.gguf
+MTP_MODEL   ?= ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf
+TEST_PROMPT ?= The key to faster LLM inference is
+TEST_TOKENS ?= 80
+NGL         ?= 99
 
-.PHONY: llama llama-run-pti llama-run-base mtp mtp-run mtp-run-base
+# ── Phony targets ─────────────────────────────────────────────────────────────
+.PHONY: all cuda test cuda-test shared cuda-shared clean help \
+        llama mtp 4seq all-llama \
+        llama-run-pti llama-run-base \
+        mtp-run mtp-run-base \
+        4seq-run 4seq-run-base
 
-llama: pti_llama
+# ── bin/ directory ────────────────────────────────────────────────────────────
+$(BINDIR):
+	mkdir -p $(BINDIR)
 
-pti_llama: pti_llama.c
+# ── HIP kernel (AMD) ──────────────────────────────────────────────────────────
+all: $(TARGET_BIN)
+
+$(TARGET_BIN): $(SRC) | $(BINDIR)
+	$(HIPCC) $(HIP_FLAGS) -o $@ $<
+	@echo "Built $@ for $(ARCH)"
+
+shared: $(TARGET_SO)
+$(TARGET_SO): $(SRC) | $(BINDIR)
+	$(HIPCC) $(HIP_FLAGS) $(SHARED) -o $@ $<
+	@echo "Built $@ for $(ARCH)"
+
+test: $(TARGET_BIN)
+	$(TARGET_BIN)
+
+# ── HIP kernel (CUDA) ─────────────────────────────────────────────────────────
+cuda: $(TARGET_BIN_CUDA)
+
+$(TARGET_BIN_CUDA): $(SRC) | $(BINDIR)
+	$(NVCC) $(CUDA_FLAGS) -o $@ $<
+	@echo "Built $@ for sm_$(SM)"
+
+cuda-shared: $(TARGET_SO_CUDA)
+$(TARGET_SO_CUDA): $(SRC) | $(BINDIR)
+	$(NVCC) $(CUDA_FLAGS) $(SHARED) -Xcompiler -fPIC -o $@ $<
+	@echo "Built $@ for sm_$(SM)"
+
+cuda-test: $(TARGET_BIN_CUDA)
+	$(TARGET_BIN_CUDA)
+
+# ── pti_llama: 2-sequence PTI (C) ─────────────────────────────────────────────
+llama: $(PTI_LLAMA)
+
+$(PTI_LLAMA): pti_llama.c | $(BINDIR)
 	gcc $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS) -lstdc++
-	@echo "Built pti_llama"
+	@echo "Built $@"
 
-llama-run-pti: pti_llama
-	./pti_llama -m $(TEST_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
+llama-run-pti: $(PTI_LLAMA)
+	$(PTI_LLAMA) -m $(TEST_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
 
-llama-run-base: pti_llama
-	./pti_llama -m $(TEST_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+llama-run-base: $(PTI_LLAMA)
+	$(PTI_LLAMA) -m $(TEST_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
 
-# ── pti_mtp: 3-sequence PTI + MTP re-init ────────────────────────────────────
-#   make mtp                   build pti_mtp (C++, requires UD-Q6_K_XL for MTP)
-#   make mtp-run               run 3-seq PTI on UD-Q6_K_XL
-#   make mtp-run-base          run baseline on UD-Q6_K_XL
+# ── pti_mtp: 3-sequence PTI + MTP re-init (C++) ───────────────────────────────
+mtp: $(PTI_MTP)
 
-mtp: pti_mtp
-
-pti_mtp: pti_mtp.cpp
+$(PTI_MTP): pti_mtp.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
-	@echo "Built pti_mtp"
+	@echo "Built $@"
 
-mtp-run: pti_mtp
-	./pti_mtp -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
+mtp-run: $(PTI_MTP)
+	$(PTI_MTP) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
 
-mtp-run-base: pti_mtp
-	./pti_mtp -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+mtp-run-base: $(PTI_MTP)
+	$(PTI_MTP) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
 
-# ── pti_4seq: 4-sequence PTI ──────────────────────────────────────────────────
-#   make 4seq              build pti_4seq
-#   make 4seq-run          run 4-seq PTI on UD-Q6_K_XL (target: ~2×)
-#   make 4seq-run-base     run baseline on UD-Q6_K_XL
+# ── pti_4seq: 4-sequence PTI (C++) — headline result ─────────────────────────
+4seq: $(PTI_4SEQ)
 
-4seq: pti_4seq
-
-pti_4seq: pti_4seq.cpp
+$(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 	g++ $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
-	@echo "Built pti_4seq"
+	@echo "Built $@"
 
-4seq-run: pti_4seq
-	./pti_4seq -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
+4seq-run: $(PTI_4SEQ)
+	$(PTI_4SEQ) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL)
 
-4seq-run-base: pti_4seq
-	./pti_4seq -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+4seq-run-base: $(PTI_4SEQ)
+	$(PTI_4SEQ) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
+# ── Build all llama.cpp binaries ──────────────────────────────────────────────
+all-llama: $(PTI_LLAMA) $(PTI_MTP) $(PTI_4SEQ)
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 clean:
-	rm -f $(TARGET_BIN) $(TARGET_BIN_CUDA) $(TARGET_SO) $(TARGET_SO_CUDA) pti_llama *.o
+	rm -rf $(BINDIR) *.o
 
 help:
-	@echo "AMD:     make [ARCH=gfx906|gfx1100|...]  shared  test"
-	@echo "CUDA:    make cuda [SM=80|89|86|75]       cuda-shared  cuda-test"
-	@echo "llama:   make llama                        build pti_llama (GGUF PTI)"
-	@echo "         make llama-run-pti  TEST_MODEL=.. NGL=99"
-	@echo "         make llama-run-base TEST_MODEL=.."
-	@echo "SM is auto-detected from nvidia-smi if not set"
+	@echo "HIP kernel (AMD):"
+	@echo "  make [ARCH=gfx906|gfx908|gfx90a|gfx1100]   build bin/pti_test"
+	@echo "  make test                                    build + run benchmarks"
+	@echo "  make shared                                  build bin/libpti.so"
+	@echo ""
+	@echo "HIP kernel (CUDA):"
+	@echo "  make cuda [SM=80|86|89]                      build bin/pti_test_cuda"
+	@echo "  make cuda-test                               build + run benchmarks"
+	@echo ""
+	@echo "llama.cpp PTI binaries (all output to bin/):"
+	@echo "  make llama                                   bin/pti_llama  (2-seq)"
+	@echo "  make mtp                                     bin/pti_mtp    (3-seq + MTP)"
+	@echo "  make 4seq                                    bin/pti_4seq   (4-seq, ~2×)"
+	@echo "  make all-llama                               all three"
+	@echo ""
+	@echo "Run shortcuts:"
+	@echo "  make 4seq-run        4-seq PTI on UD-Q6_K_XL (reproduces 38.1 tok/s)"
+	@echo "  make 4seq-run-base   baseline for comparison"
+	@echo "  make mtp-run / mtp-run-base"
+	@echo "  make llama-run-pti / llama-run-base"
+	@echo ""
+	@echo "Variables:"
+	@echo "  ARCH=gfx906          GPU arch (default: gfx906 = MI50)"
+	@echo "  MTP_MODEL=path       model for 4seq/mtp runs (default: UD-Q6_K_XL)"
+	@echo "  TEST_MODEL=path      model for llama runs (default: Q5_K_M)"
+	@echo "  TEST_TOKENS=80       tokens to generate"
+	@echo "  NGL=99               GPU layers"

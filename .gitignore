@@ -1,6 +1,8 @@
+bin/
 __pycache__/
 *.pyc
 *.o
+# stale root-level binaries from pre-bin/ builds
 pti_test
 pti_test_cuda
 libpti.so
