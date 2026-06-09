@@ -6,6 +6,12 @@ PTI achieves **~2× LLM throughput today**, measured on Qwen3.6-27B (MI50), usin
 llama.cpp's existing batch-decode infrastructure. No draft model. No separate VRAM footprint.
 No quality gap. The full path to **4–5× throughput** is documented below.
 
+
+## Note
+
+4seq (the 1.96X version) is the current working benchmark. I'm working on the MCP+llama CPP.  This should give us a theoretical max of 4X for temperature 0.  
+Once that's ready, I'll push, and we should expect somewhere between 70%-80% of that max: 2.5-3.5X speedup over bare model.
+
 ---
 
 ## Headline Results (MI50, Qwen3.6-27B, measured)
