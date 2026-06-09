@@ -60,6 +60,7 @@ PTI_MTP    := $(BINDIR)/pti_mtp
 PTI_4SEQ   := $(BINDIR)/pti_4seq
 PTI_SERVER := $(BINDIR)/pti_server
 PTI_DEBUG  := $(BINDIR)/pti_debug
+PTI_BENCH  := $(BINDIR)/pti_gemv_bench
 
 # ── llama.cpp paths ───────────────────────────────────────────────────────────
 LLAMA_DIR    ?= ../llama.cpp
@@ -78,7 +79,7 @@ NGL         ?= 99
 
 # ── Phony targets ─────────────────────────────────────────────────────────────
 .PHONY: all cuda test cuda-test shared cuda-shared clean help \
-        llama mtp 4seq server debug all-llama \
+        llama mtp 4seq server debug bench all-llama \
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
         4seq-run 4seq-run-base
@@ -161,6 +162,13 @@ $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 debug: $(PTI_DEBUG)
 
 $(PTI_DEBUG): pti_debug.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
+
+# ── pti_gemv_bench: GEMV fusion benchmark ────────────────────────────────────
+bench: $(PTI_BENCH)
+
+$(PTI_BENCH): pti_gemv_bench.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
 	@echo "Built $@"
 

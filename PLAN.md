@@ -86,6 +86,103 @@ correct PTI is at or below baseline. With it, target 60–75 tok/s.
 
 ---
 
+## GEMV Fusion Test — June 2026
+
+### Does ggml share weight reads across N sequences?
+
+`pti_gemv_bench` runs N=1/2/4 sequences through identical decode steps
+(short context, greedy) and measures ms/step. If weights are loaded once
+for all N, ms/step should be flat. If loaded N times, it scales linearly.
+
+**Results (MI50, Qwen3.6-27B UD-Q6_K_XL, ctx=128, 20 measured steps):**
+
+```
+N   ms/step   ms/seq   scaling   eff_BW(GB/s)   BW_per_seq
+─   ───────   ──────   ───────   ────────────   ──────────
+1     53.1     53.1    1.00×       456              456
+2     66.2     33.1    1.25×       366              183
+4    103.5     25.9    1.95×       234               59
+```
+
+Theoretical minimum (weights loaded once): 23.7 ms (24.22 GB / 1024 GB/s)
+
+**Interpretation**: N=4 scaling of 1.95× sits between fully-fused (1×) and
+fully-unfused (4×). ggml achieves partial weight sharing — large FFN matrices
+go through the batched MMVQ path, but attention projections, SSM state updates,
+and other per-sequence ops scale closer to linearly. The M5 kernel needs to
+close the remaining gap.
+
+**Theoretical PTI throughput at full fusion:**
+```
+N=1 baseline: 18.8 tok/s
+N=4 ideal:   ~38–40 tok/s  (weights shared, KV/SSM overhead ~5%)
+```
+
+---
+
+## Memory Layout Analysis — KV Cache and SSM State
+
+### KV cache — shared-prefix layout (high value)
+
+The 4 PTI sequences share identical KV history for all positions except the
+3-position stagger tip. Current llama.cpp stores 4 separate full KV caches
+(4× redundant data for the shared prefix). A positional layout stores one
+record per position, shared across all sequences:
+
+```
+Positional KV (single record per position):
+  pos 0:   K/V shared by all 4 seqs       ← one read serves all
+  pos 1:   K/V shared by all 4 seqs
+  ...
+  pos N:   K/V for seqs 1, 2, 3 only
+  pos N+1: K/V for seqs 2, 3 only
+  pos N+2: K/V for seq 3 only
+```
+
+For a 4096-token context: reduces KV reads from 4×4096 to ~4099 records.
+~4× reduction in attention-layer KV traffic. Only ~16 attention layers in
+Qwen3.6-27B, so absolute savings are modest vs 24 GB of weights, but the
+principle is sound and implementable within llama.cpp's KV pool.
+
+### SSM recurrent state — interleaved layout (moderate value)
+
+SSM states cannot be shared (each sequence's state is a distinct running
+accumulator that diverges after the first generated token). However, grouping
+all 4 seqs' values at the same state dimension together enables SIMD:
+
+```
+Current (4 separate 144 MB vectors):
+  h_A: [d0, d1 ... dD]
+  h_B: [d0, d1 ... dD]   ← different values, same layout
+  h_C, h_D: same
+
+Interleaved by dimension (still 576 MB, coalesced):
+  dim 0: [h_A[0], h_B[0], h_C[0], h_D[0]]  ← one 128-bit load = all 4 seqs
+  dim 1: [h_A[1], h_B[1], h_C[1], h_D[1]]
+  ...
+```
+
+SSM update kernel becomes one float4 FMA per dimension instead of 4 scattered
+f32 FMAs. On GPU with proper batching the benefit is already partially realised
+(4 parallel thread blocks), but explicit SIMD interleaving can improve it further.
+
+**Mathematical ground truth**: the SSM state is tiny relative to weights
+(144 MB × 4 = 576 MB vs 24 GB). Even at 0% efficiency the SSM state cost is
+576 MB / 1024 GB/s = 0.56 ms — about 1% of a 53 ms decode step. Interleaving
+the state is a second-order optimization. The weight GEMV fusion (M5) is where
+the step-time budget actually lives.
+
+### Priority ranking for M5 kernel work
+
+| Target | Data size | Expected gain | Priority |
+|---|---|---|---|
+| Fused weight GEMV (all layers) | 24 GB | ~2× step speedup | Critical |
+| Shared-prefix KV cache | 4096 × 16 attn layers | ~5% step speedup | Medium |
+| SSM state interleaving | 576 MB | <1% step speedup | Low |
+| Conv state sharing | 22 MB | Negligible | Skip |
+
+---
+
 ## Where We Are
 
 ### Measured results (MI50, Qwen3.6-27B, greedy, -n 80)
