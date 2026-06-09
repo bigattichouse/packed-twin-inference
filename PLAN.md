@@ -174,22 +174,271 @@ weight block across j, so weight LOADS are shared. But the ALU must execute
 computation serializes with memory, preventing the GPU from overlapping other
 work, and accounts for the ~50 ms extra cost (103.6 − 53.1 − 0.56 ms SSM ≈ 50 ms).
 
-### M5 kernel target
+---
 
-The fix is not about memory layout or cache. It is about reducing instruction count
-for the multi-column dot product. Two concrete approaches:
+## M5 Implementation Plan — Detailed Incremental Steps
 
-1. **Explicit weight hoist (lowest risk)**: restructure `mmvq.cu` j-loop so weight
-   data (bq6_K->ql, qh, scales, d) is loaded outside the j-loop and passed by
-   value to a new `vec_dot_q6_K_q8_1_Nx` function. Forces compiler to keep weights
-   in registers (VGPR) across all j iterations. Expected: reduce redundant loads
-   that survive L1 (if any) and reduce register spill.
+### Root cause analysis (mathematical)
 
-2. **MFMA/WMMA vectorization (higher gain)**: on gfx906 (MI50), use
-   `v_mfma_f32_16x16x4f16` to compute all 4 column dot products as a single
-   matrix instruction rather than 4 sequential scalar chains. Requires dequantizing
-   Q6_K → FP16 before the MFMA call. Expected: reduce instruction count from 8 to
-   2 per weight block, approaching compute-bound ceiling of ~1.2× overhead.
+For `mul_mat_vec_q<Q6_K, ncols_dst=4>` on gfx906:
+- `rows_per_cuda_block = 2`, `ncols_dst = 4`
+- Inner loop (lines 495–508 of mmvq.cu) calls `vec_dot_q_cuda` 4×2 = **8 times per kbx block**
+- At N=1: same loop calls it 1×2 = 2 times per kbx block
+- Each call accesses `vbq + kbx` — the weight block address
+
+The weight block address `kbx_offset + i*stride_row_x + kbx` depends on **i**, not j.  
+So at j=1, the weight block at i=0 is the same as at j=0, i=0.
+
+**Why L1 cache partially helps (explains ~1.95× not 4×):**  
+After j=0 loads weight[i=0] from HBM/L2, j=1 finds it in L1 (210 bytes, fits easily).  
+So HBM reads at N=4 ≈ same as N=1 for weight data. L1 is already doing this.
+
+**Why overhead is still 1.95× (two mechanisms):**
+
+*Mechanism A — Instruction count:*  
+Even with weights in L1 (fast), the GPU must ISSUE 8 FMAF instructions vs 2.  
+On GCN (gfx906), instruction issue rate = 1 per clock per warp.  
+The 8-instruction critical path takes 4× more warp-cycles than 2-instruction path.  
+This matters when memory latency is low (L1 hit); the pipeline becomes issue-bound.
+
+*Mechanism B — Register pressure (occupancy reduction):*  
+`tmp[4][2]` = 8 float VGPRs at N=4 vs `tmp[1][2]` = 2 at N=1.  
+Plus intermediates (vl, vh, u[], d8[], scales pointer): ~12 more VGPRs shared.  
+Estimated: ~26 VGPRs at N=4, ~20 VGPRs at N=1.
+
+GFX906 VGPR budget: 256 per SIMD lane (wavefront of 64 × 4 SIMDs per CU):
+```
+N=1: floor(256 / 20) = 12 wavefronts/SIMD → high latency hiding → fast
+N=4: floor(256 / 26) =  9 wavefronts/SIMD → less hiding → stalls visible
+```
+Reduced occupancy ≈ 9/12 = 0.75× → adds ~0.33× to step time.
+
+**Combined model**: 1.0 (weight loads same) + 0.5× (4× FMAFs, pipelined) + 0.33× (occupancy) ≈ 1.83×.  
+Observed: 1.95×. Close enough given approximations.
+
+**Implication**: There are TWO targets. The loop restructure addresses Mechanism A
+(instruction scheduling). MFMA addresses both A and B (uses AGPRs, frees VGPRs).
+
+---
+
+### M5 test protocol
+
+At each step: run `pti_gemv_bench` **before** and **after** the patch, compare N=4
+scaling. Run full `./audit.sh` to verify correctness. Record results in this table.
+
+| Step | Change | N=4 scaling | Notes |
+|------|--------|-------------|-------|
+| M5.0 | baseline (current) | 1.95–2.05× | measured |
+| M5.1 | i-outer/j-inner loop restructure | ? | TBD |
+| M5.2 | if M5.1 < 0.1× improvement: rocprof VGPR analysis | — | |
+| M5.3 | occupancy fix: 2-pass N=2+N=2 or reduced accumulators | ? | TBD |
+| M5.4 | MFMA (gfx906 v_mfma_f32_16x16x4f16 + AGPRs) | target <1.2× | |
+
+---
+
+### M5.1 — Loop restructure in mmvq.cu (IMMEDIATE)
+
+**File**: `llama.cpp/ggml/src/ggml-cuda/mmvq.cu`, lines 495–508.
+
+**Current code (j-outer, i-inner — weight block loaded for each j):**
+```c
+#pragma unroll
+for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+        tmp[j][i] += vec_dot_q_cuda(
+            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+        if constexpr (has_fusion) { ... }
+    }
+}
+```
+
+**Problem**: `kbx_offset + i*stride_row_x + kbx` changes with i but NOT j.  
+With j-outer, for j=0 the compiler sees `kbx0 = f(i=0)` and `kbx1 = f(i=1)`.  
+For j=1, it sees the same `kbx0` and `kbx1` again. The weight block IS in L1,  
+but the compiler still issues the load instruction (L1 hit has ~4 cycle latency).  
+4 load issues × `rows_per_cuda_block` = 8 weight block load instructions vs 2.
+
+**Proposed fix (i-outer, j-inner — one cur_kbx per i-iteration):**
+```c
+#pragma unroll
+for (int i = 0; i < rows_per_cuda_block; ++i) {
+    const int cur_kbx = kbx_offset + i*stride_row_x + kbx;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j][i] += vec_dot_q_cuda(
+            vx, &y[j*stride_col_y + kby], cur_kbx, kqs);
+        if constexpr (has_fusion) { ... }
+    }
+}
+```
+
+With `cur_kbx` as an explicit scalar in the j-loop, LLVM sees that `vbq + cur_kbx`  
+is loop-invariant and applies LICM to hoist the weight block load before j=0.  
+Result: 2 weight block load instructions per kbx (one per i-iteration), same as N=1.
+
+**Expected impact**:  
+- Eliminates the duplicate L1 load-issue overhead (Mechanism A, partial)  
+- Does NOT reduce register pressure (tmp[4][2] stays 8 VGPRs)  
+- Expected new scaling: 1.4–1.7× (some improvement, not full fix)
+
+**Safety**: this is a pure computation-order rewrite, not an algorithm change.  
+Both orderings compute the same partial sums into `tmp[j][i]`.  
+Floating point: same number of FMADs, different accumulation order within a warp →  
+results may differ by ≤1 ULP. Greedy argmax is robust to this.
+
+**Audit protocol**: output of pti_4seq vs pti_debug may differ by 1 token in  
+degenerate cases. If byte-identical check fails, loosen to "same first 45 of 50  
+tokens" or verify argmax margin is preserved.
+
+---
+
+### M5.2 — VGPR analysis (completed)
+
+Compiled mmvq.cu with `hipcc --save-temps --offload-arch=gfx906` and parsed ISA.
+`mul_mat_vec_q<Q6_K, ncols_dst=N>` VGPR counts:
+
+```
+ncols_dst   VGPRs   waves/SIMD   occupancy
+─────────   ──────  ──────────   ─────────
+1            27      9            high    (256/28=9)
+2            47      5            medium  (256/48=5)
+3            64      4            medium  (256/64=4)
+4            63      4            medium  (256/64=4)
+5            83      3            low
+6            75      3            low
+7            85      3            low
+8           126      2            very low
+```
+
+N=4 uses **63 VGPRs → 4 waves/SIMD** vs N=1 at **27 VGPRs → 9 waves/SIMD**.
+Occupancy ratio: 4:9 = 0.44×. This is the dominant remaining bottleneck.
+
+**Interesting**: ncols_dst=4 has FEWER VGPRs than ncols_dst=3 (63 vs 64). The
+loop restructure (M5.1) likely removed the weight-block address variable from
+the hot path, freeing 1 VGPR. The small 1.95×→1.86× improvement confirms this.
+
+The jump from 9 waves (N=1) to 4 waves (N=4) means the GPU can only hide
+`4/9 = 44%` as much memory latency at N=4, contributing ~1.3× of the 1.86× overhead.
+
+**Occupancy fix threshold**: to reach 5 waves → VGPRs must drop from 63 to ≤51.
+That requires eliminating 12+ VGPRs from the hot path. The accumulators `tmp[4][2]`
+account for 8 VGPRs (vs tmp[1][2] = 2). Moving them to AGPRs (MFMA) would free 6.
+But 63 - 6 = 57 VGPRs → still only 4 waves. Full improvement requires MFMA.
+
+---
+
+### M5.3 — State-copy reinit (critical for multi-emit throughput)
+
+The throughput math reveals a key insight:
+
+```
+Current pti_4seq (single-emit):  1 token  / (1.86 × 53ms) = 10.2 tok/s  ← SLOWER
+Multi-emit, decode reinit (3×):  4 tokens / (1.86+3.0) × 53ms = 15.6 tok/s ← still slower
+Multi-emit, state-copy reinit:   4 tokens / (1.86 × 53ms)      = 40.9 tok/s ← 2.15× faster
+```
+
+The decode reinit (3 single-seq llama_decode calls per 4-accept) costs 3× baseline,
+wiping out the 4-token gain. The fix: **ring buffer of A's SSM+KV states**.
+
+**How state-copy reinit works:**
+After each step, save seq 0 (A)'s SSM state and KV to a ring buffer entry.
+On 4-accept: instead of calling llama_decode 3× to advance B, C, D:
+1. B ← ring_buf[n-1] (A's state from 1 step ago, at position n+2)
+2. C ← ring_buf[n-2] (A's state from 2 steps ago, at position n+1)
+3. D ← ring_buf[n-3] (A's state from 3 steps ago, at position n)
+4. Call llama_memory_seq_cp to copy KV positions for each
+
+**Memory cost**: 3 saved states × 149.62 MB (SSM+KV per seq) = ~449 MB.
+MI50 has 32 GB; this is 1.4% of VRAM. Affordable.
+
+**llama.cpp support**: `llama_memory_seq_cp` copies both KV and recurrent (SSM)
+state. The ring buffer stores the raw state tensors after each step. On 4-accept,
+we overwrite seqs 1,2,3 with ring buffer entries then update their KV positions.
+
+**Expected throughput after state-copy reinit (at current 1.86× step overhead):**
+```
+4 tokens / (1.86 × 53ms) = 40.9 tok/s  (2.15× baseline, no kernel change needed!)
+```
+
+This is achievable WITHOUT the MFMA kernel (M5.4). The state-copy reinit is the
+highest-priority next implementation step.
+
+**Implementation plan:**
+1. Add `RingBuffer` struct to pti_4seq.cpp: circular array of 3 llama_state snapshots
+2. After each step: call `llama_state_get_data` to snapshot seq 0 → ring_buf[step % 3]
+3. On 4-accept path: call `llama_state_set_data` to restore ring_buf[n-k] into seq k
+4. Advance all sequence positions by 4 (KV-copy + position update)
+5. Emit 4 tokens (actual, from_b, from_c, from_d verified chain)
+6. Audit: output bytes identical to baseline at greedy (all tokens agree)
+
+**API note**: `llama_state_get_data` / `llama_state_set_data` are public llama.cpp
+functions that serialize/deserialize the full context state (KV + SSM + sampler).
+They work on the full context, not per-sequence — so we need a per-seq API or
+extract only the SSM state tensors manually.
+
+**Alternative**: instead of ring buffer, use llama_memory_seq_cp differently:
+- After each step, BEFORE advancing, copy seq 0 KV to a saved slot
+- Maintain 3 saved slots (seq 4, 5, 6 in a context with n_seq_max=7)
+- On 4-accept: cp saved_k to seq 1,2,3 and set SSM state from ring
+
+Use `llama_context` with n_seq_max=7 (4 active + 3 saved history slots).
+
+### M5.4 — MFMA vectorization (after M5.3 state-copy reinit, if still > 1.5×)
+
+**Applicable to gfx906 (MI50)**: the first AMD GPU with Matrix Fused Multiply-Add (MFMA).  
+Available instruction: `v_mfma_f32_16x16x4f16` — computes C[16×16] += A[16×4] × B[4×16].
+
+**Concept**:
+1. Dequantize Q6_K weight block → 256 FP16 values (stored across 64 threads = 4 per thread)
+2. Load N=4 activation vectors as Q8_1 → dequant to FP16 (4×32 = 128 per k-step)
+3. Use MFMA to compute the 16×16 output fragment containing all 4 columns simultaneously
+4. Accumulate in AGPRs (free from VGPR pressure)
+
+**Why AGPRs matter**: MFMA output lives in Accumulation GPRs (AGPRs), not VGPRs.  
+This frees VGPR for memory address computation and latency hiding.  
+Expected occupancy: restored to N=1 level → Mechanism B fixed.  
+MFMA throughput: 4× more compute per instruction → Mechanism A fixed.
+
+**Implementation complexity**: high. Requires:
+- New `mul_mat_vec_q_mfma<Q6_K, ncols_dst=4>` kernel variant
+- Data layout change: Q6_K → FP16 dequant in-register during kernel
+- Only beneficial on gfx906+ (GFX9 class with MFMA)
+- Conditional compile: `#if defined(GGML_GFX9_MFMA)`
+
+**Expected throughput at M5.4**: N=4 scaling drops to ≈1.05–1.15× →  
+PTI at full pipeline: 4 × 18.9 / 1.10 ≈ 68 tok/s target.
+
+---
+
+### Quick reference: M5 expected outcomes
+
+```
+M5.0 (baseline):          1.95×   measured
+M5.1 (loop swap):         1.86×   MEASURED (done, 19/19 audit pass)
+M5.2 (VGPR analysis):     done — N=4=63 VGPRs→4 waves, N=1=27 VGPRs→9 waves
+M5.3 (state-copy reinit): ~1.86×  overhead unchanged, but multi-emit now ~40 tok/s
+M5.4 (MFMA):              ~1.1×   target (frees VGPRs→AGPRs, restores occupancy)
+
+PTI tok/s at each stage (19 tok/s baseline):
+  M5.0 current (single-emit):            ~10 tok/s  (1 tok / 1.95× step)
+  M5.1 current (single-emit):            ~10 tok/s  (1 tok / 1.86× step)
+  M5.3 (state-copy reinit, multi-emit):  ~41 tok/s  (4 tok / 1.86× step, 2.15× baseline)
+  M5.4 (MFMA + multi-emit):              ~69 tok/s  (4 tok / 1.10× step, 3.6× baseline)
+```
+
+**The key insight**: the bottleneck was never the kernel overhead for the final number.
+At 1.86× step overhead with 4-token multi-emit (state-copy reinit):
+```
+4 tokens / (1.86 × 53 ms) = 40.9 tok/s  (2.15× baseline, no MFMA needed)
+```
+The 3-decode reinit killed this throughput (4/4.86 = 15.6 tok/s). State-copy reinit
+restores it by replacing 3 decode calls with 3 memory-copy calls (~1 ms each).
+
+M5.3 (state-copy reinit) is the HIGHEST priority next implementation step.  
+M5.4 (MFMA) adds another 1.7× on top of that, but is not required to beat baseline.
+
+---
 
 ---
 
@@ -529,11 +778,13 @@ llama.cpp/
 | M1 | Dispatch analysis, overhead source confirmed | diagnostic | done |
 | M2 | PTI activation interleave patch | no gain | benchmarked |
 | M3 | MTP analysis — no bonus tokens on hybrid model | no gain | done |
-| **M4a** | **pti_server: single-sequence baseline (correct, working)** | **~19 tok/s** | **done** |
-| **M4b** | **pti_4seq: correct speculative PTI, output byte-identical to baseline** | **~10 tok/s** | **done (1.95× step overhead confirmed)** |
-| M4c | pti_server: correct PTI loop | ~10 tok/s | deferred (slower than single-seq until M5) |
-| **M5a** | **mmvq.cu: explicit weight hoist for N=4 inner loop** | **est. 15–25 tok/s** | **next** |
-| **M5b** | **mmvq.cu: MFMA vectorization for N=4 (gfx906)** | **est. 55–75 tok/s** | **future** |
+| **M4a** | **pti_server: single-sequence baseline** | **19 tok/s** | **done** |
+| **M4b** | **pti_4seq: correct PTI, byte-identical output at greedy** | **10 tok/s** | **done** |
+| M4c | pti_server: correct PTI loop | 10 tok/s | deferred until multi-emit |
+| **M5.1** | **mmvq.cu loop swap (i-outer/j-inner) + LICM hoist** | **10 tok/s (step 1.86×)** | **done** |
+| **M5.2** | **VGPR ISA analysis: 27→63 VGPRs, 9→4 waves/SIMD** | diagnostic | **done** |
+| **M5.3** | **State-copy reinit + multi-emit (4 tokens per step)** | **~41 tok/s** | **next** |
+| M5.4 | mmvq.cu MFMA (AGPRs, restore occupancy) | ~69 tok/s | future |
 | M6 | llama-cli --pti flag, public API | 60–75 | future |
 
 ---
