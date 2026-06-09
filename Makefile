@@ -79,7 +79,7 @@ NGL         ?= 99
 
 # ── Phony targets ─────────────────────────────────────────────────────────────
 .PHONY: all cuda test cuda-test shared cuda-shared clean help \
-        llama mtp 4seq server debug bench all-llama \
+        llama mtp 4seq server debug bench audit all-llama \
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
         4seq-run 4seq-run-base
@@ -183,6 +183,15 @@ $(PTI_SERVER): pti_server.cpp | $(BINDIR)
 	    $(LLAMA_DIR)/build/vendor/cpp-httplib/libcpp-httplib.a \
 	    $(LLAMA_LDFLAGS) -lpthread -lssl -lcrypto
 	@echo "Built $@"
+
+# ── Audit: correctness + performance for each PTI step ───────────────────────
+audit: debug 4seq bench
+	@echo "Running PTI audit (8-10 min on MI50)..."
+	./audit.sh
+
+audit-quick: debug 4seq
+	@echo "Running quick PTI audit (no bench)..."
+	./audit.sh --quick --no-bench
 
 # ── Build all llama.cpp binaries ──────────────────────────────────────────────
 all-llama: $(PTI_LLAMA) $(PTI_MTP) $(PTI_4SEQ)

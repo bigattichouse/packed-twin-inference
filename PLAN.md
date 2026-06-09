@@ -3,8 +3,39 @@
 **Goal**: integrate PTI into llama.cpp to eliminate the batch-GEMM overhead
 and reach 80–100 tok/s on Qwen3.6-27B (MI50).
 
-**Current baseline**: 38.1 tok/s (1.96×) via external `pti_4seq.cpp` using
-llama.cpp's public API. No patches to llama.cpp required for 2×.
+**Current baseline**: 18.9 tok/s (single-sequence, correct output).
+38.1 tok/s figure was inflated by duplicate token counting — see Algorithm
+Correction section.
+
+---
+
+## Audit Framework
+
+Every step of the PTI pipeline has a corresponding automated check.
+Run with `make audit` (full, ~10 min) or `make audit-quick` (no bench, ~6 min).
+
+```
+make audit         # build → baseline → PTI match → accept rates → GEMV bench
+make audit-quick   # same minus the GEMV scaling bench
+./audit.sh --help  # options: -m model, -n tokens, --no-bench, --quick
+```
+
+### What each audit step checks
+
+| Step | Binary | Checks |
+|---|---|---|
+| 1. Build | make | debug, 4seq, bench targets compile cleanly |
+| 2. Baseline | pti_debug | non-empty output, prefill timing, tok/s > 5, coherence heuristic |
+| 3. PTI correctness | pti_4seq | byte-identical to baseline, 100% 4-accept at greedy, zero rejects, same token count |
+| 4. GEMV scaling | pti_gemv_bench | N=4 scaling between 1× and 4× (partial fusion confirmed) |
+
+### Passing criteria
+
+- All steps PASS → PTI machinery is correct and hardware is behaving as expected
+- Step 3 fails on output match → regression in emit logic (check pti_4seq.cpp)
+- Step 3 fails on accept rate → sampler or batch state issue
+- Step 4 scaling ≥ 4× → ggml MMVQ dispatch may have changed; M5 kernel priority rises
+- Step 4 scaling ≤ 1.2× → ggml now fully fuses; M5 kernel may already be done
 
 ---
 
