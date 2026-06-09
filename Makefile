@@ -58,6 +58,7 @@ SRC             := pti_kernel.hip
 PTI_LLAMA  := $(BINDIR)/pti_llama
 PTI_MTP    := $(BINDIR)/pti_mtp
 PTI_4SEQ   := $(BINDIR)/pti_4seq
+PTI_SERVER := $(BINDIR)/pti_server
 
 # ── llama.cpp paths ───────────────────────────────────────────────────────────
 LLAMA_DIR    ?= ../llama.cpp
@@ -76,7 +77,7 @@ NGL         ?= 99
 
 # ── Phony targets ─────────────────────────────────────────────────────────────
 .PHONY: all cuda test cuda-test shared cuda-shared clean help \
-        llama mtp 4seq all-llama \
+        llama mtp 4seq server all-llama \
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
         4seq-run 4seq-run-base
@@ -157,6 +158,15 @@ $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 
 # ── pti_server: PTI HTTP server (OpenAI-compatible) ───────────────────────────
 server: $(PTI_SERVER)
+
+$(PTI_SERVER): pti_server.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) \
+	    -I$(LLAMA_DIR)/vendor \
+	    -I$(LLAMA_DIR)/vendor/cpp-httplib \
+	    -o $@ $< \
+	    $(LLAMA_DIR)/build/vendor/cpp-httplib/libcpp-httplib.a \
+	    $(LLAMA_LDFLAGS) -lpthread -lssl -lcrypto
+	@echo "Built $@"
 
 # ── Build all llama.cpp binaries ──────────────────────────────────────────────
 all-llama: $(PTI_LLAMA) $(PTI_MTP) $(PTI_4SEQ)
