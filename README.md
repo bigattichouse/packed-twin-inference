@@ -239,6 +239,17 @@ At 393 GB/s (llama.cpp GEMV efficiency): 393 / 4.9 ≈ 80 tok/s
 
 ---
 
+## Architecture Diagrams
+
+| Diagram | What it shows |
+|---|---|
+| `diagram-pti-4seq-step.svg` | One full PTI step: 4-token batch, weight sharing, verify/accept/reject paths, KV layout |
+| `diagram-pti-overhead.svg` | Why overhead is 2× not 4×: weight load shared, activation reads are the cost, throughput bars |
+| `diagram-memory-layout.svg` | SSQ uint16 block format — how two int8 weights pack into one word |
+| `diagram-workflow.svg` | High-level PTI inference loop from prefill through accept/reject |
+
+---
+
 ## Files
 
 | File | Purpose | Status |

@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" font-family="monospace" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#555"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="520" fill="#fafafa" rx="6"/>
+
+  <!-- Title -->
+  <text x="450" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="#111">Why Overhead Is 2× Not 4× — Weight Sharing in llama_decode</text>
+  <text x="450" y="48" text-anchor="middle" font-size="12" fill="#555">MI50 · Qwen3.6-27B · one transformer layer (FFN shown)</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════ -->
+  <!-- LEFT: Baseline N=1 -->
+  <!-- ═══════════════════════════════════════════════════════════════════════ -->
+  <text x="210" y="75" text-anchor="middle" font-size="13" font-weight="bold" fill="#1a3a6a">Baseline  (N=1, 47 ms/step)</text>
+
+  <!-- HBM arrow -->
+  <rect x="30" y="90" width="100" height="36" rx="4" fill="#cfe2ff" stroke="#4a6eb5" stroke-width="1.5"/>
+  <text x="80" y="108" text-anchor="middle" font-size="11" fill="#1a2a5a">HBM</text>
+  <text x="80" y="122" text-anchor="middle" font-size="11" fill="#1a2a5a">25 GB weights</text>
+  <line x1="130" y1="108" x2="158" y2="108" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- GEMV kernel -->
+  <rect x="160" y="90" width="100" height="36" rx="4" fill="#e8f0fe" stroke="#4a6eb5" stroke-width="1.5"/>
+  <text x="210" y="108" text-anchor="middle" font-size="11" fill="#1a2a5a">mul_mat_vec_q</text>
+  <text x="210" y="122" text-anchor="middle" font-size="11" fill="#1a2a5a">GEMV  N=1</text>
+  <line x1="260" y1="108" x2="288" y2="108" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- output -->
+  <rect x="290" y="90" width="90" height="36" rx="4" fill="#d4edda" stroke="#2a7a2a" stroke-width="1.5"/>
+  <text x="335" y="108" text-anchor="middle" font-size="11" fill="#1a4a1a">1 logit</text>
+  <text x="335" y="122" text-anchor="middle" font-size="11" fill="#1a4a1a">vector</text>
+
+  <!-- activation box -->
+  <rect x="160" y="142" width="100" height="30" rx="3" fill="#fff3cd" stroke="#b08a00" stroke-width="1"/>
+  <text x="210" y="157" text-anchor="middle" font-size="11" fill="#705500">activation</text>
+  <text x="210" y="169" text-anchor="middle" font-size="11" fill="#705500">20 KB  (L2 hit)</text>
+  <line x1="210" y1="142" x2="210" y2="128" stroke="#b08a00" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- BW bar N=1 -->
+  <text x="30" y="198" font-size="11" fill="#333">Effective BW:</text>
+  <rect x="30" y="205" width="340" height="18" rx="3" fill="#4a90d9"/>
+  <text x="200" y="218" text-anchor="middle" font-size="10" fill="white">393 GB/s  (Q5_K_M GEMV — 103% of D2D)</text>
+  <text x="378" y="218" font-size="10" fill="#333">1.00×</text>
+
+  <!-- step time bar N=1 -->
+  <text x="30" y="240" font-size="11" fill="#333">Step time:</text>
+  <rect x="30" y="247" width="110" height="18" rx="3" fill="#2a7a2a"/>
+  <text x="85" y="260" text-anchor="middle" font-size="10" fill="white">47 ms</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════ -->
+  <!-- RIGHT: PTI N=4 -->
+  <!-- ═══════════════════════════════════════════════════════════════════════ -->
+  <text x="660" y="75" text-anchor="middle" font-size="13" font-weight="bold" fill="#1a3a6a">PTI 4-seq  (N=4, 105 ms/step)</text>
+
+  <!-- HBM — SAME weights -->
+  <rect x="480" y="90" width="100" height="36" rx="4" fill="#cfe2ff" stroke="#4a6eb5" stroke-width="2"/>
+  <text x="530" y="108" text-anchor="middle" font-size="11" fill="#1a2a5a">HBM</text>
+  <text x="530" y="122" text-anchor="middle" font-size="11" fill="#1a2a5a">25 GB weights</text>
+  <line x1="580" y1="108" x2="608" y2="108" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- GEMM kernel (batch) -->
+  <rect x="610" y="90" width="115" height="36" rx="4" fill="#e8f0fe" stroke="#4a6eb5" stroke-width="1.5"/>
+  <text x="667" y="108" text-anchor="middle" font-size="11" fill="#1a2a5a">mul_mat_vec_q</text>
+  <text x="667" y="122" text-anchor="middle" font-size="11" fill="#1a2a5a">ncols_dst=4</text>
+  <line x1="725" y1="108" x2="753" y2="108" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- output -->
+  <rect x="755" y="90" width="110" height="36" rx="4" fill="#d4edda" stroke="#2a7a2a" stroke-width="1.5"/>
+  <text x="810" y="108" text-anchor="middle" font-size="11" fill="#1a4a1a">4 logit</text>
+  <text x="810" y="122" text-anchor="middle" font-size="11" fill="#1a4a1a">vectors</text>
+
+  <!-- 4 activation boxes -->
+  <rect x="610" y="142" width="50" height="26" rx="3" fill="#ffe8b0" stroke="#b08a00" stroke-width="1"/>
+  <text x="635" y="155" text-anchor="middle" font-size="10" fill="#705500">xa 20KB</text>
+  <text x="635" y="165" text-anchor="middle" font-size="9" fill="#705500">L2 hit</text>
+
+  <rect x="664" y="142" width="50" height="26" rx="3" fill="#ffe8b0" stroke="#b08a00" stroke-width="1"/>
+  <text x="689" y="155" text-anchor="middle" font-size="10" fill="#705500">xb 20KB</text>
+  <text x="689" y="165" text-anchor="middle" font-size="9" fill="#705500">L2 hit</text>
+
+  <rect x="718" y="142" width="50" height="26" rx="3" fill="#ffe8b0" stroke="#b08a00" stroke-width="1"/>
+  <text x="743" y="155" text-anchor="middle" font-size="10" fill="#705500">xc 20KB</text>
+  <text x="743" y="165" text-anchor="middle" font-size="9" fill="#705500">L2 hit</text>
+
+  <rect x="772" y="142" width="50" height="26" rx="3" fill="#ffe8b0" stroke="#b08a00" stroke-width="1"/>
+  <text x="797" y="155" text-anchor="middle" font-size="10" fill="#705500">xd 20KB</text>
+  <text x="797" y="165" text-anchor="middle" font-size="9" fill="#705500">L2 hit</text>
+
+  <line x1="635" y1="142" x2="635" y2="128" stroke="#b08a00" stroke-width="1.1" marker-end="url(#arr)"/>
+  <line x1="689" y1="142" x2="689" y2="128" stroke="#b08a00" stroke-width="1.1" marker-end="url(#arr)"/>
+  <line x1="743" y1="142" x2="743" y2="128" stroke="#b08a00" stroke-width="1.1" marker-end="url(#arr)"/>
+  <line x1="797" y1="142" x2="797" y2="128" stroke="#b08a00" stroke-width="1.1" marker-end="url(#arr)"/>
+
+  <!-- L2 pressure callout -->
+  <rect x="610" y="176" width="215" height="20" rx="3" fill="#fde8e8" stroke="#a04040" stroke-width="1"/>
+  <text x="717" y="190" text-anchor="middle" font-size="10" fill="#701010">4× activation reads per weight block → L2 pressure</text>
+
+  <!-- BW bar N=4 -->
+  <text x="480" y="215" font-size="11" fill="#333">Effective BW:</text>
+  <rect x="480" y="222" width="177" height="18" rx="3" fill="#4a90d9" opacity="0.7"/>
+  <text x="568" y="235" text-anchor="middle" font-size="10" fill="white">177 GB/s  (46% of D2D)</text>
+  <text x="665" y="235" font-size="10" fill="#a04040">← 2.2× lower per-seq</text>
+
+  <!-- step time bar N=4 -->
+  <text x="480" y="258" font-size="11" fill="#333">Step time:</text>
+  <rect x="480" y="265" width="224" height="18" rx="3" fill="#a04040"/>
+  <text x="592" y="278" text-anchor="middle" font-size="10" fill="white">105 ms  (2.04× baseline)</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════ -->
+  <!-- Throughput comparison bars -->
+  <!-- ═══════════════════════════════════════════════════════════════════════ -->
+  <line x1="30" y1="310" x2="870" y2="310" stroke="#ddd" stroke-width="1"/>
+  <text x="450" y="330" text-anchor="middle" font-size="13" font-weight="bold" fill="#111">Throughput — tokens per second (total output)</text>
+
+  <!-- baseline bar -->
+  <text x="30" y="358" font-size="11" fill="#333">Baseline 1-seq:</text>
+  <rect x="160" y="345" width="105" height="22" rx="3" fill="#4a90d9"/>
+  <text x="265" y="361" font-size="11" fill="#333">  19.4 tok/s  1.00×</text>
+
+  <!-- 2-seq bar -->
+  <text x="30" y="383" font-size="11" fill="#333">PTI 2-seq:</text>
+  <rect x="160" y="370" width="152" height="22" rx="3" fill="#2a7a2a" opacity="0.8"/>
+  <text x="315" y="386" font-size="11" fill="#333">  30.5 tok/s  1.57×</text>
+
+  <!-- 3-seq bar -->
+  <text x="30" y="408" font-size="11" fill="#333">PTI 3-seq:</text>
+  <rect x="160" y="395" width="169" height="22" rx="3" fill="#2a7a2a" opacity="0.85"/>
+  <text x="332" y="411" font-size="11" fill="#333">  33.9 tok/s  1.75×</text>
+
+  <!-- 4-seq bar -->
+  <text x="30" y="433" font-size="11" fill="#333">PTI 4-seq:</text>
+  <rect x="160" y="420" width="190" height="22" rx="3" fill="#1a5a1a"/>
+  <text x="353" y="436" font-size="11" fill="#333">  38.1 tok/s  1.96×  ← current best</text>
+
+  <!-- theoretical ideal (4×) -->
+  <text x="30" y="458" font-size="11" fill="#aaa">Ideal 4× (no overhead):</text>
+  <rect x="160" y="445" width="388" height="22" rx="3" fill="#aaa" opacity="0.3"/>
+  <line x1="160" y1="445" x2="548" y2="445" stroke="#aaa" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="160" y1="467" x2="548" y2="467" stroke="#aaa" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="552" y="461" font-size="11" fill="#999">77.6 tok/s  4.00×  (target after integration)</text>
+
+  <!-- vertical scale line -->
+  <line x1="160" y1="340" x2="160" y2="470" stroke="#ccc" stroke-width="1"/>
+
+  <!-- Key insight box -->
+  <rect x="30" y="480" width="840" height="30" rx="4" fill="#e8f0fe" stroke="#4a6eb5" stroke-width="1"/>
+  <text x="450" y="498" text-anchor="middle" font-size="12" fill="#1a2a5a">
+    Weight load is shared: 25 GB loaded ONCE per step regardless of N.  Overhead = 4× activation reads + longer reduction.  Fix: interleaved float4 activation layout in mmvq.cu.
+  </text>
+</svg>

@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" font-family="monospace" font-size="13">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#555"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#2a7a2a"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#a02020"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="560" fill="#fafafa" rx="6"/>
+
+  <!-- Title -->
+  <text x="450" y="32" text-anchor="middle" font-size="16" font-weight="bold" fill="#111">PTI 4-Sequence Step (current implementation — 38.1 tok/s on MI50)</text>
+  <text x="450" y="52" text-anchor="middle" font-size="12" fill="#555">One llama_decode call · One weight load · 4 predictions · verify/accept in user code</text>
+
+  <!-- ── WEIGHT LOAD box ─────────────────────────────────────────────────── -->
+  <rect x="30" y="75" width="160" height="60" rx="5" fill="#e8f0fe" stroke="#4a6eb5" stroke-width="1.5"/>
+  <text x="110" y="99" text-anchor="middle" font-weight="bold" fill="#2a3d7a">HBM Weight Load</text>
+  <text x="110" y="115" text-anchor="middle" font-size="11" fill="#2a3d7a">25 GB model weights</text>
+  <text x="110" y="129" text-anchor="middle" font-size="11" fill="#2a3d7a">ONE load serves all 4 seqs</text>
+
+  <!-- arrow from weight load to llama_decode -->
+  <line x1="190" y1="105" x2="238" y2="105" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ── llama_decode box ────────────────────────────────────────────────── -->
+  <rect x="240" y="75" width="200" height="60" rx="5" fill="#e8f0fe" stroke="#4a6eb5" stroke-width="1.5"/>
+  <text x="340" y="96" text-anchor="middle" font-weight="bold" fill="#2a3d7a">llama_decode(ctx, batch)</text>
+  <text x="340" y="112" text-anchor="middle" font-size="11" fill="#2a3d7a">batch.n_tokens = 4</text>
+  <text x="340" y="128" text-anchor="middle" font-size="11" fill="#2a3d7a">one token per sequence</text>
+
+  <!-- 4 sequence inputs entering llama_decode from below -->
+  <!-- Seq labels -->
+  <text x="260" y="172" text-anchor="middle" font-size="11" fill="#444">Seq 0 (A)</text>
+  <text x="312" y="172" text-anchor="middle" font-size="11" fill="#444">Seq 1 (B)</text>
+  <text x="364" y="172" text-anchor="middle" font-size="11" fill="#444">Seq 2 (C)</text>
+  <text x="416" y="172" text-anchor="middle" font-size="11" fill="#444">Seq 3 (D)</text>
+
+  <!-- token bubbles -->
+  <rect x="240" y="178" width="40" height="22" rx="3" fill="#d4edda" stroke="#3a7a3a" stroke-width="1"/>
+  <text x="260" y="194" text-anchor="middle" font-size="11" fill="#1a4a1a">tok_a</text>
+
+  <rect x="292" y="178" width="40" height="22" rx="3" fill="#d4edda" stroke="#3a7a3a" stroke-width="1"/>
+  <text x="312" y="194" text-anchor="middle" font-size="11" fill="#1a4a1a">tok_b</text>
+
+  <rect x="344" y="178" width="40" height="22" rx="3" fill="#d4edda" stroke="#3a7a3a" stroke-width="1"/>
+  <text x="364" y="194" text-anchor="middle" font-size="11" fill="#1a4a1a">tok_c</text>
+
+  <rect x="396" y="178" width="40" height="22" rx="3" fill="#d4edda" stroke="#3a7a3a" stroke-width="1"/>
+  <text x="416" y="194" text-anchor="middle" font-size="11" fill="#1a4a1a">tok_d</text>
+
+  <!-- arrows from token bubbles up to llama_decode -->
+  <line x1="260" y1="178" x2="260" y2="137" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="312" y1="178" x2="312" y2="137" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="364" y1="178" x2="364" y2="137" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="416" y1="178" x2="416" y2="137" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+  <!-- position labels -->
+  <text x="260" y="216" text-anchor="middle" font-size="10" fill="#888">pos_a</text>
+  <text x="312" y="216" text-anchor="middle" font-size="10" fill="#888">pos_a+1</text>
+  <text x="364" y="216" text-anchor="middle" font-size="10" fill="#888">pos_a+2</text>
+  <text x="416" y="216" text-anchor="middle" font-size="10" fill="#888">pos_a+3</text>
+
+  <!-- ── Logits output ───────────────────────────────────────────────────── -->
+  <line x1="440" y1="105" x2="488" y2="105" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="490" y="75" width="185" height="60" rx="5" fill="#fff3cd" stroke="#b08a00" stroke-width="1.5"/>
+  <text x="582" y="96" text-anchor="middle" font-weight="bold" fill="#705500">4 logit vectors</text>
+  <text x="582" y="112" text-anchor="middle" font-size="11" fill="#705500">argmax → next token</text>
+  <text x="582" y="128" text-anchor="middle" font-size="11" fill="#705500">for each sequence</text>
+
+  <!-- ── Verify box ──────────────────────────────────────────────────────── -->
+  <line x1="675" y1="105" x2="718" y2="105" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="720" y="75" width="155" height="60" rx="5" fill="#f0f0f0" stroke="#666" stroke-width="1.5"/>
+  <text x="797" y="96" text-anchor="middle" font-weight="bold" fill="#333">Verify</text>
+  <text x="797" y="112" text-anchor="middle" font-size="11" fill="#333">tok_b == actual_next?</text>
+  <text x="797" y="128" text-anchor="middle" font-size="11" fill="#333">tok_c == next_from_b?</text>
+
+  <!-- ── Accept/Reject outcomes ─────────────────────────────────────────── -->
+
+  <!-- 4-ACCEPT path -->
+  <rect x="590" y="265" width="290" height="70" rx="5" fill="#d4edda" stroke="#2a7a2a" stroke-width="1.5"/>
+  <text x="735" y="284" text-anchor="middle" font-weight="bold" fill="#1a4a1a">4-ACCEPT  (100% greedy)</text>
+  <text x="735" y="300" text-anchor="middle" font-size="11" fill="#1a4a1a">emit actual_next, next_from_b, next_from_c, next_from_d</text>
+  <text x="735" y="316" text-anchor="middle" font-size="11" fill="#1a4a1a">advance all 4 positions · 4 tokens out · no resets</text>
+  <text x="735" y="330" text-anchor="middle" font-size="11" fill="#1a4a1a">next step: tok_a←actual  tok_b←from_b  tok_c←from_c  tok_d←from_d</text>
+
+  <!-- arrow from verify to 4-accept -->
+  <line x1="797" y1="135" x2="797" y2="230" stroke="#2a7a2a" stroke-width="1.5"/>
+  <line x1="797" y1="230" x2="735" y2="263" stroke="#2a7a2a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <text x="820" y="200" font-size="11" fill="#2a7a2a">B✓ C✓ D✓</text>
+
+  <!-- 3-ACCEPT path -->
+  <rect x="590" y="355" width="290" height="60" rx="5" fill="#d4edda" stroke="#2a7a2a" stroke-width="1.5"/>
+  <text x="735" y="374" text-anchor="middle" font-weight="bold" fill="#1a4a1a">3-ACCEPT</text>
+  <text x="735" y="390" text-anchor="middle" font-size="11" fill="#1a4a1a">emit 3 tokens · re-init seq D only (1 extra decode)</text>
+  <text x="735" y="406" text-anchor="middle" font-size="11" fill="#1a4a1a">seq D reset to pos_c · 3 tokens out</text>
+
+  <line x1="770" y1="265" x2="735" y2="353" stroke="#2a7a2a" stroke-width="1.2" marker-end="url(#arrow-green)"/>
+  <text x="748" y="320" font-size="11" fill="#2a7a2a">B✓ C✓ D✗</text>
+
+  <!-- 2-ACCEPT path -->
+  <rect x="590" y="435" width="290" height="60" rx="5" fill="#fff3cd" stroke="#b08a00" stroke-width="1.5"/>
+  <text x="735" y="454" text-anchor="middle" font-weight="bold" fill="#705500">2-ACCEPT</text>
+  <text x="735" y="470" text-anchor="middle" font-size="11" fill="#705500">emit 2 tokens · re-init seqs C and D (2–3 extra decodes)</text>
+  <text x="735" y="486" text-anchor="middle" font-size="11" fill="#705500">2 tokens out</text>
+
+  <line x1="735" y1="353" x2="735" y2="433" stroke="#b08a00" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <text x="748" y="400" font-size="11" fill="#b08a00">B✓ C✗</text>
+
+  <!-- REJECT path -->
+  <rect x="590" y="515" width="290" height="36" rx="5" fill="#fde8e8" stroke="#a02020" stroke-width="1.5"/>
+  <text x="735" y="531" text-anchor="middle" font-weight="bold" fill="#701010">REJECT</text>
+  <text x="735" y="547" text-anchor="middle" font-size="11" fill="#701010">emit 1 token · re-init seqs B, C, D (3–4 extra decodes)</text>
+
+  <line x1="735" y1="493" x2="735" y2="513" stroke="#a02020" stroke-width="1.2" marker-end="url(#arrow-red)"/>
+  <text x="748" y="510" font-size="11" fill="#a02020">B✗</text>
+
+  <!-- ── KV Cache diagram ────────────────────────────────────────────────── -->
+  <rect x="30" y="265" width="530" height="200" rx="5" fill="#f8f8f8" stroke="#bbb" stroke-width="1"/>
+  <text x="295" y="285" text-anchor="middle" font-weight="bold" font-size="13" fill="#333">KV Cache — 4 independent sequences, shared prefix</text>
+
+  <!-- Seq 0 KV bar -->
+  <text x="50" y="315" font-size="11" fill="#333">Seq 0 (A):</text>
+  <rect x="130" y="302" width="300" height="18" rx="2" fill="#4a90d9" opacity="0.7"/>
+  <text x="280" y="315" text-anchor="middle" font-size="10" fill="white">prompt tokens (shared with seqs 1–3 via seq_cp)</text>
+  <rect x="430" y="302" width="30" height="18" rx="2" fill="#1a5a9a"/>
+  <text x="445" y="315" text-anchor="middle" font-size="10" fill="white">gen</text>
+  <text x="470" y="315" font-size="10" fill="#555">← pos_a</text>
+
+  <!-- Seq 1 KV bar -->
+  <text x="50" y="340" font-size="11" fill="#333">Seq 1 (B):</text>
+  <rect x="130" y="327" width="300" height="18" rx="2" fill="#4a90d9" opacity="0.5"/>
+  <rect x="430" y="327" width="48" height="18" rx="2" fill="#1a5a9a" opacity="0.8"/>
+  <text x="454" y="340" text-anchor="middle" font-size="10" fill="white">+1</text>
+  <text x="486" y="340" font-size="10" fill="#555">← pos_a+1</text>
+
+  <!-- Seq 2 KV bar -->
+  <text x="50" y="365" font-size="11" fill="#333">Seq 2 (C):</text>
+  <rect x="130" y="352" width="300" height="18" rx="2" fill="#4a90d9" opacity="0.5"/>
+  <rect x="430" y="352" width="65" height="18" rx="2" fill="#1a5a9a" opacity="0.8"/>
+  <text x="462" y="365" text-anchor="middle" font-size="10" fill="white">+2</text>
+  <text x="502" y="365" font-size="10" fill="#555">← pos_a+2</text>
+
+  <!-- Seq 3 KV bar -->
+  <text x="50" y="390" font-size="11" fill="#333">Seq 3 (D):</text>
+  <rect x="130" y="377" width="300" height="18" rx="2" fill="#4a90d9" opacity="0.5"/>
+  <rect x="430" y="377" width="82" height="18" rx="2" fill="#1a5a9a" opacity="0.8"/>
+  <text x="471" y="390" text-anchor="middle" font-size="10" fill="white">+3</text>
+  <text x="518" y="390" font-size="10" fill="#555">← pos_a+3</text>
+
+  <text x="130" y="415" font-size="10" fill="#888">■ shared prefix (via llama_memory_seq_cp)   ■ divergent tail</text>
+
+  <!-- VRAM note -->
+  <rect x="40" y="430" width="505" height="24" rx="3" fill="#e8f4e8" stroke="#aaa" stroke-width="1"/>
+  <text x="292" y="446" text-anchor="middle" font-size="11" fill="#333">VRAM: 24.5 GiB total  (+0.8 GiB vs baseline 23.7 GiB)  ·  KV/state per extra seq ≈ 278 MiB</text>
+
+  <!-- Step time note -->
+  <rect x="40" y="462" width="505" height="24" rx="3" fill="#e8eaf6" stroke="#aaa" stroke-width="1"/>
+  <text x="292" y="478" text-anchor="middle" font-size="11" fill="#333">Step time: ~105 ms  (2.04× baseline 47 ms)  ·  tokens/step: 4 (greedy) → 38.1 tok/s</text>
+</svg>
