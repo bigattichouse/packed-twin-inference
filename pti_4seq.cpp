@@ -248,7 +248,7 @@ static int run_pti4(const PTIArgs *args) {
                 tok_b = next_from_b;
 
                 llama_memory_seq_rm(mem, 2, pos_c - 1, -1);
-                llama_memory_seq_rm(mem, 3, pos_d - 1, -1);
+                llama_memory_seq_rm(mem, 3, pos_b, -1);   // trim to pos_b-1; D stage1 rebuilds from pos_b
                 pos_c = pos_b;
                 pos_d = pos_b;
 
@@ -284,7 +284,7 @@ static int run_pti4(const PTIArgs *args) {
 
             llama_memory_seq_rm(mem, 1, pos_b - 1, -1);
             llama_memory_seq_rm(mem, 2, pos_c - 1, -1);
-            llama_memory_seq_rm(mem, 3, pos_d - 1, -1);
+            llama_memory_seq_rm(mem, 3, pos_a, -1);       // trim seq3 to confirmed prefix (0..pos_a-1)
             pos_b = pos_a; pos_c = pos_a; pos_d = pos_a;
 
             batch_clear(&step_batch);
@@ -300,6 +300,12 @@ static int run_pti4(const PTIArgs *args) {
                     pos_c = pos_b + 1;
                 }
 
+                // D stage0: replay actual_next on seq3 (fills pos_a; seq3 was trimmed to pos_a-1)
+                batch_clear(&step_batch);
+                batch_add(&step_batch, actual_next, pos_d, 3, false);
+                if (llama_decode(ctx, step_batch) == 0) {
+                    pos_d++;
+                }
                 batch_clear(&step_batch);
                 batch_add(&step_batch, tok_b, pos_b, 3, false);
                 if (llama_decode(ctx, step_batch) == 0) {

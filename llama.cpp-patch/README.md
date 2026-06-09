@@ -1,7 +1,21 @@
 # PTI Interleaved Activation Patch for llama.cpp
 
+> **NOT READY — DO NOT APPLY YET**
+>
+> The kernel patch compiles and the interleaved layout is correct, but the
+> benchmark driver (`pti_4seq`) is blocked on a compatibility issue with
+> llama.cpp v0.0.9261+: Qwen3.6-27B uses a hybrid attention + SSM
+> architecture (QWEN35/ISWA), and the new strict position validation
+> rejects the REJECT/2-ACCEPT reinit paths that PTI requires.
+>
+> **What currently works:** the 2× baseline throughput measurement
+> (`pti_4seq` without GGML_PTI_INTERLEAVED). Kernel benchmarking against
+> the interleaved path is blocked until the reinit logic is fixed.
+>
+> See `PLAN.md` for status.
+
 **Target file**: `ggml/src/ggml-cuda/mmvq.cu`
-**Status**: benchmarking in progress
+**Status**: kernel written, benchmark blocked (reinit incompatibility with hybrid model)
 
 ## What this does
 
