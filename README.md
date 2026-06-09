@@ -77,15 +77,21 @@ model (4–19 GiB extra). PTI's extra cost is near-zero.
 
 ## Why Greedy Accept Rate Is 100%
 
-For same-model PTI with greedy (temp=0) decoding:
+PTI is **not speculative decoding** — there is no draft model. It is batch decode
+with position offsets. All 4 sequences run the same model weights; they simply
+start at different positions in the generated sequence:
 
-- Sequence 0 is the **verifier**: it processes the confirmed token at position n
-- Sequence 1 is the **drafter**: it speculatively processes position n+1
-- Sequence 2, 3, … continue the speculative chain
+```
+Seq 0: model(confirmed_token,  pos n)   → predicts token n+1
+Seq 1: model(token_n+1_guess,  pos n+1) → predicts token n+2
+Seq 2: model(token_n+2_guess,  pos n+2) → predicts token n+3
+Seq 3: model(token_n+3_guess,  pos n+3) → predicts token n+4
+```
 
-With greedy decoding and identical weights, sequence 0 at position n always predicts
-the same token that sequence 1 speculated at n-1. Accept rate = 100%. No rollbacks.
-N tokens emitted every step.
+With greedy (temp=0) decoding, the same model given the same input always
+produces the same output. So sequence 1's prediction at position n+1 is
+guaranteed to match what sequence 0 would have predicted — 100% accept rate.
+N tokens emitted every step, no rollbacks, no quality loss.
 
 | Decoding mode | Accept rate | PTI multiplier |
 |---|---|---|

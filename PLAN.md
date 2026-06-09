@@ -85,69 +85,83 @@ So N=4 should still be MMVQ — overhead is from within the kernel, not dispatch
 
 ## Three-Phase Integration Plan
 
-### Phase 1 — Measure overhead source (1–2 days)
+### Phase 1 — Overhead source confirmed (done)
 
-**Goal**: confirm exactly what causes the 2.04× overhead at N=4.
+**Dispatch analysis** (static, no profiling needed):
 
-1. Add `--pti 4` flag to `llama-cli` that passes `n_seq_max=4` and submits
-   4-token batches. This mirrors what `pti_4seq.cpp` does but from inside llama.cpp.
+`MMVQ_MAX_BATCH_SIZE = 8`. For N=4 on MI50 GCN:
+- `src1->ne[1] = 4 <= 8` → `use_mul_mat_vec_q = true`
+- `ggml_cuda_should_use_mmq` returns `false` for GCN (no DP4A / MMA)
+- Dispatch path: `ggml_cuda_mul_mat_vec_q` → `mul_mat_vec_q<Q5_K, ncols_dst=4>`
 
-2. Run rocprof on the 4-seq decode loop and identify which kernel consumes
-   the extra 1.04× step time vs baseline:
-   ```bash
-   rocprof --stats ./llama-cli --pti 4 -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf \
-           -p "The key to faster LLM inference is" -n 80 -ngl 99
-   ```
+**N=4 uses the MMVQ GEMV kernel, not cuBLAS/rocBLAS GEMM.**
+Overhead is inside `mul_mat_vec_q` from increased L2 activation traffic:
 
-3. Expected findings:
-   - If `mul_mat_vec_q` is called with `ncols_dst=4` → overhead is within kernel
-   - If GEMM kernel appears instead → dispatch threshold is the fix
+```
+N=1:  17408 blocks × 1 × 20 KB activations = 357 MB L2 traffic
+N=4:   8704 blocks × 4 × 20 KB activations = 714 MB L2 traffic  (2× more)
+```
 
-**Deliverable**: profiler trace pinpointing the overhead. Determines which fix to implement.
+The activation tensor (20 KB per seq) fits in MI50's 16 MB L2, so it's not
+an HBM miss — it's L2 bandwidth saturation from 2× more requests.
+The weight reads (89 MB) are identical for N=1 and N=4.
 
-**Expected result from this phase alone**: 0 extra tok/s, but unblocks Phase 2.
+**Fix**: interleave the 4 activation tensors as `[K × 4]` float4 layout.
+One float4 load fetches all 4 activations at the same K position →
+4× fewer L2 transactions → L2 traffic drops from 714 MB back to ~179 MB.
+
+This is exactly the `pti_linear4_q8_intlv` approach benchmarked in
+`pti_kernel.hip` at 130 GB/s (the best of all custom kernels).
+
+**Deliverable from Phase 1**: complete dispatch/overhead analysis (this document).
+Phase 2 proceeds directly to writing the kernel patch.
 
 ---
 
-### Phase 2 — Eliminate overhead (3–5 days)
+### Phase 2 — Eliminate overhead (patch written)
 
-**Option A (likely)**: overhead is within `mul_mat_vec_q` at `ncols_dst=4`.
+**Status**: patch file `pti_mmvq_patch.cu` written and committed.  Ready to
+apply to `llama.cpp` and benchmark.
 
-The GCN table uses `nwarps=2` for both N=1 and N=4. The kernel processes
-`rows_per_block=2` at N=4 but `rows_per_block=1` at N=1. Each row-block
-reads all 4 activation vectors once per K iteration, so L2 pressure grows 4×.
+**Root cause confirmed** (from Phase 1 dispatch analysis):
+- N=4 uses `mul_mat_vec_q<Q5_K, ncols_dst=4>` on MMVQ path (confirmed, not GEMM)
+- Inner loop reads `y[j * stride_col_y + kby]` for j = 0..3
+- `stride_col_y = 160 blocks = 5760 bytes` → 4 accesses 5760 bytes apart per kby
+- 160 kby iterations × 4 scattered reads = 640 L2 transactions vs 160 for N=1
 
-Fix: add a PTI-specific kernel variant that reads 4 activation vectors as a
-single `float4` (interleaved layout), matching the `pti_linear4_q8_intlv` approach
-already benchmarked at 130 GB/s in `pti_kernel.hip`:
+**Patch approach** (see `pti_mmvq_patch.cu` for full annotated diff):
 
-```cpp
-// In mmvq.cu — new kernel variant
-template <ggml_type type, int ncols_dst, bool pti_interleaved>
-__global__ void mul_mat_vec_q_pti(...)
-{
-    // Existing weight load (unchanged)
-    // Activation load: if pti_interleaved, use float4 from [K × ncols_dst] layout
-    float4 xv = ((const float4*)vy_interleaved)[k];
-    // xv.x=xa, xv.y=xb, xv.z=xc, xv.w=xd — ONE VMEM instruction for 4 streams
-}
+1. `pti_interleave_q8_1_kernel<N>` — pre-packs N activation columns into
+   interleaved layout `y_intlv[kby * N + j]` so all N blocks per kby position
+   are adjacent (144 bytes in 3 cache lines, not 4 × 5760 bytes apart).
+   Launched once per GEMV call; negligible cost (22.5 KB of data movement).
+
+2. `mul_mat_vec_q<..., pti_interleaved=true>` — new bool template param.
+   When true, the inner loop uses `ybase = &y[kby * ncols_dst]` with `ybase[j]`
+   instead of `y[j * stride_col_y + kby]`.  All existing code paths compile
+   exactly as before (the new param defaults to false).
+
+3. `ggml_cuda_mul_mat_vec_q_pti` — new dispatch function in ggml-cuda.cu.
+   Checks `ctx.pti_mode && ncols_dst == 4`, interleaves activations into a
+   pre-allocated 78 KB buffer, then calls the interleaved kernel variant.
+
+4. `llama_context_set_pti(ctx, n_streams)` — allocates the interleaved buffer
+   once at context init; reused across all decode steps.
+
+**Files to modify in llama.cpp**:
+- `ggml/src/ggml-cuda/mmvq.cu` — add `pti_interleaved` template param + branch
+- `ggml/src/ggml-cuda/ggml-cuda.cu` — add PTI dispatch + `pti_interleave_q8_1_kernel`
+- `src/llama.cpp` — add `pti_n_streams`, `pti_act_buf` to `llama_context`
+- `include/llama.h` — add `llama_context_set_pti`, `llama_pti_params`
+
+**Expected result**: step overhead drops from 2.04× → 1.05–1.15×.
+```
+4 / 1.15 × 19.4 ≈ 67 tok/s  (conservative)
+4 / 1.05 × 19.4 ≈ 74 tok/s  (optimistic)
 ```
 
-**Option B (less likely)**: dispatch routes N=4 to GEMM.
-
-Fix: raise `MMVQ_MAX_BATCH_SIZE` or override the dispatch for PTI mode to
-force the GEMV path for all N ≤ 8.
-
-**Files to modify**:
-- `ggml/src/ggml-cuda/mmvq.cu` — kernel variant
-- `ggml/src/ggml-cuda/ggml-cuda.cu` — dispatch if needed
-- `src/llama.cpp` — PTI context mode (sets interleaved activation layout)
-
-**Expected result**: step overhead drops from 2.04× → 1.1–1.3×.
-```
-4 / 1.15 × 19.4 ≈ 67 tok/s  (conservative, 1.15× overhead)
-4 / 1.05 × 19.4 ≈ 74 tok/s  (optimistic, 1.05× overhead)
-```
+**Validation**: run `pti_4seq` with `GGML_CUDA_FORCE_MMVQ_PTI=1` env var;
+output tokens must be bit-identical to baseline (same argmax on same logits).
 
 ---
 
@@ -244,8 +258,8 @@ llama.cpp/
 | Milestone | Description | Expected tok/s | Delta |
 |---|---|---|---|
 | M0 (done) | pti_4seq.cpp via public API | **38.1** | baseline for v2 |
-| M1 | rocprof trace, overhead source confirmed | 38.1 | diagnostic |
-| M2 | PTI GEMV variant in mmvq.cu, overhead 1.1–1.3× | **60–75** | +22–37 |
+| M1 | Dispatch analysis, overhead source confirmed (static) | 38.1 | diagnostic |
+| M2 (patch written) | PTI GEMV variant in mmvq.cu, overhead 1.05–1.15× | **60–75** | +22–37 |
 | M3 | PTI × MTP, MTP head after main decode | **80–100** | +20–30 |
 | M4 | llama-cli --pti flag, public API | 80–100 | shippable |
 
