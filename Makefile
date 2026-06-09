@@ -55,9 +55,9 @@ TARGET_SO       := $(BINDIR)/libpti.so
 TARGET_SO_CUDA  := $(BINDIR)/libpti_cuda.so
 SRC             := pti_kernel.hip
 
-PTI_LLAMA := $(BINDIR)/pti_llama
-PTI_MTP   := $(BINDIR)/pti_mtp
-PTI_4SEQ  := $(BINDIR)/pti_4seq
+PTI_LLAMA  := $(BINDIR)/pti_llama
+PTI_MTP    := $(BINDIR)/pti_mtp
+PTI_4SEQ   := $(BINDIR)/pti_4seq
 
 # ── llama.cpp paths ───────────────────────────────────────────────────────────
 LLAMA_DIR    ?= ../llama.cpp
@@ -80,6 +80,7 @@ NGL         ?= 99
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
         4seq-run 4seq-run-base
+
 
 # ── bin/ directory ────────────────────────────────────────────────────────────
 $(BINDIR):
@@ -153,6 +154,9 @@ $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 
 4seq-run-base: $(PTI_4SEQ)
 	$(PTI_4SEQ) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
+# ── pti_server: PTI HTTP server (OpenAI-compatible) ───────────────────────────
+server: $(PTI_SERVER)
 
 # ── Build all llama.cpp binaries ──────────────────────────────────────────────
 all-llama: $(PTI_LLAMA) $(PTI_MTP) $(PTI_4SEQ)

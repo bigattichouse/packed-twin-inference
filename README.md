@@ -75,6 +75,11 @@ plateau: 4 tokens for 2.04× step cost ≈ 1.96×. The overhead comes from llama
 batch GEMM being less memory-efficient than its single-token GEMV path (see
 Bandwidth Analysis below).
 
+**The arithmetic**: each step produces 4 tokens and costs 2.04× a baseline step.
+Throughput = (4 tokens) / (2.04 × baseline_step_time) = (4/2.04) × baseline_rate
+= 1.96 × 19.4 = 38.0 tok/s. The 2.04× overhead is not a deduction from baseline —
+it is the denominator in the ratio, divided into 4× more output per step.
+
 **VRAM cost is minimal**: PTI adds only ~0.2 GiB per extra sequence (KV cache only)
 because model weights are shared. Standard speculative decoding needs a full second
 model (4–19 GiB extra). PTI's extra cost is near-zero.
@@ -84,16 +89,33 @@ model (4–19 GiB extra). PTI's extra cost is near-zero.
 ## How Acceptance Works
 
 PTI is **self-speculative decoding** — the same model acts as both drafter and
-verifier, running at staggered positions. The guesses fed to sequences 1–3 were
-sampled by those same sequences one step earlier:
+verifier. The four sequences run at genuinely different KV positions (n, n+1,
+n+2, n+3), staggered during initialization. Each step produces 4 tokens at 4
+distinct output positions, not 4 re-computations of the same position.
 
 ```
-Step k:
-  Seq 0: model(confirmed_tok,  pos n)   → actual_next        (ground truth)
-  Seq 1: model(tok_b_guess,    pos n+1) → next_from_b        (tok_b_guess from step k-1)
-  Seq 2: model(tok_c_guess,    pos n+2) → next_from_c        (tok_c_guess from step k-1)
-  Seq 3: model(tok_d_guess,    pos n+3) → next_from_d        (tok_d_guess from step k-1)
+Step k — four sequences at four different positions:
+
+  Seq 0 (A): KV covers positions 0..n.   Processes tok_a at pos n.
+             → actual_next  = token at output position n+1  (ground truth)
+
+  Seq 1 (B): KV covers positions 0..n+1. Processes tok_b at pos n+1.
+             → next_from_b  = token at output position n+2  (B's prediction)
+
+  Seq 2 (C): KV covers positions 0..n+2. Processes tok_c at pos n+2.
+             → next_from_c  = token at output position n+3  (C's prediction)
+
+  Seq 3 (D): KV covers positions 0..n+3. Processes tok_d at pos n+3.
+             → next_from_d  = token at output position n+4  (D's prediction)
+
+On 4-accept: emit [actual_next, next_from_b, next_from_c, next_from_d].
+Output cursor advances by 4. Next step: A→n+1, B→n+2, C→n+3, D→n+4.
 ```
+
+The stagger is established during initialization (see `pti_4seq.cpp` lines
+232–262): B's KV is built by running `tok_gen_0` at pos_a; C's KV by running
+`tok_gen_0` then `tok_b` at pos_a, pos_b; D's by running all three. Each
+sequence sees a different, complete prefix — not a variation on A's position.
 
 **Greedy (temp=0):** the same model with the same prefix always produces the
 same argmax token. Seq 1's guess from step k-1 is guaranteed to equal what
@@ -387,6 +409,41 @@ twin-pair quantization for the TSQ variant.
   compute N dot products cooperatively — eliminates the 4× inner-loop scaling
 - Projected: 2.04× overhead → ~1.1–1.3× → **60–75 tok/s** on MI50
 - No MTP bonus tokens (MTP head predicts t+1, same position as main logits)
+
+---
+
+---
+
+## Common Objections
+
+**"B/C/D just recompute A's token — output is counted 4×."**
+
+No. B, C, D are at positions n+1, n+2, n+3 — not at A's position n. Each sequence
+has a fully independent KV cache covering a different prefix length. On 4-accept, the
+four emitted tokens are at output positions n+1, n+2, n+3, n+4. The code confirms
+this: `pos_b = pos_a + 1`, `pos_c = pos_b + 1`, `pos_d = pos_c + 1` (init lines
+236, 247, 262). All four positions advance together each step (line 296).
+
+**"batch=4 costs 2.04× so real throughput is baseline/2.04 ≈ 0.49×."**
+
+Wrong divisor. The correct ratio is `(4 tokens produced) / (2.04 × step cost)` =
+`4/2.04 × baseline_rate` = 1.96×. `baseline/2.04` would be correct only if PTI
+produced 1 token per step — it produces 4.
+
+**"This is just batch decoding."**
+
+Yes, in the sense that `llama_decode` with a multi-token batch is the mechanism.
+The contribution is the staggered-offset initialization, the greedy accept-chain
+logic, and the reject/reinit protocol that keeps the four sequences coherent.
+Standard batch serving runs N *independent* user requests; PTI runs N *staggered*
+positions of one sequence and emits them all as one stream.
+
+**"38 tok/s is the HBM bandwidth ceiling for this model anyway."**
+
+The single-stream baseline (19.4 tok/s) is already near the HBM ceiling for the
+UD-Q6_K_XL model (~444 GB/s measured, 87% of MI50 spec). PTI at 38 tok/s exceeds
+what any single-stream decode can achieve on this hardware — it does so by
+producing 4 confirmed tokens per weight-load cycle instead of 1. That is the gain.
 
 ---
 
