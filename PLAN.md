@@ -138,16 +138,58 @@ N   ms/step   ms/seq   scaling   eff_BW(GB/s)   BW_per_seq
 Theoretical minimum (weights loaded once): 23.7 ms (24.22 GB / 1024 GB/s)
 
 **Interpretation**: N=4 scaling of 1.95× sits between fully-fused (1×) and
-fully-unfused (4×). ggml achieves partial weight sharing — large FFN matrices
-go through the batched MMVQ path, but attention projections, SSM state updates,
-and other per-sequence ops scale closer to linearly. The M5 kernel needs to
-close the remaining gap.
+fully-unfused (4×). ggml achieves partial weight sharing via L1 cache — the
+weight block for a given kbx stays in L1 across the j=0..3 activation passes.
+The remaining overhead is from 4× more multiply-accumulate instructions in the
+inner loop, transitioning the kernel from memory-bound (N=1) to partially
+compute-bound (N=4).
 
 **Theoretical PTI throughput at full fusion:**
 ```
 N=1 baseline: 18.8 tok/s
 N=4 ideal:   ~38–40 tok/s  (weights shared, KV/SSM overhead ~5%)
 ```
+
+### Context isolation — bottleneck confirmed as GEMV compute (M5)
+
+Ran N=1 and N=4 at two context sizes to distinguish GEMV compute overhead from
+SSM state and KV cache:
+
+```
+ctx    N=1 ms   N=4 ms   scaling
+128     53.1    103.6    1.95×
+1024    53.3    103.6    1.94×
+Δ = 0.01   →  ctx-INDEPENDENT
+```
+
+- **KV cache** scales with ctx — ruled out (scaling unchanged at 8× larger ctx)
+- **SSM state** is fixed per n_seq_max (not n_ctx) and is only 576 MB total →
+  0.56 ms at 1024 GB/s = 1% of step time — mathematically ruled out
+- **Conclusion**: overhead is in the MMVQ inner loop compute
+
+Mechanism: `vec_dot_q6_K_q8_1` with `#pragma unroll` on j=0..3 produces
+8 sequential FMAF instructions per weight block (4j × 2i). L1 cache holds the
+weight block across j, so weight LOADS are shared. But the ALU must execute
+4× more multiply-accumulate chains — 8 instructions vs 2 at N=1. This
+computation serializes with memory, preventing the GPU from overlapping other
+work, and accounts for the ~50 ms extra cost (103.6 − 53.1 − 0.56 ms SSM ≈ 50 ms).
+
+### M5 kernel target
+
+The fix is not about memory layout or cache. It is about reducing instruction count
+for the multi-column dot product. Two concrete approaches:
+
+1. **Explicit weight hoist (lowest risk)**: restructure `mmvq.cu` j-loop so weight
+   data (bq6_K->ql, qh, scales, d) is loaded outside the j-loop and passed by
+   value to a new `vec_dot_q6_K_q8_1_Nx` function. Forces compiler to keep weights
+   in registers (VGPR) across all j iterations. Expected: reduce redundant loads
+   that survive L1 (if any) and reduce register spill.
+
+2. **MFMA/WMMA vectorization (higher gain)**: on gfx906 (MI50), use
+   `v_mfma_f32_16x16x4f16` to compute all 4 column dot products as a single
+   matrix instruction rather than 4 sequential scalar chains. Requires dequantizing
+   Q6_K → FP16 before the MFMA call. Expected: reduce instruction count from 8 to
+   2 per weight block, approaching compute-bound ceiling of ~1.2× overhead.
 
 ---
 
@@ -487,10 +529,11 @@ llama.cpp/
 | M1 | Dispatch analysis, overhead source confirmed | diagnostic | done |
 | M2 | PTI activation interleave patch | no gain | benchmarked |
 | M3 | MTP analysis — no bonus tokens on hybrid model | no gain | done |
-| **M4a** | **pti_server: single-sequence baseline (correct, working)** | **~19 tok/s** | **next** |
-| **M4b** | **pti_debug: correct speculative PTI, output verified** | **~15–19 tok/s** | **next** |
-| **M4c** | **pti_server: correct PTI loop** | **~15–19 tok/s** | **next** |
-| **M5** | **Kernel rewrite: fused PTI GEMV (mmvq.cu), overhead ~1.1×** | **60–75** | **future** |
+| **M4a** | **pti_server: single-sequence baseline (correct, working)** | **~19 tok/s** | **done** |
+| **M4b** | **pti_4seq: correct speculative PTI, output byte-identical to baseline** | **~10 tok/s** | **done (1.95× step overhead confirmed)** |
+| M4c | pti_server: correct PTI loop | ~10 tok/s | deferred (slower than single-seq until M5) |
+| **M5a** | **mmvq.cu: explicit weight hoist for N=4 inner loop** | **est. 15–25 tok/s** | **next** |
+| **M5b** | **mmvq.cu: MFMA vectorization for N=4 (gfx906)** | **est. 55–75 tok/s** | **future** |
 | M6 | llama-cli --pti flag, public API | 60–75 | future |
 
 ---

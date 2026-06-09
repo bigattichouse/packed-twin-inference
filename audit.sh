@@ -207,10 +207,10 @@ if [[ $DO_BENCH -eq 1 ]]; then
         -w $BENCH_WARMUP -s $BENCH_STEPS -ctx $BENCH_CTX \
         >/dev/null 2>"$bench_err"
 
-    # Parse table
-    ms1=$(awk '/^\s+1\s/{print $2; exit}' "$bench_err" 2>/dev/null || echo 0)
-    ms2=$(awk '/^\s+2\s/{print $2; exit}' "$bench_err" 2>/dev/null || echo 0)
-    ms4=$(awk '/^\s+4\s/{print $2; exit}' "$bench_err" 2>/dev/null || echo 0)
+    # Parse table — use $1==N field match (awk \s not portable)
+    ms1=$(awk '$1==1{print $2; exit}' "$bench_err" 2>/dev/null || echo 0)
+    ms2=$(awk '$1==2{print $2; exit}' "$bench_err" 2>/dev/null || echo 0)
+    ms4=$(awk '$1==4{print $2; exit}' "$bench_err" 2>/dev/null || echo 0)
     s4=$(grep -oP 'N=4 scaling: \K[\d.]+' "$bench_err" 2>/dev/null || echo 0)
 
     inf "N=1: ${ms1} ms   N=2: ${ms2} ms   N=4: ${ms4} ms   scaling: ${s4}×"
@@ -223,9 +223,11 @@ if [[ $DO_BENCH -eq 1 ]]; then
     fi
 
     # Theoretical ceiling if fully fused
-    ideal=$(awk "BEGIN{printf \"%.1f\", $bl_rate * 4 * ($ms1/$ms4)}")
-    inf "Theoretical PTI at full fusion: ~${ideal} tok/s"
-    inf "M5 kernel target: close the $(awk "BEGIN{printf \"%.2f\", $s4}")× gap to 1×"
+    if [[ "$ms4" != "0" && "$ms1" != "0" ]]; then
+        ideal=$(awk "BEGIN{printf \"%.1f\", $bl_rate * 4.0 * ($ms1/$ms4)}")
+        inf "Theoretical PTI at full fusion: ~${ideal} tok/s"
+    fi
+    inf "M5 kernel target: close the ${s4}× gap to 1×"
 
     if float_lt "$s4" 1.5; then
         inf "→ Near-full fusion. PTI benefits already realised by ggml."
@@ -236,6 +238,32 @@ if [[ $DO_BENCH -eq 1 ]]; then
     fi
 
     rm -f "$bench_err"
+
+    # ── 4b. Context isolation — confirm bottleneck is GEMV compute, not SSM/KV ──
+    hdr "4b. Context isolation (--ctx-iso)"
+    inf "Running N=4 at ctx=${BENCH_CTX}/8 vs ctx=${BENCH_CTX} to check ctx-independence."
+    inf "Δscaling < 0.1 → bottleneck is GEMV compute, not SSM state or KV cache."
+
+    iso_err=$(mktemp)
+    bin/pti_gemv_bench -m "$MODEL" \
+        -w 2 -s 5 -ctx "$BENCH_CTX" --ctx-iso \
+        >/dev/null 2>"$iso_err"
+
+    iso_delta=$(grep -oP 'Context isolation: delta=\K[\d.]+' "$iso_err" 2>/dev/null || echo -1)
+    s_lo=$(grep -oP 'ctx=\d+\s+N=4 scaling: \K[\d.]+' "$iso_err" 2>/dev/null | head -1 || echo 0)
+    s_hi=$(grep -oP 'ctx=\d+\s+N=4 scaling: \K[\d.]+' "$iso_err" 2>/dev/null | tail -1 || echo 0)
+
+    inf "ctx=${BENCH_CTX}/8 scaling: ${s_lo}×    ctx=${BENCH_CTX} scaling: ${s_hi}×    Δ = ${iso_delta}"
+
+    if [[ "$iso_delta" == "-1" ]]; then
+        bad "ctx-iso output not parseable"
+    elif float_lt "$iso_delta" 0.1; then
+        ok "ctx-independent (Δ=${iso_delta} < 0.1) — bottleneck is GEMV compute"
+    else
+        bad "ctx-dependent (Δ=${iso_delta} ≥ 0.1) — SSM/KV state may be a factor"
+    fi
+
+    rm -f "$iso_err"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

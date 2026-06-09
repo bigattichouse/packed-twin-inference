@@ -130,21 +130,28 @@ int main(int argc, char **argv) {
     int   n_warmup = 5;
     int   n_steps  = 20;
     int   n_ctx    = 128;     // short: minimises KV/SSM noise vs GEMV signal
+    bool  ctx_iso  = false;   // --ctx-iso: run N=1 and N=4 at ctx/8 and ctx to
+                              //   confirm scaling is ctx-independent (GEMV compute,
+                              //   not SSM/KV state). Uses faster w=2 s=5.
 
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-m")   && i+1 < argc) model_path = argv[++i];
-        else if (!strcmp(argv[i], "-ngl") && i+1 < argc) ngl        = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-w")   && i+1 < argc) n_warmup   = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-s")   && i+1 < argc) n_steps    = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-ctx") && i+1 < argc) n_ctx      = atoi(argv[++i]);
+        if      (!strcmp(argv[i], "-m")       && i+1 < argc) model_path = argv[++i];
+        else if (!strcmp(argv[i], "-ngl")     && i+1 < argc) ngl        = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-w")       && i+1 < argc) n_warmup   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-s")       && i+1 < argc) n_steps    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-ctx")     && i+1 < argc) n_ctx      = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx-iso"))               ctx_iso    = true;
     }
 
     if (!model_path) {
         fprintf(stderr,
-            "Usage: %s -m <model.gguf> [-ngl N] [-w warmup] [-s steps] [-ctx N]\n"
+            "Usage: %s -m <model.gguf> [-ngl N] [-w warmup] [-s steps] [-ctx N] [--ctx-iso]\n"
             "\n"
             "Measures whether ggml shares weight loads across N decode sequences.\n"
-            "Uses short context (default 128) to isolate GEMV from KV/SSM overhead.\n",
+            "Uses short context (default 128) to isolate GEMV from KV/SSM overhead.\n"
+            "\n"
+            "--ctx-iso: additionally run N=1/N=4 at ctx/8 to confirm ctx-independence.\n"
+            "           Scaling should match within 0.1× if bottleneck is GEMV compute.\n",
             argv[0]);
         return 1;
     }
@@ -231,6 +238,50 @@ int main(int argc, char **argv) {
         1000.0 / results[0].ms_per_step,
         1000.0 / results[0].ms_per_step * 4.0 *
             (results[0].ms_per_step / results[2].ms_per_step));
+
+    // ── context isolation test ─────────────────────────────────────────────────
+    if (ctx_iso) {
+        int ctx_lo = n_ctx / 8;
+        if (ctx_lo < 16) ctx_lo = 16;
+        int iso_warmup = 2, iso_steps = 5;
+
+        fprintf(stderr,
+            "\n── Context isolation test (--ctx-iso) ─────────────────────────────────\n"
+            "  Purpose: if scaling(N=4) is ctx-independent, the bottleneck is GEMV\n"
+            "  compute (inner loop), not SSM state or KV cache.\n"
+            "  Running N=1 and N=4 at ctx=%d and ctx=%d (w=%d s=%d)...\n\n",
+            ctx_lo, n_ctx, iso_warmup, iso_steps);
+
+        fprintf(stderr, "  ctx=%d  N=1 ... ", ctx_lo); fflush(stderr);
+        Result r_lo1 = run(model, vocab, 1, MODEL_GB, ctx_lo, iso_warmup, iso_steps, 0);
+        fprintf(stderr, "%.1f ms/step\n", r_lo1.ms_per_step);
+
+        fprintf(stderr, "  ctx=%d  N=4 ... ", ctx_lo); fflush(stderr);
+        Result r_lo4 = run(model, vocab, 4, MODEL_GB, ctx_lo, iso_warmup, iso_steps, r_lo1.ms_per_step);
+        fprintf(stderr, "%.1f ms/step\n", r_lo4.ms_per_step);
+
+        fprintf(stderr, "  ctx=%d N=1 ... ", n_ctx); fflush(stderr);
+        Result r_hi1 = run(model, vocab, 1, MODEL_GB, n_ctx,  iso_warmup, iso_steps, 0);
+        fprintf(stderr, "%.1f ms/step\n", r_hi1.ms_per_step);
+
+        fprintf(stderr, "  ctx=%d N=4 ... ", n_ctx); fflush(stderr);
+        Result r_hi4 = run(model, vocab, 4, MODEL_GB, n_ctx,  iso_warmup, iso_steps, r_hi1.ms_per_step);
+        fprintf(stderr, "%.1f ms/step\n", r_hi4.ms_per_step);
+
+        double s_lo = r_lo4.ms_per_step / r_lo1.ms_per_step;
+        double s_hi = r_hi4.ms_per_step / r_hi1.ms_per_step;
+        double delta = s_hi - s_lo;
+        if (delta < 0) delta = -delta;
+
+        fprintf(stderr,
+            "\n  ctx=%-4d  N=4 scaling: %.2f×\n"
+            "  ctx=%-4d  N=4 scaling: %.2f×\n"
+            "  Δ = %.2f  → %s\n",
+            ctx_lo, s_lo, n_ctx, s_hi, delta,
+            delta < 0.1 ? "ctx-INDEPENDENT (bottleneck is GEMV compute)" :
+                          "ctx-DEPENDENT   (SSM/KV state contributes)");
+        fprintf(stderr, "Context isolation: delta=%.2f\n", delta);
+    }
 
     llama_model_free(model);
     llama_backend_free();
