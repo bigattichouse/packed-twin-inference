@@ -79,10 +79,16 @@ done
 # ── 2. Baseline single-sequence ───────────────────────────────────────────────
 hdr "2. Baseline single-sequence (pti_debug)"
 
+# pti_debug -n N generates N+1 tokens (1 from prefill + N loop iterations).
+# pti_4seq  -n N generates N   tokens (1 tok_gen0 + N-1 loop iterations).
+# Give debug one fewer so both produce N_TOK total output tokens.
+BL_N=$((N_TOK - 1))
+PTI_N=$N_TOK
+
 bl_out=$(mktemp)
 bl_err=$(mktemp)
 
-if bin/pti_debug -m "$MODEL" -p "$PROMPT" -n $N_TOK >"$bl_out" 2>"$bl_err"; then
+if bin/pti_debug -m "$MODEL" -p "$PROMPT" -n $BL_N >"$bl_out" 2>"$bl_err"; then
     ok "pti_debug exited cleanly"
 else
     bad "pti_debug non-zero exit"
@@ -141,7 +147,7 @@ hdr "3. PTI 4-seq correctness (pti_4seq)"
 pti_out=$(mktemp)
 pti_err=$(mktemp)
 
-if bin/pti_4seq -m "$MODEL" -p "$PROMPT" -n $N_TOK >"$pti_out" 2>"$pti_err"; then
+if bin/pti_4seq -m "$MODEL" -p "$PROMPT" -n $PTI_N >"$pti_out" 2>"$pti_err"; then
     ok "pti_4seq exited cleanly"
 else
     bad "pti_4seq non-zero exit"
@@ -179,11 +185,11 @@ else
     bad "partial accepts at greedy: 3-acc=$acc3 2-acc=$acc2"
 fi
 
-# PTI token count should match baseline
-if [[ $pti_n -eq $bl_tokens ]]; then
-    ok "PTI token count matches baseline ($pti_n)"
+# PTI token count should equal N_TOK (pti_4seq counts tok_gen0 + loop)
+if [[ $pti_n -eq $N_TOK ]]; then
+    ok "PTI token count correct ($pti_n)"
 else
-    bad "token count mismatch: baseline=$bl_tokens PTI=$pti_n"
+    bad "PTI token count wrong: expected $N_TOK got $pti_n"
 fi
 
 # PTI timing
