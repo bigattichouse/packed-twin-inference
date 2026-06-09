@@ -305,18 +305,11 @@ static int run_pti4(const PTIArgs *args) {
                         fprintf(stderr, "\n[4-ACCEPT pos=%d]", pos_a-1);
 
                     print_token(vocab, actual_next);  n_gen++;
-                    if (!llama_vocab_is_eog(vocab, next_from_b)) { print_token(vocab, next_from_b); n_gen++; }
-                    if (!llama_vocab_is_eog(vocab, next_from_c)) { print_token(vocab, next_from_c); n_gen++; }
-                    if (!llama_vocab_is_eog(vocab, next_from_d)) { print_token(vocab, next_from_d); n_gen++; }
 
                     tok_a = actual_next;
                     tok_b = next_from_b;
                     tok_c = next_from_c;
                     tok_d = next_from_d;
-
-                    if (llama_vocab_is_eog(vocab, next_from_b) ||
-                        llama_vocab_is_eog(vocab, next_from_c) ||
-                        llama_vocab_is_eog(vocab, next_from_d)) break;
 
                 } else {
                     // ── 3-accept: D wrong, re-init D ──────────────────────
@@ -325,8 +318,6 @@ static int run_pti4(const PTIArgs *args) {
                         fprintf(stderr, "\n[3-ACCEPT pos=%d]", pos_a-1);
 
                     print_token(vocab, actual_next);  n_gen++;
-                    if (!llama_vocab_is_eog(vocab, next_from_b)) { print_token(vocab, next_from_b); n_gen++; }
-                    if (!llama_vocab_is_eog(vocab, next_from_c)) { print_token(vocab, next_from_c); n_gen++; }
 
                     tok_a = actual_next;
                     tok_b = next_from_b;
@@ -335,9 +326,6 @@ static int run_pti4(const PTIArgs *args) {
                     // D wrong: copy C's confirmed state, decode next_from_c at pos_c
                     tok_d = reinit_seq(mem, ctx, &step_batch, n_vocab,
                                        /*src=*/2, /*dst=*/3, next_from_c, pos_c, &pos_d);
-
-                    if (llama_vocab_is_eog(vocab, next_from_b) ||
-                        llama_vocab_is_eog(vocab, next_from_c)) break;
                 }
             } else {
                 // ── 2-accept: C+D wrong, re-init C and D ──────────────────
@@ -346,7 +334,6 @@ static int run_pti4(const PTIArgs *args) {
                     fprintf(stderr, "\n[2-ACCEPT pos=%d]", pos_a-1);
 
                 print_token(vocab, actual_next);  n_gen++;
-                if (!llama_vocab_is_eog(vocab, next_from_b)) { print_token(vocab, next_from_b); n_gen++; }
 
                 tok_a = actual_next;
                 tok_b = next_from_b;
@@ -358,8 +345,6 @@ static int run_pti4(const PTIArgs *args) {
                 // D wrong: copy C's post-reinit state (chain), decode tok_c at pos_c
                 tok_d = reinit_seq(mem, ctx, &step_batch, n_vocab,
                                    /*src=*/2, /*dst=*/3, tok_c, pos_c, &pos_d);
-
-                if (llama_vocab_is_eog(vocab, next_from_b)) break;
             }
         } else {
             // ── Reject: B wrong, re-init B, C, D ─────────────────────────
