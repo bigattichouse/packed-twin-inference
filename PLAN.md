@@ -8,6 +8,84 @@ llama.cpp's public API. No patches to llama.cpp required for 2×.
 
 ---
 
+## Algorithm Correction (June 2026)
+
+### The duplication bug
+
+`pti_4seq.cpp` emits 4 tokens every 4-accept step — but 3 of those 4 are
+identical to tokens emitted in the *previous* step. Consecutive 4-accept steps
+produce the sequence:
+
+```
+Step 1 emits: t1  t2  t3  t4
+Step 2 emits: t2  t3  t4  t5     ← t2, t3, t4 duplicated
+Step 3 emits: t3  t4  t5  t6     ← t3, t4, t5 duplicated
+```
+
+The n_gen counter counted all emit calls (including duplicates), so the
+reported 38.1 tok/s figure overstates actual unique-token throughput.
+The output text is garbled — visible in the raw output of `pti_4seq` and
+confirmed by running `pti_server`.
+
+### Root cause
+
+After a 4-accept, `pos_a` advances by only 1. In the next step seq 0
+re-decodes `actual` at the new `pos_a` and produces the same prediction as
+`from_b` from the previous step. The stagger stays fixed at {0, 1, 2, 3}
+relative to seq 0, but the intent was to advance the *entire window* by 4.
+
+### Correct algorithm (speculative decoding framing)
+
+PTI is speculative decoding where the drafter and verifier are the *same*
+model on staggered KV caches. The accept chain is:
+
+```
+tok_b == actual?         (B's draft for n+1 matches A's ground truth)
+  tok_c == from_b?       (C's draft for n+2 matches B's confirmed output)
+    tok_d == from_c?     (D's draft for n+3 matches C's confirmed output)
+      from_d is the new unverified draft for n+4
+```
+
+On k-accept, **k tokens are emitted** (actual plus the k-1 confirmed drafts).
+The stagger must then advance by k to avoid re-decoding already-confirmed
+positions. For a 4-accept this means copying seq 3's KV to seq 0 and
+rebuilding the B/C/D stagger from that new base — 3 single-token reinit
+calls, same as the reject path.
+
+Expected throughput after correction (same 2.04× step overhead):
+- 4-accept (temp=0, greedy): 4 tokens per (1 batch + 3 reinit) = 4/5.04 ≈ 0.79× baseline
+- 2-seq at temp=0: 2 tokens per (1 batch + 1 reinit) = 2/2.27 ≈ 0.88×
+
+This means **PTI does not deliver speedup at N>1 via the public API** as
+currently structured. The speedup in the original paper/approach comes from
+weight sharing in hardware (one weight fetch serves N activations), which
+requires the fused kernel (Phase 4 / M4). Without M4, the correct PTI
+algorithm runs at or below baseline throughput.
+
+### Revised benchmark table
+
+| Config | Reported tok/s | Unique tok/s (corrected) | Note |
+|---|---|---|---|
+| baseline | 19.4 | 19.4 | single-sequence, no duplication |
+| PTI 4-seq (old, buggy) | 38.1 | ~10–12 | counted duplicate tokens |
+| PTI 4-seq (corrected) | — | ~15–16 (est.) | correct emit + reinit overhead |
+
+### Revised plan
+
+**Step 1 (now):** Replace the PTI loop in `pti_server.cpp` with the single-
+sequence loop from `pti_debug.cpp`. This gives a correct, working HTTP server
+at baseline throughput. Validate with nanocoder.
+
+**Step 2:** Implement correct speculative-decoding-style PTI in `pti_debug`
+first (with verbose per-token logging), confirm output is identical to
+single-sequence baseline. Then port to `pti_server.cpp`.
+
+**Step 3 (M4):** Fused PTI GEMV kernel (mmvq.cu). This is where the real
+speedup lives — one weight fetch, N activation vectors. Without it, the
+correct PTI is at or below baseline. With it, target 60–75 tok/s.
+
+---
+
 ## Where We Are
 
 ### Measured results (MI50, Qwen3.6-27B, greedy, -n 80)
@@ -275,14 +353,17 @@ llama.cpp/
 
 ## Milestones and Expected tok/s
 
-| Milestone | Description | Expected tok/s | Delta |
+| Milestone | Description | Expected tok/s | Status |
 |---|---|---|---|
-| M0 (done) | pti_4seq.cpp via public API | **38.1** | baseline for v2 |
-| M1 (done) | Dispatch analysis, overhead source confirmed (static) | 38.1 | diagnostic |
-| M2 (benchmarked, no gain) | PTI activation interleave patch — root cause was wrong | 38.1 | 0 |
-| M3 (done, negative) | MTP analysis — cannot add tokens; no reject-path shortcut on hybrid | 38.1 | 0 |
-| **M4** | **Kernel rewrite: fused PTI GEMV in mmvq.cu, overhead 1.05–1.15×** | **60–75** | **+22–37** |
-| M5 | llama-cli --pti flag, public API | 60–75 | shippable |
+| M0 | pti_4seq.cpp via public API | 38.1 (duplicate-inflated) | done |
+| M1 | Dispatch analysis, overhead source confirmed | diagnostic | done |
+| M2 | PTI activation interleave patch | no gain | benchmarked |
+| M3 | MTP analysis — no bonus tokens on hybrid model | no gain | done |
+| **M4a** | **pti_server: single-sequence baseline (correct, working)** | **~19 tok/s** | **next** |
+| **M4b** | **pti_debug: correct speculative PTI, output verified** | **~15–19 tok/s** | **next** |
+| **M4c** | **pti_server: correct PTI loop** | **~15–19 tok/s** | **next** |
+| **M5** | **Kernel rewrite: fused PTI GEMV (mmvq.cu), overhead ~1.1×** | **60–75** | **future** |
+| M6 | llama-cli --pti flag, public API | 60–75 | future |
 
 ---
 

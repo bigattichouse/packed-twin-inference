@@ -59,6 +59,7 @@ PTI_LLAMA  := $(BINDIR)/pti_llama
 PTI_MTP    := $(BINDIR)/pti_mtp
 PTI_4SEQ   := $(BINDIR)/pti_4seq
 PTI_SERVER := $(BINDIR)/pti_server
+PTI_DEBUG  := $(BINDIR)/pti_debug
 
 # ── llama.cpp paths ───────────────────────────────────────────────────────────
 LLAMA_DIR    ?= ../llama.cpp
@@ -77,7 +78,7 @@ NGL         ?= 99
 
 # ── Phony targets ─────────────────────────────────────────────────────────────
 .PHONY: all cuda test cuda-test shared cuda-shared clean help \
-        llama mtp 4seq server all-llama \
+        llama mtp 4seq server debug all-llama \
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
         4seq-run 4seq-run-base
@@ -155,6 +156,13 @@ $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 
 4seq-run-base: $(PTI_4SEQ)
 	$(PTI_4SEQ) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
+# ── pti_debug: single-sequence debug script ──────────────────────────────────
+debug: $(PTI_DEBUG)
+
+$(PTI_DEBUG): pti_debug.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
 
 # ── pti_server: PTI HTTP server (OpenAI-compatible) ───────────────────────────
 server: $(PTI_SERVER)
