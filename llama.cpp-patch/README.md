@@ -1,18 +1,22 @@
 # PTI Interleaved Activation Patch for llama.cpp
 
-> **NOT READY — DO NOT APPLY YET**
+> **STATUS — 2026-06-08**
 >
-> The kernel patch compiles and the interleaved layout is correct, but the
-> benchmark driver (`pti_4seq`) is blocked on a compatibility issue with
-> llama.cpp v0.0.9261+: Qwen3.6-27B uses a hybrid attention + SSM
-> architecture (QWEN35/ISWA), and the new strict position validation
-> rejects the REJECT/2-ACCEPT reinit paths that PTI requires.
+> **Reinit logic: FIXED.** The position-validation crash (llama.cpp v0.0.9261+)
+> is resolved via `reinit_seq()` — uses `rm_all` + `seq_cp` chain instead of
+> partial `seq_rm`. `pti_4seq` runs cleanly and shows 100% 4-ACCEPT on
+> Gemma-3-270m-Q8_0 (pure transformer, confirmed working).
 >
-> **What currently works:** the 2× baseline throughput measurement
-> (`pti_4seq` without GGML_PTI_INTERLEAVED). Kernel benchmarking against
-> the interleaved path is blocked until the reinit logic is fixed.
+> **Qwen3.6-27B: PENDING (separate issue).** The model's hybrid SSM/ISWA
+> architecture (`LLM_ARCH_QWEN35`) produces different logits for the same token
+> in a single-sequence batch vs a 4-sequence batch. Root cause: `llama_memory_recurrent`
+> cell assignment in multi-seq ubatches. This is independent of the kernel patch.
 >
-> See `PLAN.md` for status.
+> **Kernel patch: READY TO BENCHMARK on Gemma-3.**
+> Run `GGML_PTI_INTERLEAVED=0` vs `GGML_PTI_INTERLEAVED=1` with Gemma-3-270m-Q8_0.
+> Qwen3.6-27B benchmarking blocked until SSM multi-seq issue is resolved.
+>
+> See `PLAN.md` for full status.
 
 **Target file**: `ggml/src/ggml-cuda/mmvq.cu`
 **Status**: kernel written, benchmark blocked (reinit incompatibility with hybrid model)
