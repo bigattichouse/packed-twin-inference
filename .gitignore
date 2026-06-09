@@ -1,4 +1,5 @@
 bin/
+llama.cpp/
 __pycache__/
 *.pyc
 *.o
