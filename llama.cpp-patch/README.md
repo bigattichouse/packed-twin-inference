@@ -1,17 +1,20 @@
 # PTI Interleaved Activation Patch for llama.cpp
 
-> **STATUS — 2026-06-08: READY TO BENCHMARK**
+> **STATUS — 2026-06-09: BENCHMARKED — NO GAIN**
 >
-> All blockers resolved. `pti_4seq` shows **100% 4-ACCEPT at 38.1 tok/s** on
-> Qwen3.6-27B-UD-Q6_K_XL (MI50, greedy, -n 80).
+> `pti_4seq` shows **100% 4-ACCEPT at 38.1 tok/s** on Qwen3.6-27B-UD-Q6_K_XL
+> (MI50, greedy, -n 80). The interleaved activation patch shows **no speedup**:
 >
-> **Fixes applied:**
-> - `reinit_seq()`: rm_all + seq_cp chain for REJECT/2-ACCEPT/3-ACCEPT paths
-> - SSM cell priming: seq0 run single-seq before B/C/D inits to establish correct
->   recurrent cell allocation order for the quad-batch gather
+> | Config | tok/s | vs baseline |
+> |---|---|---|
+> | GGML_PTI_INTERLEAVED=0 (baseline) | 38.1 | — |
+> | GGML_PTI_INTERLEAVED=1 (patched) | 35.6 | −6% (noise, no gain) |
 >
-> **Next:** benchmark `GGML_PTI_INTERLEAVED=0` vs `GGML_PTI_INTERLEAVED=1` on
-> Qwen3.6-27B-UD-Q6_K_XL to measure the interleaved activation kernel speedup.
+> **Root cause revised**: activation traffic (~480 MB/step) is <2% of weight
+> loading (~25 GB/step). Pre-pass interleave adds overhead without any benefit.
+> The 2× overhead is from 4× MMVQ compute scaling with N, not L2 activation traffic.
+>
+> **Next:** true fused PTI kernel in mmvq.cu — see PLAN.md Phase 4 (M4).
 
 **Target file**: `ggml/src/ggml-cuda/mmvq.cu`
 **Status**: kernel written, benchmark blocked (reinit incompatibility with hybrid model)

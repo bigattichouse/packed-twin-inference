@@ -22,6 +22,7 @@
  */
 
 #include "../llama.cpp/include/llama.h"
+#include "../llama.cpp/src/llama-ext.h"  // llama_set_embeddings_pre_norm, llama_get_embeddings_pre_norm_ith
 
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +64,45 @@ static void batch_add(struct llama_batch *b, llama_token tok,
 }
 
 static void batch_clear(struct llama_batch *b) { b->n_tokens = 0; }
+
+// MTP prediction: takes (tok_t, h_t from main context at batch_idx) → predicts t+1.
+// NOTE: this predicts the SAME position as the main model's logits for batch_idx.
+// It does NOT add a bonus token — it is an alternative 1-layer prediction of the
+// same next-token position, useful as a fast approximate predictor on reject paths.
+// Returns -1 on failure.
+static llama_token mtp_predict_next(
+        llama_context *ctx_mtp,
+        llama_context *ctx_main,
+        int32_t        batch_idx,
+        llama_token    tok_at_pos,
+        llama_pos      pos,
+        int32_t        n_embd,
+        int32_t        n_vocab)
+{
+    if (!ctx_mtp) return -1;
+    const float *h = llama_get_embeddings_pre_norm_ith(ctx_main, batch_idx);
+    if (!h) return -1;
+
+    struct llama_batch mb = llama_batch_init(1, n_embd, 1);
+    mb.token = (llama_token *)malloc(sizeof(llama_token));
+    mb.n_tokens     = 1;
+    mb.token[0]     = tok_at_pos;
+    mb.pos[0]       = pos;
+    mb.n_seq_id[0]  = 1;
+    mb.seq_id[0][0] = 0;
+    mb.logits[0]    = 1;
+    memcpy(mb.embd, h, (size_t)n_embd * sizeof(float));
+
+    llama_token result = -1;
+    if (llama_decode(ctx_mtp, mb) == 0) {
+        float *logits = llama_get_logits_ith(ctx_mtp, 0);
+        if (logits) result = (llama_token)argmax_f(logits, n_vocab);
+    }
+    free(mb.token);
+    mb.token = nullptr;
+    llama_batch_free(mb);
+    return result;
+}
 
 // Reinit sequence dst for hybrid attention+SSM models:
 //   rm_all (p0=0) always succeeds even when partial rollback cannot.
@@ -109,7 +149,8 @@ static int run_pti4(const PTIArgs *args) {
 
     const struct llama_vocab *vocab = llama_model_get_vocab(model);
     int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    fprintf(stderr, "Vocab: %d\n", n_vocab);
+    int32_t n_embd  = llama_model_n_embd(model);
+    fprintf(stderr, "Vocab: %d  n_embd: %d\n", n_vocab, n_embd);
 
     struct llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx      = DEFAULT_CTX * 4;
@@ -119,6 +160,29 @@ static int run_pti4(const PTIArgs *args) {
 
     struct llama_context *ctx = llama_init_from_model(model, cparams);
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return 1; }
+
+    // Enable pre-norm embeddings (needed for mtp_predict_next on reject paths)
+    llama_set_embeddings_pre_norm(ctx, true, false);
+
+    // MTP context — 1-layer MTP head for fast next-token prediction.
+    // At greedy (100% 4-ACCEPT) this context is created but never invoked.
+    // It is useful for temperature>0 reject paths.
+    struct llama_context *ctx_mtp = nullptr;
+    {
+        struct llama_context_params mp = llama_context_default_params();
+        mp.n_ctx     = DEFAULT_CTX;
+        mp.n_batch   = DEFAULT_CTX;
+        mp.n_seq_max = 1;
+        mp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_mtp = llama_init_from_model(model, mp);
+        if (ctx_mtp) {
+            llama_set_embeddings_pre_norm(ctx_mtp, true, true);
+            fprintf(stderr, "MTP context: active\n");
+        } else {
+            fprintf(stderr, "MTP context: unavailable (model may lack MTP heads)\n");
+        }
+    }
 
     llama_memory_t mem = llama_get_memory(ctx);
 
@@ -147,6 +211,8 @@ static int run_pti4(const PTIArgs *args) {
     fprintf(stderr, "Prefill done. First token: [%d]\n", tok_gen_0);
     fprintf(stderr, "Output: ");
     print_token(vocab, tok_gen_0);
+
+    double t_gen_start = now_sec();  // honest start: includes init overhead below
 
     // ── Prime seq0 with its own exclusive SSM cell before B/C/D inits ─────────
     // After seq_cp, all 4 seqs share one SSM cell. Without this step, the
@@ -205,6 +271,8 @@ static int run_pti4(const PTIArgs *args) {
 
     struct llama_batch step_batch = llama_batch_init(4, 0, 4);
     double t_start = now_sec();
+    // NOTE: t_init (the 7 single-seq decode steps to stagger B/C/D before the loop)
+    // is NOT included here. See "Init overhead" in the stats below for the honest total.
 
     for (int step = 0; step < args->max_new - 1; step++) {
         if (llama_vocab_is_eog(vocab, tok_a)) break;
@@ -318,7 +386,9 @@ static int run_pti4(const PTIArgs *args) {
         if (llama_vocab_is_eog(vocab, actual_next)) break;
     }
 
-    double elapsed = now_sec() - t_start;
+    double elapsed      = now_sec() - t_start;
+    double t_init_cost  = t_start - t_gen_start;   // 7 startup decode steps
+    double elapsed_full = elapsed + t_init_cost;    // honest end-to-end
     int total_checks = n_4acc + n_3acc + n_2acc + n_reject;
 
     fprintf(stderr, "\n\n════════════════════════════════════════\n");
@@ -338,12 +408,17 @@ static int run_pti4(const PTIArgs *args) {
                 (n_4acc + n_3acc) > 0
                 ? 100.0 * n_4acc / (n_4acc + n_3acc) : 0.0);
     }
-    fprintf(stderr, "  Elapsed:           %.2fs\n", elapsed);
-    fprintf(stderr, "  Throughput:        %.1f tok/s\n", n_gen / elapsed);
+    fprintf(stderr, "  Init overhead:     %.0f ms  (7 startup decode steps, one-time)\n",
+            t_init_cost * 1000.0);
+    fprintf(stderr, "  Steady-state:      %.1f tok/s  (loop only, excludes init)\n",
+            n_gen / elapsed);
+    fprintf(stderr, "  Amortized:         %.1f tok/s  (init + loop, honest end-to-end)\n",
+            n_gen / elapsed_full);
     fprintf(stderr, "════════════════════════════════════════\n");
 
     llama_batch_free(batch);
     llama_batch_free(step_batch);
+    if (ctx_mtp) llama_free(ctx_mtp);
     llama_free(ctx);
     llama_model_free(model);
     return 0;

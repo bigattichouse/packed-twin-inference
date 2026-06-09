@@ -178,37 +178,44 @@ output tokens must be bit-identical to baseline (same argmax on same logits).
 
 ---
 
-### Phase 3 — PTI × MTP integration (3–5 days)
+### Phase 3 — MTP analysis (done, negative result for bonus tokens)
 
-**Goal**: use the UD-Q6_K_XL MTP head to add free tokens on top of PTI.
+**Finding**: The Qwen3.6-27B UD MTP head (`nextn_predict_layers=1`) takes
+`(tok_t, h_t from main model)` and predicts `t+1` — the SAME position the
+main model already computes. It does NOT predict `t+2`. It cannot add a
+genuine 5th token to the PTI output.
 
-The UD model has `nextn_predict_layers=1`. The MTP head is 1 transformer layer
-(vs 64 main layers) — ~1.5% of total weight. Running it after the main forward
-pass costs ~1.5% extra compute/bandwidth, returning ~1 extra token.
-
-**Architecture** (uses existing `pti_mtp.cpp` approach):
-
+**Architecture** (from `qwen35moe.cpp:graph_mtp`):
 ```
-Per step:
-  1. Main forward (N=4 sequences) → N logits
-  2. Verify/accept (existing PTI logic) → emit 1-4 tokens
-  3. MTP head on accepted hidden state → 1 extra draft token (free)
-  4. Feed MTP token back as sequence N+1 draft at next step
+MTP input:  (tok_embed_t, h_t)  →  concat  →  1-layer transformer  →  logits for t+1
+```
+The token at position t and the main model's hidden state at t are concatenated
+and projected. This is a more informative "output head" — it may improve accept
+rate vs the standard head, but predicts the same position.
+
+**pti_mtp.cpp status**: `ctx_mtp` is created, `mtp_predict_next()` is defined,
+but the main loop uses full decodes for all reinit paths. The MTP function is
+never called. The comment reads "Partial cross-stream seq_cp fails on hybrid
+models — no MTP shortcut here."
+
+**What MTP CAN do** (for temperature > 0, future work):
+- On the REJECT path, after B-reinit produces h_B_new (at pos_a):
+  `mtp_predict_next(ctx_mtp, ctx, 0, actual_next, pos_a, n_embd, n_vocab)`
+  predicts tok_b — same as B's reinit logits. No saving here.
+- Each chained reinit (B→C→D) requires the PREVIOUS step's hidden state,
+  so no reinit calls can be skipped.
+- **At 100% greedy (all benchmarks so far): zero MTP benefit.**
+
+**Corrected throughput estimate**:
+```
+At greedy:     4.0 tok/step (unchanged — MTP cannot add tokens at t+2)
+At temp=0.7:   ~2.5–3.0 tok/step (PTI accept rate, no MTP benefit)
+Path to >4×:   kernel rewrite (Phase 4) to eliminate 2× step overhead
 ```
 
-**Files to modify**:
-- `src/llama-ext.h` — already extended for MTP (see `pti_mtp.cpp`)
-- `src/llama.cpp` — add MTP head execution after main decode in PTI mode
-- `pti_4seq.cpp` — reference implementation to merge
-
-**Expected result**:
-```
-Step tokens: 4 (PTI) × 1.88 (MTP k=1 accept rate) ≈ 7.5 per step
-Step cost:   ~1.1× baseline (Phase 2 overhead eliminated)
-tok/s:       7.5 / 1.1 × 19.4 ≈ 132 tok/s  (optimistic)
-             5.0 / 1.3 × 19.4 ≈  75 tok/s  (conservative, ~5 accepted)
-Target:      80–100 tok/s
-```
+**MTP infrastructure** is ported to `pti_4seq.cpp` for:
+- Correctness (model initializes properly with pre-norm embeddings enabled)
+- Future sampled-mode benchmarks where MTP quality difference may be measured
 
 ---
 
@@ -271,10 +278,11 @@ llama.cpp/
 | Milestone | Description | Expected tok/s | Delta |
 |---|---|---|---|
 | M0 (done) | pti_4seq.cpp via public API | **38.1** | baseline for v2 |
-| M1 | Dispatch analysis, overhead source confirmed (static) | 38.1 | diagnostic |
-| M2 (patch written) | PTI GEMV variant in mmvq.cu, overhead 1.05–1.15× | **60–75** | +22–37 |
-| M3 | PTI × MTP, MTP head after main decode | **80–100** | +20–30 |
-| M4 | llama-cli --pti flag, public API | 80–100 | shippable |
+| M1 (done) | Dispatch analysis, overhead source confirmed (static) | 38.1 | diagnostic |
+| M2 (benchmarked, no gain) | PTI activation interleave patch — root cause was wrong | 38.1 | 0 |
+| M3 (done, negative) | MTP analysis — cannot add tokens; no reject-path shortcut on hybrid | 38.1 | 0 |
+| **M4** | **Kernel rewrite: fused PTI GEMV in mmvq.cu, overhead 1.05–1.15×** | **60–75** | **+22–37** |
+| M5 | llama-cli --pti flag, public API | 60–75 | shippable |
 
 ---
 
@@ -310,7 +318,9 @@ llama.cpp/
 Hardware:       MI50, 32 GiB HBM2, ~1 TB/s peak, 383 GB/s measured D2D
 Model (best):   UD-Q6_K_XL, 25 GB, 19.4 tok/s baseline, MTP head present
 Weight ceiling: 254 GB/s (Q8_0 GEMV), 393 GB/s (Q5_K_M GEMV, llama.cpp)
-Activation L2:  17408 blocks × 4 seqs × 20 KB = 1.36 GB traffic (root cause)
+Overhead:       2.04× at N=4; from 4× MMVQ compute + attn/SSM scaling with N
+                Activation traffic (~480 MB/step) is <2% of weight traffic (~25 GB/step)
 Current best:   38.1 tok/s (4-seq, pti_4seq.cpp, 1.96× baseline)
-Target:         80–100 tok/s (Phase 3 complete)
+Honest (-n 80): ~32 tok/s amortized (includes 7 startup decode steps, one-time)
+Target:         60–75 tok/s after kernel rewrite (M4)
 ```

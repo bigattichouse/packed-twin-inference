@@ -145,7 +145,7 @@ mtp-run-base: $(PTI_MTP)
 4seq: $(PTI_4SEQ)
 
 $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
-	g++ $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
 	@echo "Built $@"
 
 4seq-run: $(PTI_4SEQ)
