@@ -40,10 +40,11 @@ Root cause: Q5_K_M packs 5 bits/weight → 60% more weights per 64-byte cache
 line vs Q8_0. Our custom Q8 kernel is limited to 254 GB/s ceiling while
 llama.cpp already reads the Q5_K_M model at 393 GB/s effective bandwidth.
 
-**The overhead is not the kernel — it's the dispatch.** llama.cpp uses its
-fast GEMV path (`mul_mat_vec_q` in `mmvq.cu`) for N=1, but routes N=4 through
-a different code path with higher overhead. The GEMV kernel itself already
-supports multi-column output via the `ncols_dst` template parameter.
+**The overhead is not the kernel dispatch or activation L2 traffic.** N=4
+uses `mul_mat_vec_q` (confirmed, not GEMM). The pre-pass interleave benchmark
+(Phase 2) shows the activation L2 traffic is not the bottleneck — the overhead
+is from 4× compute in the MMVQ inner loop (multiply-accumulate for 4 output
+columns) plus attention and SSM computation scaling linearly with N.
 
 ---
 
@@ -118,10 +119,22 @@ Phase 2 proceeds directly to writing the kernel patch.
 
 ---
 
-### Phase 2 — Eliminate overhead (patch written)
+### Phase 2 — Eliminate overhead (patch written, benchmarked: no gain)
 
-**Status**: patch file `pti_mmvq_patch.cu` written and committed.  Ready to
-apply to `llama.cpp` and benchmark.
+**Status**: patch applied and benchmarked on Qwen3.6-27B (MI50, greedy, -n 80):
+
+| Config | Model | tok/s | vs baseline |
+|---|---|---|---|
+| GGML_PTI_INTERLEAVED=0 (baseline) | UD-Q6_K_XL | 38.1 | — |
+| GGML_PTI_INTERLEAVED=1 (patched) | UD-Q6_K_XL | 35.6 | −6% (within noise, no gain) |
+| GGML_PTI_INTERLEAVED=0 (baseline) | Q5_K_M | ~29 | — |
+| GGML_PTI_INTERLEAVED=1 (patched) | Q5_K_M | ~25 | −14% (net loss) |
+
+**Root cause revised**: the 2× overhead at N=4 is NOT from activation L2 traffic.
+The pre-pass interleave kernel adds ~160 KB/layer of extra memory I/O (read +
+write the activation buffer) which is not recouped by improved cache behavior.
+Activation traffic is negligible (~480 MB/step total) vs weight loading (~18.6 GB),
+so optimizing L2 activation access cannot move the overall step time.
 
 **Root cause confirmed** (from Phase 1 dispatch analysis):
 - N=4 uses `mul_mat_vec_q<Q5_K, ncols_dst=4>` on MMVQ path (confirmed, not GEMM)

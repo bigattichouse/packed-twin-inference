@@ -64,6 +64,33 @@ static void batch_add(struct llama_batch *b, llama_token tok,
 
 static void batch_clear(struct llama_batch *b) { b->n_tokens = 0; }
 
+// Reinit sequence dst for hybrid attention+SSM models:
+//   rm_all (p0=0) always succeeds even when partial rollback cannot.
+//   seq_cp copies BOTH attention KV and recurrent state from src to dst.
+//   Then decode tok at pos and return the predicted next token.
+//   Sets *pos_out = pos + 1.
+static llama_token reinit_seq(
+        llama_memory_t        mem,
+        struct llama_context *ctx,
+        struct llama_batch   *b,
+        int32_t               n_vocab,
+        llama_seq_id          src,
+        llama_seq_id          dst,
+        llama_token           tok,
+        llama_pos             pos,
+        llama_pos            *pos_out)
+{
+    llama_memory_seq_rm(mem, dst, 0, -1);
+    llama_memory_seq_cp(mem, src, dst, 0, -1);
+    batch_clear(b);
+    batch_add(b, tok, pos, dst, true);
+    llama_token next = 0;
+    if (llama_decode(ctx, *b) == 0)
+        next = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
+    *pos_out = pos + 1;
+    return next;
+}
+
 struct PTIArgs {
     int  max_new      = 80;
     int  n_gpu_layers = 99;
@@ -120,6 +147,20 @@ static int run_pti4(const PTIArgs *args) {
     fprintf(stderr, "Prefill done. First token: [%d]\n", tok_gen_0);
     fprintf(stderr, "Output: ");
     print_token(vocab, tok_gen_0);
+
+    // ── Prime seq0 with its own exclusive SSM cell before B/C/D inits ─────────
+    // After seq_cp, all 4 seqs share one SSM cell. Without this step, the
+    // recurrent memory's gather+re-order in the first quad-batch places seq0 in
+    // an unexpected physical slot, causing the SSM layers to read the wrong
+    // source state and producing wrong logits for seq0 only. Running seq0 alone
+    // first creates an exclusive cell for it; the reset puts it back at the
+    // prefill state via seq1's still-untouched cell, leaving the cell pool in
+    // an arrangement that the quad-batch gather handles correctly.
+    batch_clear(&batch);
+    batch_add(&batch, tok_gen_0, pos_a, 0, true);
+    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "seq0 prime failed\n"); return 1; }
+    llama_memory_seq_rm(mem, 0, 0, -1);
+    llama_memory_seq_cp(mem, 1, 0, 0, -1);
 
     // ── B init: B processes tok_gen_0 at pos_a ───────────────────────────────
     batch_clear(&batch);
@@ -186,6 +227,7 @@ static int run_pti4(const PTIArgs *args) {
 
         pos_a++; pos_b++; pos_c++; pos_d++;
 
+
         if (tok_b == actual_next) {
             if (tok_c == next_from_b) {
                 if (tok_d == next_from_c) {
@@ -222,15 +264,9 @@ static int run_pti4(const PTIArgs *args) {
                     tok_b = next_from_b;
                     tok_c = next_from_c;
 
-                    llama_memory_seq_rm(mem, 3, pos_d - 1, -1);
-                    pos_d = pos_c;
-
-                    batch_clear(&step_batch);
-                    batch_add(&step_batch, next_from_c, pos_d, 3, true);
-                    if (llama_decode(ctx, step_batch) == 0) {
-                        tok_d = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                        pos_d++;
-                    }
+                    // D wrong: copy C's confirmed state, decode next_from_c at pos_c
+                    tok_d = reinit_seq(mem, ctx, &step_batch, n_vocab,
+                                       /*src=*/2, /*dst=*/3, next_from_c, pos_c, &pos_d);
 
                     if (llama_vocab_is_eog(vocab, next_from_b) ||
                         llama_vocab_is_eog(vocab, next_from_c)) break;
@@ -247,30 +283,13 @@ static int run_pti4(const PTIArgs *args) {
                 tok_a = actual_next;
                 tok_b = next_from_b;
 
-                llama_memory_seq_rm(mem, 2, pos_c - 1, -1);
-                llama_memory_seq_rm(mem, 3, pos_b, -1);   // trim to pos_b-1; D stage1 rebuilds from pos_b
-                pos_c = pos_b;
-                pos_d = pos_b;
+                // C wrong: copy B's confirmed state, decode next_from_b at pos_b
+                tok_c = reinit_seq(mem, ctx, &step_batch, n_vocab,
+                                   /*src=*/1, /*dst=*/2, next_from_b, pos_b, &pos_c);
 
-                batch_clear(&step_batch);
-                batch_add(&step_batch, next_from_b, pos_c, 2, true);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                    pos_c++;
-                }
-
-                // D re-init: process next_from_b at pos_b, then tok_c at pos_b+1
-                batch_clear(&step_batch);
-                batch_add(&step_batch, next_from_b, pos_d, 3, false);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    pos_d++;
-                }
-                batch_clear(&step_batch);
-                batch_add(&step_batch, tok_c, pos_d, 3, true);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    tok_d = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                    pos_d++;
-                }
+                // D wrong: copy C's post-reinit state (chain), decode tok_c at pos_c
+                tok_d = reinit_seq(mem, ctx, &step_batch, n_vocab,
+                                   /*src=*/2, /*dst=*/3, tok_c, pos_c, &pos_d);
 
                 if (llama_vocab_is_eog(vocab, next_from_b)) break;
             }
@@ -282,42 +301,17 @@ static int run_pti4(const PTIArgs *args) {
 
             print_token(vocab, actual_next);  n_gen++;
 
-            llama_memory_seq_rm(mem, 1, pos_b - 1, -1);
-            llama_memory_seq_rm(mem, 2, pos_c - 1, -1);
-            llama_memory_seq_rm(mem, 3, pos_a, -1);       // trim seq3 to confirmed prefix (0..pos_a-1)
-            pos_b = pos_a; pos_c = pos_a; pos_d = pos_a;
+            // B wrong: copy A's confirmed state, decode actual_next at pos_a
+            tok_b = reinit_seq(mem, ctx, &step_batch, n_vocab,
+                               /*src=*/0, /*dst=*/1, actual_next, pos_a, &pos_b);
 
-            batch_clear(&step_batch);
-            batch_add(&step_batch, actual_next, pos_b, 1, true);
-            if (llama_decode(ctx, step_batch) == 0) {
-                tok_b = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                pos_b++;
+            // C wrong: copy B's post-reinit state (chain), decode tok_b at pos_b
+            tok_c = reinit_seq(mem, ctx, &step_batch, n_vocab,
+                               /*src=*/1, /*dst=*/2, tok_b, pos_b, &pos_c);
 
-                batch_clear(&step_batch);
-                batch_add(&step_batch, tok_b, pos_b, 2, true);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    tok_c = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                    pos_c = pos_b + 1;
-                }
-
-                // D stage0: replay actual_next on seq3 (fills pos_a; seq3 was trimmed to pos_a-1)
-                batch_clear(&step_batch);
-                batch_add(&step_batch, actual_next, pos_d, 3, false);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    pos_d++;
-                }
-                batch_clear(&step_batch);
-                batch_add(&step_batch, tok_b, pos_b, 3, false);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    pos_d = pos_b + 1;
-                }
-                batch_clear(&step_batch);
-                batch_add(&step_batch, tok_c, pos_d, 3, true);
-                if (llama_decode(ctx, step_batch) == 0) {
-                    tok_d = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
-                    pos_d++;
-                }
-            }
+            // D wrong: copy C's post-reinit state (chain), decode tok_c at pos_c
+            tok_d = reinit_seq(mem, ctx, &step_batch, n_vocab,
+                               /*src=*/2, /*dst=*/3, tok_c, pos_c, &pos_d);
             tok_a = actual_next;
         }
 
