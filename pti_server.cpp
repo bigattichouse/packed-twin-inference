@@ -155,64 +155,39 @@ static std::string messages_to_prompt(const json &messages) {
     return std::string(buf.data(), needed);
 }
 
-// ── PTI state ─────────────────────────────────────────────────────────────────
+// ── generation stats ──────────────────────────────────────────────────────────
 
-struct PTIStats {
-    int    n_gen    = 0;
-    int    n_4acc   = 0;
-    int    n_3acc   = 0;
-    int    n_2acc   = 0;
-    int    n_reject = 0;
-    double ss_tok_s = 0.0;   // steady-state tok/s (loop only)
-    double am_tok_s = 0.0;   // amortized tok/s (includes init overhead)
+struct GenStats {
+    int    n_gen   = 0;
+    double tok_s   = 0.0;
 };
 
-// Reinitialise sequence dst from src's KV state, decode tok at pos,
-// return sampled next token. Used on reject/partial-accept paths.
-static llama_token reinit_seq(llama_memory_t mem, llama_context *ctx,
-                               llama_batch *b, float temperature,
-                               llama_seq_id src, llama_seq_id dst,
-                               llama_token tok, llama_pos pos,
-                               llama_pos *pos_out) {
-    llama_memory_seq_rm(mem, dst, 0, -1);
-    llama_memory_seq_cp(mem, src, dst, 0, -1);
-    batch_clear(b);
-    batch_add(b, tok, pos, dst, true);
-    llama_token next = 0;
-    if (llama_decode(ctx, *b) == 0)
-        next = sample_token(llama_get_logits_ith(ctx, 0), G.n_vocab, temperature);
-    *pos_out = pos + 1;
-    return next;
-}
+// ── streaming generation (single-sequence, correct baseline) ─────────────────
 
-// ── PTI decode with streaming sink ───────────────────────────────────────────
-
-// Callback: called once per emitted token. Return false to abort generation.
+// Callback: called once per emitted token. Return false to abort.
 using TokenSink = std::function<bool(const std::string &)>;
 
-static PTIStats run_pti4(const std::string &prompt, int max_new,
-                          float temperature, const TokenSink &sink) {
-    PTIStats stats;
+static GenStats run_generate(const std::string &prompt, int max_new,
+                              float temperature, const TokenSink &sink) {
+    GenStats stats;
 
     // ── context ──────────────────────────────────────────────────────────────
-    llama_context_params cparams  = llama_context_default_params();
-    cparams.n_ctx                 = (uint32_t)G.args.n_ctx;
-    cparams.n_batch               = (uint32_t)G.args.n_batch;
-    cparams.n_ubatch              = (uint32_t)G.args.n_ubatch;
-    cparams.n_seq_max             = 4;
-    cparams.flash_attn_type       = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    cparams.type_k                = GGML_TYPE_Q8_0;
-    cparams.type_v                = GGML_TYPE_Q8_0;
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx        = (uint32_t)G.args.n_ctx;
+    cparams.n_batch      = (uint32_t)G.args.n_batch;
+    cparams.n_ubatch     = (uint32_t)G.args.n_ubatch;
+    cparams.n_seq_max    = 1;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.type_k       = GGML_TYPE_Q8_0;
+    cparams.type_v       = GGML_TYPE_Q8_0;
 
     llama_context *ctx = llama_init_from_model(G.model, cparams);
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return stats; }
 
-    llama_memory_t mem = llama_get_memory(ctx);
-
-    // ── tokenise prompt ───────────────────────────────────────────────────────
-    std::vector<llama_token> prompt_toks(MAX_PROMPT_TOKENS);
+    // ── tokenise ─────────────────────────────────────────────────────────────
+    std::vector<llama_token> toks(MAX_PROMPT_TOKENS);
     int n_prompt = llama_tokenize(G.vocab, prompt.c_str(), (int32_t)prompt.size(),
-                                  prompt_toks.data(), MAX_PROMPT_TOKENS, true, true);
+                                  toks.data(), MAX_PROMPT_TOKENS, true, true);
     if (n_prompt <= 0) {
         fprintf(stderr, "Tokenise failed\n");
         llama_free(ctx);
@@ -221,10 +196,10 @@ static PTIStats run_pti4(const std::string &prompt, int max_new,
     fprintf(stderr, "  prompt: %d tokens\n", n_prompt);
 
     // ── prefill ───────────────────────────────────────────────────────────────
-    llama_batch batch = llama_batch_init(n_prompt + 8, 0, 4);
+    llama_batch batch = llama_batch_init(n_prompt + 1, 0, 1);
     batch_clear(&batch);
     for (int i = 0; i < n_prompt; i++)
-        batch_add(&batch, prompt_toks[i], (llama_pos)i, 0, i == n_prompt - 1);
+        batch_add(&batch, toks[i], (llama_pos)i, 0, i == n_prompt - 1);
 
     if (llama_decode(ctx, batch) != 0) {
         fprintf(stderr, "Prefill failed\n");
@@ -232,149 +207,44 @@ static PTIStats run_pti4(const std::string &prompt, int max_new,
         return stats;
     }
 
-    llama_pos   pos_a    = (llama_pos)n_prompt;
-    llama_token tok_gen0 = sample_token(llama_get_logits_ith(ctx, batch.n_tokens - 1),
-                                        G.n_vocab, temperature);
-
-    llama_memory_seq_cp(mem, 0, 1, 0, -1);
-    llama_memory_seq_cp(mem, 0, 2, 0, -1);
-    llama_memory_seq_cp(mem, 0, 3, 0, -1);
-
-    // Emit first token immediately
-    if (!sink(token_to_str(tok_gen0))) {
+    // sample first token from prefill logits
+    llama_token cur = sample_token(llama_get_logits_ith(ctx, batch.n_tokens - 1),
+                                   G.n_vocab, temperature);
+    if (!sink(token_to_str(cur))) {
         llama_batch_free(batch); llama_free(ctx);
         return stats;
     }
     stats.n_gen = 1;
 
-    double t_gen_start = now_sec();
+    // ── decode loop ───────────────────────────────────────────────────────────
+    llama_pos pos = (llama_pos)n_prompt;
+    double t0 = now_sec();
 
-    // ── SSM cell prime (Qwen3.6 hybrid model alignment) ───────────────────────
-    batch_clear(&batch);
-    batch_add(&batch, tok_gen0, pos_a, 0, true);
-    llama_decode(ctx, batch);
-    llama_memory_seq_rm(mem, 0, 0, -1);
-    llama_memory_seq_cp(mem, 1, 0, 0, -1);
+    for (int step = 0; step < max_new - 1; step++) {
+        if (llama_vocab_is_eog(G.vocab, cur)) break;
 
-    // ── B init ────────────────────────────────────────────────────────────────
-    batch_clear(&batch);
-    batch_add(&batch, tok_gen0, pos_a, 1, true);
-    llama_decode(ctx, batch);
-    llama_token tok_b = sample_token(llama_get_logits_ith(ctx, 0), G.n_vocab, temperature);
-    llama_pos   pos_b = pos_a + 1;
+        batch_clear(&batch);
+        batch_add(&batch, cur, pos, 0, true);
 
-    // ── C init ────────────────────────────────────────────────────────────────
-    batch_clear(&batch);
-    batch_add(&batch, tok_gen0, pos_a, 2, false);
-    llama_decode(ctx, batch);
-    batch_clear(&batch);
-    batch_add(&batch, tok_b, pos_b, 2, true);
-    llama_decode(ctx, batch);
-    llama_token tok_c = sample_token(llama_get_logits_ith(ctx, 0), G.n_vocab, temperature);
-    llama_pos   pos_c = pos_b + 1;
-
-    // ── D init ────────────────────────────────────────────────────────────────
-    batch_clear(&batch);
-    batch_add(&batch, tok_gen0, pos_a, 3, false);
-    llama_decode(ctx, batch);
-    batch_clear(&batch);
-    batch_add(&batch, tok_b, pos_b, 3, false);
-    llama_decode(ctx, batch);
-    batch_clear(&batch);
-    batch_add(&batch, tok_c, pos_c, 3, true);
-    llama_decode(ctx, batch);
-    llama_token tok_d = sample_token(llama_get_logits_ith(ctx, 0), G.n_vocab, temperature);
-    llama_pos   pos_d = pos_c + 1;
-
-    llama_token tok_a = tok_gen0;
-
-    // ── main PTI loop ─────────────────────────────────────────────────────────
-    llama_batch step_batch = llama_batch_init(4, 0, 4);
-    bool aborted = false;
-    double t_loop_start = now_sec();
-
-    for (int step = 0; step < max_new - 1 && !aborted; step++) {
-        if (llama_vocab_is_eog(G.vocab, tok_a)) break;
-
-        batch_clear(&step_batch);
-        batch_add(&step_batch, tok_a, pos_a, 0, true);
-        batch_add(&step_batch, tok_b, pos_b, 1, true);
-        batch_add(&step_batch, tok_c, pos_c, 2, true);
-        batch_add(&step_batch, tok_d, pos_d, 3, true);
-
-        if (llama_decode(ctx, step_batch) != 0) break;
-
-        llama_token actual   = sample_token(llama_get_logits_ith(ctx, 0), G.n_vocab, temperature);
-        llama_token from_b   = sample_token(llama_get_logits_ith(ctx, 1), G.n_vocab, temperature);
-        llama_token from_c   = sample_token(llama_get_logits_ith(ctx, 2), G.n_vocab, temperature);
-        llama_token from_d   = sample_token(llama_get_logits_ith(ctx, 3), G.n_vocab, temperature);
-
-        pos_a++; pos_b++; pos_c++; pos_d++;
-
-        // Emit helper — returns false to signal abort
-        auto emit = [&](llama_token tok) -> bool {
-            if (llama_vocab_is_eog(G.vocab, tok)) { aborted = true; return false; }
-            if (!sink(token_to_str(tok)))           { aborted = true; return false; }
-            stats.n_gen++;
-            return true;
-        };
-
-        if (tok_b == actual) {
-            if (tok_c == from_b) {
-                if (tok_d == from_c) {
-                    // ── 4-accept ──────────────────────────────────────────
-                    stats.n_4acc++;
-                    emit(actual); emit(from_b); emit(from_c); emit(from_d);
-                    tok_a = actual; tok_b = from_b; tok_c = from_c; tok_d = from_d;
-                } else {
-                    // ── 3-accept, reinit D ────────────────────────────────
-                    stats.n_3acc++;
-                    emit(actual); emit(from_b); emit(from_c);
-                    tok_a = actual; tok_b = from_b; tok_c = from_c;
-                    tok_d = reinit_seq(mem, ctx, &step_batch, temperature,
-                                       2, 3, from_c, pos_c, &pos_d);
-                }
-            } else {
-                // ── 2-accept, reinit C+D ──────────────────────────────────
-                stats.n_2acc++;
-                emit(actual); emit(from_b);
-                tok_a = actual; tok_b = from_b;
-                tok_c = reinit_seq(mem, ctx, &step_batch, temperature,
-                                   1, 2, from_b, pos_b, &pos_c);
-                tok_d = reinit_seq(mem, ctx, &step_batch, temperature,
-                                   2, 3, tok_c,  pos_c, &pos_d);
-            }
-        } else {
-            // ── reject, reinit B+C+D ──────────────────────────────────────
-            stats.n_reject++;
-            emit(actual);
-            tok_b = reinit_seq(mem, ctx, &step_batch, temperature,
-                               0, 1, actual, pos_a, &pos_b);
-            tok_c = reinit_seq(mem, ctx, &step_batch, temperature,
-                               1, 2, tok_b,  pos_b, &pos_c);
-            tok_d = reinit_seq(mem, ctx, &step_batch, temperature,
-                               2, 3, tok_c,  pos_c, &pos_d);
-            tok_a = actual;
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "Decode failed at step %d\n", step);
+            break;
         }
 
-        if (llama_vocab_is_eog(G.vocab, actual)) break;
+        llama_token next = sample_token(llama_get_logits_ith(ctx, 0),
+                                        G.n_vocab, temperature);
+        if (!sink(token_to_str(next))) break;
+
+        stats.n_gen++;
+        pos++;
+        cur = next;
     }
 
-    double t_end       = now_sec();
-    double loop_time   = t_end - t_loop_start;
-    double total_time  = t_end - t_gen_start;
-    stats.ss_tok_s     = loop_time  > 0 ? stats.n_gen / loop_time  : 0;
-    stats.am_tok_s     = total_time > 0 ? stats.n_gen / total_time : 0;
-
-    int total_steps = stats.n_4acc + stats.n_3acc + stats.n_2acc + stats.n_reject;
-    fprintf(stderr,
-        "  → %d tok  %.1f tok/s (%.1f amortized)\n"
-        "     4-acc=%d  3-acc=%d  2-acc=%d  rej=%d  (of %d steps)\n",
-        stats.n_gen, stats.ss_tok_s, stats.am_tok_s,
-        stats.n_4acc, stats.n_3acc, stats.n_2acc, stats.n_reject, total_steps);
+    double elapsed = now_sec() - t0;
+    stats.tok_s = elapsed > 0 ? stats.n_gen / elapsed : 0;
+    fprintf(stderr, "  → %d tok  %.1f tok/s\n", stats.n_gen, stats.tok_s);
 
     llama_batch_free(batch);
-    llama_batch_free(step_batch);
     llama_free(ctx);
     return stats;
 }
@@ -393,7 +263,7 @@ static std::string sse_chunk(const std::string &text, const std::string &id) {
     return "data: " + chunk.dump() + "\n\n";
 }
 
-static std::string sse_done(const PTIStats &s, const std::string &id) {
+static std::string sse_done(const GenStats &s, const std::string &id) {
     json choice = {{"delta", json::object()}, {"index", 0}, {"finish_reason", "stop"}};
     json chunk  = {{"id", id}, {"object", "chat.completion.chunk"},
                    {"model", "pti-4seq"}, {"choices", json::array({choice})}};
@@ -441,7 +311,7 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
     res.set_chunked_content_provider("text/event-stream",
         [prompt, temperature, max_tokens, id](size_t /*offset*/,
                                                httplib::DataSink &sink) -> bool {
-            PTIStats stats = run_pti4(prompt, max_tokens, temperature,
+            GenStats stats = run_generate(prompt, max_tokens, temperature,
                 [&sink, &id](const std::string &text) -> bool {
                     auto chunk = sse_chunk(text, id);
                     return sink.write(chunk.c_str(), chunk.size());
