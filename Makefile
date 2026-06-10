@@ -182,6 +182,18 @@ $(PTI_BENCH): pti_gemv_bench.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
 	@echo "Built $@"
 
+# ── pti_q6k_bench: M6.1 Q6_K MMVQ replica microbench (HIP) ───────────────────
+PTI_Q6K := $(BINDIR)/pti_q6k_bench
+
+q6kbench: $(PTI_Q6K)
+
+$(PTI_Q6K): pti_q6k_bench.hip | $(BINDIR)
+	$(HIPCC) $(HIP_FLAGS) -o $@ $<
+	@echo "Built $@"
+
+q6kbench-run: $(PTI_Q6K)
+	$(PTI_Q6K)
+
 # ── pti_kbatch_bench: M6.0 k-token batch cost curve ──────────────────────────
 kbench: $(PTI_KBENCH)
 

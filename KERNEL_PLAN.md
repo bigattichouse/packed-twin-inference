@@ -174,7 +174,7 @@ seq_cp checkpoint restore: 0.02 ms  (effectively free)
 - **Verdict: M6.4 (lookup) is GO at current kernel cost; kernel work (M6.1–6.3) multiplies the gain
   (cost_4 1.71× → ~1.2× would lift hit-run throughput from 42 to ~60 tok/s).**
 
-### M6.1 — Standalone Q6_K microbench replica
+### M6.1 — Standalone Q6_K microbench replica — **DONE, gate PASS**
 
 - Extract the MMVQ Q6_K inner loop (from `ggml-cuda/mmvq.cuh` + `vecdotq.cuh`, both in working dir)
   into a standalone `.hip` benchmark with real Q6_K block layout (synthetic data, format-identical),
@@ -185,12 +185,45 @@ seq_cp checkpoint restore: 0.02 ms  (effectively free)
 - **FAIL** → the cost lives outside GEMV (dispatch, quantize_q8_1, graph overhead) → pivot to
   profiling `llama_decode` with rocprof before touching kernels.
 
-### M6.2 — Kernel optimization loop (microbench only)
+**Results (measured)**: `pti_q6k_bench.hip`, correctness vs CPU integer reference PASS at all k.
+Ratios: n=2 = 1.24–1.33× (in-tree 1.20×), n=4 = 1.51–1.66× (in-tree 1.71×) → within ±10%, PASS.
+VGPRs via hipFuncGetAttributes: 24/36/63/79 for n=1/2/4/8 → 10/7/4/3 waves (n=4 matches the
+in-tree ISA analysis exactly). n=1 runs at ~510 GB/s pure weight-read.
+Lesson logged: the replica's first reduction used `__shfl_down` (sum in lane 0 only) — upstream
+needs the XOR butterfly because lane tx writes row tx. The CPU-reference check caught it.
+
+### M6.2 — Kernel optimization loop (microbench only) — **CLOSED: floor reached**
 
 - Apply experiment matrix (§3) one variable at a time; keep a results table per variant.
 - **Gate**: k=2 ≤ **1.10×**, k=4 ≤ **1.35×** (stretch 1.15×) on the microbench GEMV.
 - **Abort**: if after VGPR diet + LDS staging + dot4 audit, k=2 still > 1.18× → occupancy isn't the
   real limiter; stop, write up findings, fall back to Plan B decision point.
+
+**Results (measured 2026-06-09, FFN gate/up 17408×5120, 200 iters)**:
+
+```
+variant                          n=2      n=4      VGPRs(n=4)  verdict
+base (upstream + M5.1)           1.29×    1.65×    63 / 4 wv   OPTIMUM
+fused unpack (j-invariant CSE)   1.30×    1.66×    64 / 4 wv   wash — LLVM already CSEs
+probe B: forced ≤40 VGPRs        —        6.00×    40 + spill  disaster
+colwarp (block/column, L2)       2.01×    3.87×    24 / 10 wv  no L2 temporal sharing
+warpcol (warp/column, L1)        1.93×    4.24×    24 / 10 wv  no L1 sharing either
+probe A: shared-y (L2 traffic)   —        1.64×    —           activations irrelevant
+```
+
+**Verdict — abort criterion met.** The n=2/n=4 overheads (1.25×/1.7×) are the instruction-issue
+floor for Q6_K MMVQ on gfx906:
+- The per-column work (dp4a + scale-combine per (i,j,qr)) is irreducible and already minimal.
+- The compiler already shares the weight unpack across columns; no VALU redundancy left.
+- Registers cannot shrink without spills (the n=4 dataflow needs ~63 VGPRs).
+- Column-split decompositions (better occupancy) lose more to duplicated weight reads than they
+  gain — neither L2 nor same-CU L1 delivers temporal sharing at GEMV streaming rates.
+- The format itself taxes the kernel: 210-byte unaligned q6_K blocks force 2×u16 loads per int.
+
+**Consequence**: M6.3 (ggml integration) is MOOT — there is nothing to integrate. The only
+remaining kernel route is Plan B (flat-format custom pipeline, §3), a major project. Path C does
+NOT need it: lookup economics are already positive at the measured 1.20×/1.71× in-tree costs.
+**Proceed directly to M6.4.**
 
 ### M6.3 — ggml integration
 
