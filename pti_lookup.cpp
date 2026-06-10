@@ -57,6 +57,23 @@ static double now_sec() {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// ── quiet llama/ggml logging (default): only WARN+ passes ────────────────────
+// Per-step seq ops emit DEBUG spam ("copying KV buffer", "graph_reserve",
+// "CUDA Graph id reused") that interleaves with generated text. --verbose
+// restores full logs (and per-fire stats).
+static bool g_verbose_logs = false;
+static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
+static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
+    if (g_verbose_logs) { fputs(text, stderr); return; }
+    if (level == GGML_LOG_LEVEL_CONT) {
+        if (g_last_lvl >= GGML_LOG_LEVEL_WARN && g_last_lvl != GGML_LOG_LEVEL_CONT)
+            fputs(text, stderr);
+        return;
+    }
+    g_last_lvl = level;
+    if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
+}
+
 // Greedy pick with deterministic tie-breaking (same rule as pti_server).
 // Different batch sizes run different kernel configs whose reductions differ
 // by ~1e-3 on logits — invisible except at genuine near-ties (the <think>
@@ -521,6 +538,8 @@ int main(int argc, char **argv) {
     }
     if (args.draft_k > MAX_DRAFT) args.draft_k = MAX_DRAFT;
 
+    g_verbose_logs = args.verbose;
+    llama_log_set(pti_log_cb, nullptr);
     llama_backend_init();
     int rc = run_lookup(&args);
     llama_backend_free();

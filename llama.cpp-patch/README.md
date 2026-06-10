@@ -1,97 +1,38 @@
-# PTI Interleaved Activation Patch for llama.cpp
+# llama.cpp patches
 
-> **STATUS — 2026-06-09: BENCHMARKED — NO GAIN**
->
-> `pti_4seq` shows **100% 4-ACCEPT at 38.1 tok/s** on Qwen3.6-27B-UD-Q6_K_XL
-> (MI50, greedy, -n 80). The interleaved activation patch shows **no speedup**:
->
-> | Config | tok/s | vs baseline |
-> |---|---|---|
-> | GGML_PTI_INTERLEAVED=0 (baseline) | 38.1 | — |
-> | GGML_PTI_INTERLEAVED=1 (patched) | 35.6 | −6% (noise, no gain) |
->
-> **Root cause revised**: activation traffic (~480 MB/step) is <2% of weight
-> loading (~25 GB/step). Pre-pass interleave adds overhead without any benefit.
-> The 2× overhead is from 4× MMVQ compute scaling with N, not L2 activation traffic.
->
-> **Next:** true fused PTI kernel in mmvq.cu — see PLAN.md Phase 4 (M4).
+PTI builds against **upstream `ggerganov/llama.cpp` master @ `ad2775726`** (or later).
+Almost everything PTI needs is already upstream at that commit:
 
-**Target file**: `ggml/src/ggml-cuda/mmvq.cu`
-**Status**: kernel written, benchmark blocked (reinit incompatibility with hybrid model)
+- MTP / nextn context support (`LLAMA_CONTEXT_TYPE_MTP` — PRs #22673, #23198)
+- pre-norm embeddings ext (`src/llama-ext.h`: `llama_set_embeddings_pre_norm`,
+  `llama_get_embeddings_pre_norm_ith`)
 
-## What this does
+## The one local patch
 
-Eliminates the 2× overhead that `mul_mat_vec_q` incurs at `ncols_dst=4`
-(the N=4 PTI decode path) by changing the activation memory access pattern.
+| patch | what | required? |
+|---|---|---|
+| `0001-mmvq-i-outer-j-inner.patch` | MMVQ loop-order fix (M5.1): makes the weight-block address loop-invariant across columns so LLVM hoists the load. N=4 batched-decode overhead 1.95× → 1.86× on gfx906. | **Optional** — performance only. PTI is correct without it; verify batches just cost a few % more. |
 
-### Root cause
+(An earlier "interleaved activation" patch lived here; it was benchmarked at no gain
+and removed — see `FAILED_EXPERIMENTS.md` in the repo root for the post-mortem.)
 
-For each weight block at position `kby`, the N=4 kernel reads four activation
-blocks from addresses 5760 bytes apart (one per column, `stride_col_y` apart):
-
-```
-y[0 * 5760 + kby]   col 0 activation at K-position kby
-y[1 * 5760 + kby]   col 1 activation at K-position kby
-y[2 * 5760 + kby]   col 2 activation at K-position kby
-y[3 * 5760 + kby]   col 3 activation at K-position kby
-```
-
-These four reads hit four different cache lines, saturating L2 bandwidth.
-
-### Fix
-
-Pack the four columns into interleaved layout before the GEMV:
-
-```
-y_intlv[kby * 4 + j]   all four activation blocks adjacent in 3 cache lines
-```
-
-The inner loop then reads `ybase[j]` where `ybase = &y[kby * ncols_dst]`.
-All four column reads are within 144 consecutive bytes instead of 4 × 5760 B.
-
-## How to apply
+## Apply
 
 ```bash
-# From your llama.cpp root
-git apply llama.cpp-patch/0001-pti-interleaved-activation.patch
-cmake --build build --config Release -j $(nproc)
+./llama.cpp-patch/patch.sh                  # apply to ../llama.cpp
+./llama.cpp-patch/patch.sh --build          # apply + rebuild (ROCm 7.2.1 / gfx906)
+./llama.cpp-patch/patch.sh /path/to/llama.cpp
 ```
 
-## How to test
+Idempotent — re-running skips already-applied patches.
+
+## If the patch doesn't apply (upstream drift)
+
+`../llama.cpp-files/` mirrors the llama.cpp directory structure with the full modified
+files — read them in the same place you'd find them upstream, or copy the tree over:
 
 ```bash
-# Correctness: output tokens must be bit-identical to baseline
-GGML_PTI_INTERLEAVED=0 ./pti_4seq ...  > baseline.txt
-GGML_PTI_INTERLEAVED=1 ./pti_4seq ...  > patched.txt
-diff baseline.txt patched.txt   # must be empty
-
-# Performance: compare step times
-GGML_PTI_INTERLEAVED=0 ./pti_4seq -m model.gguf -p "hello" -n 80 2>&1 | grep tok/s
-GGML_PTI_INTERLEAVED=1 ./pti_4seq -m model.gguf -p "hello" -n 80 2>&1 | grep tok/s
+cp -r llama.cpp-files/* /path/to/llama.cpp/
 ```
 
-## Expected result
-
-| Config | step time | tok/s | HBM eff BW |
-|---|---|---|---|
-| N=4 baseline (no patch) | ~105 ms | 38.1 | 177 GB/s |
-| N=4 interleaved (patched) | ~52 ms | ~67 | ~330 GB/s |
-| N=1 baseline (reference) | 47 ms | 19.4 | 393 GB/s |
-
-## Files changed
-
-| File | Change |
-|---|---|
-| `ggml/src/ggml-cuda/mmvq.cu:396` | Add `bool pti_interleaved = false` to `mul_mat_vec_q` template |
-| `ggml/src/ggml-cuda/mmvq.cu:495` | Add `if constexpr (pti_interleaved)` inner loop branch |
-| `ggml/src/ggml-cuda/mmvq.cu:689` | Add `bool pti_interleaved = false` to `mul_mat_vec_q_switch_fusion` |
-| `ggml/src/ggml-cuda/mmvq.cu:714` | Launch interleaved kernel variant when `pti_interleaved` |
-| `ggml/src/ggml-cuda/mmvq.cu:756` | Add `bool pti_interleaved = false` to `mul_mat_vec_q_switch_ncols_dst` |
-| `ggml/src/ggml-cuda/mmvq.cu:868` | Dispatch PTI variant in `case 4` |
-| `ggml/src/ggml-cuda/mmvq.cu:926` | Add `bool pti_interleaved = false` to `mul_mat_vec_q_switch_type` |
-| `ggml/src/ggml-cuda/mmvq.cu:1072` | Add `pti_interleave_q8_1_kernel<N>` GPU kernel |
-| `ggml/src/ggml-cuda/mmvq.cu:1178` | Env-var gated dispatch in `ggml_cuda_mul_mat_vec_q` |
-
-All changes are backward compatible. `pti_interleaved = false` is the default
-everywhere; the env var `GGML_PTI_INTERLEAVED=1` activates the new path only
-for non-MoE batches with exactly `ncols_dst = 4`.
+Current contents: `ggml/src/ggml-cuda/mmvq.cu` (base commit + patch applied).

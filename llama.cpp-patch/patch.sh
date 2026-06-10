@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# patch.sh — apply the PTI interleaved activation patch to a llama.cpp checkout
+# patch.sh — apply this repo's llama.cpp modifications.
 #
 # Usage:
 #   ./patch.sh                        # apply to ../llama.cpp (default)
@@ -7,13 +7,22 @@
 #   ./patch.sh --build                # apply + rebuild (ROCm 7.2.1 / gfx906)
 #   ./patch.sh /path/to/llama.cpp --build
 #
-# The patch adds the GGML_PTI_INTERLEAVED=1 env var gate to mul_mat_vec_q.
-# No existing behavior changes when the env var is unset.
+# What it applies (see README.md in this directory):
+#   0001-mmvq-i-outer-j-inner.patch — MMVQ loop-order fix (M5.1). OPTIONAL
+#   performance patch: N=4 batched-decode overhead 1.95x -> 1.86x on gfx906.
+#   Everything else PTI needs (MTP context type, pre-norm embeddings ext)
+#   is already upstream as of the base commit below — no patch required.
+#
+# Idempotent: re-running detects already-applied patches and skips them.
+# Patch won't apply (upstream drift)? Copy the full modified files instead —
+# ../llama.cpp-files/ mirrors the llama.cpp directory structure:
+#   cp -r llama.cpp-files/* /path/to/llama.cpp/
 
 set -euo pipefail
 
+BASE_COMMIT=ad2775726   # upstream ggerganov/llama.cpp master this repo was built against
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH_FILE="$SCRIPT_DIR/0001-pti-interleaved-activation.patch"
 
 # Parse args
 LLAMA_DIR=""
@@ -39,14 +48,26 @@ if [[ ! -f "$LLAMA_DIR/ggml/src/ggml-cuda/mmvq.cu" ]]; then
     exit 1
 fi
 
-# Check patch hasn't been applied already
-if grep -q "pti_interleave_q8_1_kernel" "$LLAMA_DIR/ggml/src/ggml-cuda/mmvq.cu"; then
-    echo "Patch already applied — skipping."
-else
-    echo "Applying patch..."
-    git -C "$LLAMA_DIR" apply "$PATCH_FILE"
-    echo "Patch applied successfully."
+if ! git -C "$LLAMA_DIR" merge-base --is-ancestor "$BASE_COMMIT" HEAD 2>/dev/null; then
+    echo "WARNING: checkout does not contain base commit $BASE_COMMIT."
+    echo "         PTI needs the upstream MTP + pre-norm ext APIs (master >= $BASE_COMMIT)."
+    echo "         The patch may still apply cleanly; continuing."
 fi
+
+for PATCH_FILE in "$SCRIPT_DIR"/*.patch; do
+    NAME="$(basename "$PATCH_FILE")"
+    if git -C "$LLAMA_DIR" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+        echo "skip:  $NAME (already applied)"
+    elif git -C "$LLAMA_DIR" apply --check "$PATCH_FILE" 2>/dev/null; then
+        git -C "$LLAMA_DIR" apply "$PATCH_FILE"
+        echo "apply: $NAME"
+    else
+        echo "FAIL:  $NAME does not apply cleanly (upstream drift?)." >&2
+        echo "       Fallback — copy the mirrored full files:" >&2
+        echo "         cp -r $SCRIPT_DIR/../llama.cpp-files/* $LLAMA_DIR/" >&2
+        exit 1
+    fi
+done
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
     echo ""
@@ -64,9 +85,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
     cmake --build "$LLAMA_DIR/build" --config Release -j "$(nproc)"
     echo ""
     echo "Build done. Binaries: $LLAMA_DIR/build/bin/"
+else
+    echo ""
+    echo "Done. Rebuild llama.cpp before building PTI (or re-run with --build)."
 fi
-
-echo ""
-echo "Test with:"
-echo "  GGML_PTI_INTERLEAVED=0 ./pti_4seq -m model.gguf ...   # baseline"
-echo "  GGML_PTI_INTERLEAVED=1 ./pti_4seq -m model.gguf ...   # patched"

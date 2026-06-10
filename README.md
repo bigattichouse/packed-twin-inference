@@ -63,8 +63,11 @@ checkpoint/rollback (0.02 ms).
 ## Quick start
 
 ```bash
-# prerequisite: llama.cpp built at ../llama.cpp/build (ROCm/HIP), model in ../gguf/
-make lookup server
+# prerequisite: upstream llama.cpp (master >= ad2775726, has the MTP/ext APIs)
+# at ../llama.cpp, built with ROCm/HIP; model in ../gguf/. One OPTIONAL perf patch:
+./llama.cpp-patch/patch.sh --build     # details: llama.cpp-patch/README.md
+# (modified files also mirrored in llama.cpp-files/ for reading or copying)
+make lookup server chat
 
 # terminal demo (great for screen recording) — full speed, MTP-only, or plain
 ./pti-cli.sh pti  "Rewrite this function with better names: ..." 300

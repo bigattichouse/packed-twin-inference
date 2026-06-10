@@ -45,6 +45,23 @@ static double now_sec() {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// ── quiet llama/ggml logging (default): only WARN+ passes ────────────────────
+// The per-step seq ops make llama emit DEBUG lines ("copying KV buffer",
+// "graph_reserve", "CUDA Graph id reused") that interleave with generated
+// text. --verbose restores full logs for debugging.
+static bool g_verbose_logs = false;
+static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
+static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
+    if (g_verbose_logs) { fputs(text, stderr); return; }
+    if (level == GGML_LOG_LEVEL_CONT) {
+        if (g_last_lvl >= GGML_LOG_LEVEL_WARN && g_last_lvl != GGML_LOG_LEVEL_CONT)
+            fputs(text, stderr);
+        return;
+    }
+    g_last_lvl = level;
+    if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
+}
+
 // Greedy with deterministic tie-breaking (same rule as pti_server/pti_lookup):
 // among tokens within EPS of the max logit, the lowest id wins — batch-shape
 // kernel noise (~1e-3) can otherwise flip genuine near-ties between modes.
@@ -311,10 +328,12 @@ int main(int argc, char **argv) {
             const char *m = argv[++i];
             g.mode = !strcmp(m, "base") ? MODE_BASE : !strcmp(m, "mtp") ? MODE_MTP : MODE_PTI;
         }
-        else { fprintf(stderr, "Usage: %s -m <model> [--mode base|mtp|pti] [-n max] [-c ctx]\n", argv[0]); return 1; }
+        else if (!strcmp(argv[i], "--verbose")) g_verbose_logs = true;
+        else { fprintf(stderr, "Usage: %s -m <model> [--mode base|mtp|pti] [-n max] [-c ctx] [--verbose]\n", argv[0]); return 1; }
     }
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
 
+    llama_log_set(pti_log_cb, nullptr);
     llama_backend_init();
     fprintf(stderr, "Loading %s ...\n", model_path);
     llama_model_params mp = llama_model_default_params();

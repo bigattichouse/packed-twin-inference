@@ -89,6 +89,23 @@ static double now_sec() {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// ── quiet llama/ggml logging (default): only WARN+ passes ────────────────────
+// Per-step seq ops emit DEBUG spam ("copying KV buffer", "graph_reserve",
+// "CUDA Graph id reused") that drowns the per-request stats. --verbose
+// restores full logs.
+static bool g_verbose_logs = false;
+static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
+static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
+    if (g_verbose_logs) { fputs(text, stderr); return; }
+    if (level == GGML_LOG_LEVEL_CONT) {
+        if (g_last_lvl >= GGML_LOG_LEVEL_WARN && g_last_lvl != GGML_LOG_LEVEL_CONT)
+            fputs(text, stderr);
+        return;
+    }
+    g_last_lvl = level;
+    if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
+}
+
 // Greedy pick with deterministic tie-breaking. Different batch sizes run
 // different kernel configurations whose reduction orders differ by ~1e-3 on
 // the logits — invisible except at genuine near-ties (e.g. the <think>
@@ -553,6 +570,7 @@ static void usage(const char *prog) {
         "  --kv-q8        Q8_0 KV cache: ~2x context headroom, but output may\n"
         "                 differ between modes (batch-size-dependent numerics)\n"
         "  --mode <m>     base | mtp | pti (default: pti)\n"
+        "  --verbose      Full llama/ggml logs (default: WARN+ only)\n"
         "  --temp <float> Default temperature (default: 0.0 — REQUIRED for speedup;\n"
         "                 temp > 0 falls back to plain decode)\n"
         "  -n <int>       Default max tokens (default: 1024)\n\n"
@@ -575,6 +593,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--temp") && i+1 < argc) args.temperature  = atof(argv[++i]);
         else if (!strcmp(argv[i], "-n")     && i+1 < argc) args.max_tokens   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--kv-q8")) args.kv_q8 = true;
+        else if (!strcmp(argv[i], "--verbose")) g_verbose_logs = true;
         else if (!strcmp(argv[i], "--mode") && i+1 < argc) {
             const char *m = argv[++i];
             args.mode = !strcmp(m, "base") ? MODE_BASE : !strcmp(m, "mtp") ? MODE_MTP : MODE_PTI;
@@ -588,6 +607,7 @@ int main(int argc, char **argv) {
         usage(argv[0]); return 1;
     }
 
+    llama_log_set(pti_log_cb, nullptr);
     llama_backend_init();
 
     fprintf(stderr, "Loading: %s\n", args.model_path);

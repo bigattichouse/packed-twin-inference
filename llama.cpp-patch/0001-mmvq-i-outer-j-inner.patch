@@ -1,0 +1,31 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 13b8b8552..f06acada9 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -492,16 +492,22 @@ static __global__ void mul_mat_vec_q(
+         // x block quant index when casting the quants to int
+         const int kqs = vdr * (tid % (qi/vdr));
+ 
++// PTI M5.1: i-outer/j-inner loop order so cur_kbx is loop-invariant across j.
++// At ncols_dst>1, the weight block address (kbx_offset+i*stride_row_x+kbx)
++// does not depend on j.  With i as the outer loop, LLVM can LICM the weight
++// block load (bq6_K = vbq+cur_kbx) before the j-loop, issuing it once per
++// i-iteration instead of once per (i,j) pair.  Correct for all quantized types.
+ #pragma unroll
+-        for (int j = 0; j < ncols_dst; ++j) {
++        for (int i = 0; i < rows_per_cuda_block; ++i) {
++            const int cur_kbx = kbx_offset + i*stride_row_x + kbx;
+ #pragma unroll
+-            for (int i = 0; i < rows_per_cuda_block; ++i) {
++            for (int j = 0; j < ncols_dst; ++j) {
+                 tmp[j][i] += vec_dot_q_cuda(
+-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                    vx, &y[j*stride_col_y + kby], cur_kbx, kqs);
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+                         tmp_gate[j][i] += vec_dot_q_cuda(
+-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                            vgate, &y[j*stride_col_y + kby], cur_kbx, kqs);
+                     }
+                 }
+             }
