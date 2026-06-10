@@ -1,9 +1,20 @@
-# packed-twin-inference
+# Packed Twin Inference (PTI)
 
-**Make a local LLM up to 2× faster — with provably identical output.**
+**Draft forward. Verify in a packed batch. Fall back to your twin.**
 
-Runs Qwen3.6-27B on a single AMD MI50 (32 GiB) through llama.cpp. No retraining, no
-quality loss, no custom GPU kernels.
+Make a local LLM up to 2× faster — with provably identical output. Runs Qwen3.6-27B on a
+single AMD MI50 (32 GiB) through llama.cpp. No retraining, no quality loss, no custom GPU
+kernels.
+
+The name is the design:
+
+- **Packed** — where the speed comes from. Verifying a 32-token draft costs 6.93× one
+  token, not 32×, because the 25 GB weight read is shared across every position in the
+  batch. One weight load, many useful computations.
+- **Twin** — why it's safe. Every draft is verified against, and healed from, a twin of
+  the working sequence's state. That twin checkpoint is what makes speculation possible
+  on hybrid-SSM models, where recurrent state cannot rewind — the piece stock lookup
+  decoding lacks.
 
 | what you're generating | plain llama.cpp | this project | speedup |
 |---|---|---|---|
@@ -93,30 +104,12 @@ diff a.txt b.txt    # always empty
 | `FAILED_EXPERIMENTS.md` | every dead end, with numbers (read this before "improving" the kernel) |
 | `KERNEL_PLAN.md`, `PLAN.md`, `DESIGN.md` | full investigation logs |
 
-## Why "packed twin inference"?
-
-The name predates the final design, but both words still point at the two load-bearing
-mechanisms:
-
-- **Packed** — the speedup comes from packing many token positions into one weight pass:
-  verifying a 32-token draft costs 6.93× one token, not 32×, because the 25 GB weight
-  read is shared across all of them. One weight load, many useful computations — the
-  project's founding thesis, surviving on a different axis (positions of one stream,
-  rather than parallel streams).
-- **Twin** — every draft is verified against, and healed from, a *twin* of the working
-  sequence's state. The twin checkpoint is what makes speculation safe on hybrid-SSM
-  models, where recurrent state cannot rewind — and it is exactly the piece stock
-  lookup decoding lacks.
-
-The whole system in one sentence: **draft forward, verify in a packed batch, and when a
-draft misses, fall back to your twin.**
-
 ## History, briefly
 
-This repo started as "Packed Twin Inference" — running staggered copies of the model in
-one batch to self-speculate. Measurement proved that idea is mathematically bounded
+PTI originally meant something stricter — running staggered *active* copies of the model
+in one batch to self-speculate. Measurement proved that idea is mathematically bounded
 *below* plain speed (the draft cost equals the savings), and that the GPU kernel had no
-headroom left on gfx906. The machinery built along the way — checkpointing, batched
-verification, byte-diff auditing — became the foundation for what actually works: free
+headroom left on gfx906. The machinery built along the way — the twin checkpoint, packed
+batch verification, byte-diff auditing — became the foundation for what actually works: free
 drafts from lookup + MTP. The numbers: baseline 52.6 ms/pass; batch verify b4 = 1.71×,
 b16 = 4.47×, b32 = 6.93×; checkpoint 0.02 ms; MTP head 88.6% t+2 accuracy at 3.5 ms.
