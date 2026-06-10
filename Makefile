@@ -15,13 +15,14 @@
 #   make cuda SM=75         RTX 2080 Ti / T4
 #
 # ── llama.cpp PTI binaries ────────────────────────────────────────────────────
-#   make llama              pti_llama  (2-seq, C)
+#   make 2seq-2             pti_2seq   (2-seq, C++) ← best measured: 16.3 tok/s
+#   make llama              pti_llama  (2-seq, C, earlier prototype)
 #   make mtp                pti_mtp    (3-seq + MTP re-init, C++)
-#   make 4seq               pti_4seq   (4-seq, C++)   ← headline 38.1 tok/s
+#   make 4seq               pti_4seq   (4-seq, C++) ← 14.6 tok/s (0.77× baseline)
 #   make all-llama          all three
 #
 # ── Run shortcuts ─────────────────────────────────────────────────────────────
-#   make 4seq-run           4-seq PTI on UD-Q6_K_XL  (reproduces 38.1 tok/s)
+#   make 4seq-run           4-seq PTI on UD-Q6_K_XL
 #   make 4seq-run-base      baseline on UD-Q6_K_XL
 #   make mtp-run / mtp-run-base
 #   make llama-run-pti / llama-run-base
@@ -221,11 +222,12 @@ help:
 	@echo "llama.cpp PTI binaries (all output to bin/):"
 	@echo "  make llama                                   bin/pti_llama  (2-seq)"
 	@echo "  make mtp                                     bin/pti_mtp    (3-seq + MTP)"
-	@echo "  make 4seq                                    bin/pti_4seq   (4-seq, ~2×)"
+	@echo "  make 2seq-2                                  bin/pti_2seq   (2-seq, best 16.3 tok/s)"
+	@echo "  make 4seq                                    bin/pti_4seq   (4-seq, 14.6 tok/s)"
 	@echo "  make all-llama                               all three"
 	@echo ""
 	@echo "Run shortcuts:"
-	@echo "  make 4seq-run        4-seq PTI on UD-Q6_K_XL (reproduces 38.1 tok/s)"
+	@echo "  make 4seq-run        4-seq PTI on UD-Q6_K_XL (14.6 tok/s)"
 	@echo "  make 4seq-run-base   baseline for comparison"
 	@echo "  make mtp-run / mtp-run-base"
 	@echo "  make llama-run-pti / llama-run-base"

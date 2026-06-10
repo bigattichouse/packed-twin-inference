@@ -17,21 +17,32 @@ re-emitted 3 of them at the start of the next step. After correcting the algorit
 | Config | Measured tok/s | vs baseline | Status |
 |---|---|---|---|
 | Baseline (single-seq) | 19.0 | 1.00× | correct |
+| PTI 2-seq, multi-emit | 16.3 | 0.86× | **best measured** |
+| PTI 4-seq, multi-emit (M5.3) | 14.6 | 0.77× | correct |
 | PTI 4-seq, single-emit | ~10.2 | 0.54× | correct but slow |
-| **PTI 4-seq, multi-emit (M5.3)** | **14.6** | **0.77×** | **correct, current best** |
 | ~~PTI 4-seq (old, buggy)~~ | ~~38.1~~ | ~~2.02×~~ | counted duplicate tokens |
 
-**The correct PTI algorithm is currently slower than baseline.** The fundamental bottleneck:
-after each 4-accept step, the stagger must advance 4 positions, requiring 3 sequential single-seq
-decode calls to rebuild B, C, D from the new anchor. These 3 reinit calls cost ~158ms, while the
-4-accept quad-decode costs ~98ms — total 256ms for 4 tokens = 15.6 ms/token vs 52.6 ms/token
-baseline (i.e., 14.6 tok/s vs 19.0 tok/s).
+**PTI is currently slower than baseline regardless of N.** The fundamental bottleneck is
+mathematical: for any N-seq multi-emit step, total cost = 1 batch-decode + (N-1) reinit calls.
+Each reinit is one full N=1 baseline decode (52.6ms). So the per-token cost is always:
+
+```
+(batch + (N-1)×52.6ms) / N  ≥  (1×52.6ms + (N-1)×52.6ms) / N  =  52.6ms/tok  =  baseline
+```
+
+The batch-decode costs > 1× baseline (1.25× for N=2, 1.86× for N=4), so PTI is always
+**strictly slower** than baseline with the current public-API reinit design. No value of N helps.
+
+- 2-seq: (66.2 + 52.6ms) / 2 = 59.4ms/tok → 16.8 tok/s theoretical, **16.3 measured**
+- 4-seq: (98 + 158ms) / 4 = 64ms/tok → 15.6 tok/s theoretical, **14.6 measured**
+- 2-seq is optimal N; adding more sequences just adds more reinit calls without proportional gain.
 
 **What we measured and confirmed:**
-- N=4 MMVQ scaling: 1.86× (after M5.1 loop restructure, down from 1.95×)
+- N=4 MMVQ scaling: 1.86× (after M5.1 loop restructure, down from 1.95×); N=2: 1.25×
 - GEMV bottleneck: compute (inner-loop FMAFs), NOT activation L2 traffic
 - SSM state: cannot tolerate stale updates — speculative reinit causes 47% D-miss rate
 - Accept chain: correct, byte-identical to baseline at greedy, 15/15 audit PASS
+- 2-seq (optimal N): 16.3 tok/s measured, 100% 2-accept, byte-identical, 25/25 PASS
 
 ---
 
@@ -157,9 +168,13 @@ Reinit still costs 158ms. Total: 216ms → 18.5 tok/s. *Barely matches, does not
 (~58ms instead of 158ms). Total: 116ms for 4 tokens → 34.5 tok/s (1.82× baseline).
 *Requires empirical validation that C/D speculative states converge for this model.*
 
-**Option C — Different stagger count:** 2-seq has only 1 reinit call per 2-emit step.
-Estimated: (66.2 + 52.6ms) / 2 tokens = 16.7 tok/s (0.88× baseline). *Better than 4-seq
-per-token, but still below baseline.*
+**Option C — 2-seq (current best):** 1 reinit call per 2-emit step.
+Measured: 16.3 tok/s (0.86× baseline). Best without a kernel. *Still below baseline.*
+
+**Why no N-seq can beat baseline with the public API**: total cost = batch + (N-1) reinits
+= N × ≥52.6ms for N tokens → ≥52.6ms/token ≥ baseline. The batch always costs > baseline
+(it processes N sequences), making the inequality strict. PTI via public API is bounded above
+by baseline throughput.
 
 **Option D — Custom fused kernel outside public API:** a kernel that loads each weight
 block once and computes N dot products in a single warp pass, eliminating the 4× inner-loop
@@ -219,11 +234,12 @@ make audit-quick
 
 | File | Purpose | Status |
 |---|---|---|
+| `pti_2seq.cpp` | **2-seq PTI — optimal N, public API** | ✓ **16.3 tok/s, byte-identical** |
 | `pti_4seq.cpp` | 4-sequence PTI — public llama.cpp API, correct algorithm | ✓ 14.6 tok/s, byte-identical |
 | `pti_debug.cpp` | Single-sequence baseline for comparison | ✓ |
 | `pti_gemv_bench.cpp` | GEMV scaling + context isolation benchmark | ✓ |
 | `pti_mtp.cpp` | 3-sequence PTI + MTP context (created, not invoked at greedy) | ✓ |
-| `pti_llama.c` | 2-sequence PTI — C API | ✓ |
+| `pti_llama.c` | 2-sequence PTI — C API (earlier prototype) | ✓ |
 | `pti_server.cpp` | HTTP server (single-seq baseline, 19 tok/s, correct) | ✓ |
 | `pti_kernel.hip` | HIP/ROCm Q8 multi-stream kernel + benchmarks | ✓ |
 | `audit.sh` | End-to-end correctness + performance audit | ✓ 15/15 PASS |
@@ -235,14 +251,17 @@ make audit-quick
 ## Key Numbers
 
 ```
-Hardware:        MI50, 32 GiB HBM2, ~1 TB/s peak
-Model:           Qwen3.6-27B UD-Q6_K_XL (25 GB, 6-bit)
-Baseline:        19.0 tok/s  (52.6 ms/step, single-seq)
-PTI 4-seq:       14.6 tok/s  (64 ms/token, 0.77× baseline)
-N=4 scaling:     1.86×  (post-M5.1 loop restructure; was 1.95×)
-Reinit cost:     62% of 4-accept step time (3 × 52.6ms = 158ms)
-VGPR pressure:   27 → 63 VGPRs at N=4 (9 → 4 waves/SIMD, 44% occupancy)
-SSM sensitivity: 47% D-miss rate with 1 stale update step → speculative reinit ruled out
+Hardware:          MI50, 32 GiB HBM2, ~1 TB/s peak
+Model:             Qwen3.6-27B UD-Q6_K_XL (25 GB, 6-bit)
+Baseline:          19.0 tok/s  (52.6 ms/step, single-seq)
+PTI 2-seq (best):  16.3 tok/s  (59.5 ms/token, 0.86× baseline)
+PTI 4-seq:         14.6 tok/s  (64 ms/token, 0.77× baseline)
+N=2 scaling:       1.25×
+N=4 scaling:       1.86×  (post-M5.1 loop restructure; was 1.95×)
+Reinit cost:       62% of 4-accept step time (3 × 52.6ms = 158ms)
+VGPR pressure:     27 → 63 VGPRs at N=4 (9 → 4 waves/SIMD, 44% occupancy)
+SSM sensitivity:   47% D-miss rate with 1 stale update step → speculative reinit ruled out
+Public API ceiling: cannot exceed baseline throughput (proof: batch > 1× + (N-1) reinits = N×)
 ```
 
 ---

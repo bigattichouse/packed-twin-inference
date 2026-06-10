@@ -469,12 +469,13 @@ PTI tok/s at each stage (19 tok/s baseline):
 speculative batch reinit (1 N=4 call instead of 3 N=1 calls), which needs empirical
 validation on a hybrid SSM model. Without that, 4-seq PTI is capped at ~0.77× baseline.
 
-Optimal N without speculative reinit: **2-seq** gives best throughput at ~16.7 tok/s:
+Optimal N without speculative reinit: **2-seq** gives best throughput at ~16.7 tok/s (measured: 16.3):
 ```
-2-seq: 1 dual-decode (1.27×) + 1 reinit (1×) = 2.27× for 2 tokens → 16.7 tok/s
+2-seq: 1 dual-decode (1.25×) + 1 reinit (1×) = 2.25× for 2 tokens → 16.8 tok/s  (measured 16.3 ✓)
 3-seq: 1 triple-decode (1.71×) + 2 reinits (2×) = 3.71× for 3 tokens → 15.3 tok/s
-4-seq: 1 quad-decode (1.86×) + 3 reinits (3×) = 4.86× for 4 tokens → 14.6 tok/s (measured)
+4-seq: 1 quad-decode (1.86×) + 3 reinits (3×) = 4.86× for 4 tokens → 15.6 tok/s (measured 14.6 ✓)
 ```
+Note: all N values are below baseline (19.0 tok/s). See "Public API Ceiling Proof" in Quick Reference.
 
 ---
 
@@ -857,12 +858,33 @@ llama.cpp/
 ## Quick Reference: Key Numbers
 
 ```
-Hardware:       MI50, 32 GiB HBM2, ~1 TB/s peak, 383 GB/s measured D2D
-Model (best):   UD-Q6_K_XL, 25 GB, 19.0 tok/s baseline, MTP head present
-Weight ceiling: 254 GB/s (Q8_0 GEMV), 393 GB/s (Q5_K_M GEMV, llama.cpp)
-Overhead:       1.86× at N=4 (after M5.1 loop swap); decode reinit costs 3× per 4-accept
-Current best:   14.6 tok/s (4-seq, M5.3 multi-emit, pti_4seq.cpp) — 0.77× baseline
-Next target:    ~20 tok/s (speculative batch reinit, M5.3b)
-MFMA target:    ~35 tok/s (M5.4 + M5.3b combined)
-Path to >2×:    speculative batch reinit reduces 3 N=1 reinits → 1 N=4 reinit
+Hardware:        MI50, 32 GiB HBM2, ~1 TB/s peak, 383 GB/s measured D2D
+Model (best):    UD-Q6_K_XL, 25 GB, 19.0 tok/s baseline, MTP head present
+Weight ceiling:  254 GB/s (Q8_0 GEMV), 393 GB/s (Q5_K_M GEMV, llama.cpp)
+Overhead:        1.86× at N=4 (after M5.1 loop swap); 1.25× at N=2
+Current best:    16.3 tok/s (2-seq, pti_2seq.cpp) — 0.86× baseline
+PTI 4-seq:       14.6 tok/s (M5.3 multi-emit, pti_4seq.cpp) — 0.77× baseline
+Public API ceiling: cannot exceed baseline (proof: batch > 1× + (N-1) reinits = N×)
+Path to >baseline: requires custom fused kernel (M5.4) that amortizes weight loads
+                   AND eliminates sequential reinit (not yet demonstrated for SSM model)
 ```
+
+### Public API Ceiling Proof
+
+For any N-seq PTI with forward stagger on a hybrid SSM model:
+```
+step_cost = batch(N) + (N-1) × reinit(1)
+         ≥ (1 × baseline) + (N-1) × baseline     [batch > 1× baseline since it does more work]
+          = N × baseline
+
+tok/s = N tokens / step_cost ≤ N tokens / (N × baseline) = baseline
+```
+
+Equality would require `batch(N) = 1 × baseline` (impossible: N=2 costs 1.25×, N=4 costs 1.86×).
+Therefore PTI throughput via the public llama.cpp API is **strictly less than baseline** on this model.
+
+The only escape routes:
+1. Make `batch(N) < baseline` — impossible without a fused kernel that processes N sequences in one
+   weight-read pass (what M5.4 targets)
+2. Eliminate `(N-1)` reinit calls — requires speculative reinit to work (ruled out empirically for
+   Qwen3.6-27B SSM layers; 47% D-miss rate)
