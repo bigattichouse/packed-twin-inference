@@ -57,6 +57,7 @@ SRC             := pti_kernel.hip
 
 PTI_LLAMA  := $(BINDIR)/pti_llama
 PTI_MTP    := $(BINDIR)/pti_mtp
+PTI_2SEQ   := $(BINDIR)/pti_2seq
 PTI_4SEQ   := $(BINDIR)/pti_4seq
 PTI_SERVER := $(BINDIR)/pti_server
 PTI_DEBUG  := $(BINDIR)/pti_debug
@@ -131,6 +132,13 @@ llama-run-pti: $(PTI_LLAMA)
 
 llama-run-base: $(PTI_LLAMA)
 	$(PTI_LLAMA) -m $(TEST_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
+# ── pti_2seq: 2-sequence PTI (C++) ───────────────────────────────────────────
+2seq-2: $(PTI_2SEQ)
+
+$(PTI_2SEQ): pti_2seq.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
 
 # ── pti_mtp: 3-sequence PTI + MTP re-init (C++) ───────────────────────────────
 mtp: $(PTI_MTP)
