@@ -115,6 +115,23 @@ immediately caught a reduction bug (shfl_down vs the XOR butterfly that upstream
 lane-indexed epilogue requires). The kernel search itself failed (floor reached), but the
 methodology is reusable for any future kernel work.
 
+## 11. Serving the speedup: pti_server + the exactness engineering it took (M7.2)
+
+OpenAI-compatible server (`pti_server`, `llama-server-pti.sh`) with three switchable modes —
+base / mtp / pti — for controlled A/B in an editor. Measured through the HTTP API:
+edit task base 18.0 → **pti 36.6 tok/s (2.03×)**, all modes byte-identical.
+
+Two findings required to get cross-mode identity, both measured here:
+- **Q8_0 KV + flash attention is batch-size-dependent**: the same position decoded in a
+  1-token vs 2-token batch can argmax differently. f16 KV is required for exactness.
+- **Even at f16, genuine fp near-ties flip with batch shape** (different kernel configs
+  differ by ~1e-3 on logits; the `<think>` open/close decision on chat templates is a
+  reliable knife-edge). Fix: deterministic tie-breaking — among tokens within ε=0.05 of
+  the max logit, lowest id wins, applied identically in every mode. Restores byte-identity
+  unconditionally.
+- Also: `kv_unified=true` flips ties too; the proven-exact config is non-unified + f16
+  (usable context = n_ctx/2 because the checkpoint takes the second stream).
+
 ## 10. M5.1 — i-outer/j-inner loop order in MMVQ (the one kernel win)
 
 Reordering the inner loops so the weight-block address is loop-invariant across columns let

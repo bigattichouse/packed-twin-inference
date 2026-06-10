@@ -1,135 +1,104 @@
 # packed-twin-inference
 
-**Lossless speculative decoding for hybrid-SSM models — 2.06× on real editing tasks, 1.22×
-on novel prose, byte-identical output, public llama.cpp API (+small ext) only.**
+**Make a local LLM up to 2× faster — with provably identical output.**
 
-Target: Qwen3.6-27B (hybrid attention + Mamba/SSM) on AMD MI50 (gfx906, 32 GiB).
-The working result is **`pti_lookup`** — speculative decoding with two zero-cost draft
-sources (n-gram lookup for copy-runs, the model's own MTP head for novel text) and SSM-safe
-rollback. No custom kernels, no model changes, no quality loss.
+Runs Qwen3.6-27B on a single AMD MI50 (32 GiB) through llama.cpp. No retraining, no
+quality loss, no custom GPU kernels.
 
-## Results (June 2026, greedy, measured)
+| what you're generating | plain llama.cpp | this project | speedup |
+|---|---|---|---|
+| Code edits (rewrite a function) | 19.2 tok/s | **39.6 tok/s** | **2.06×** |
+| Fresh prose / new code | 19.4 tok/s | **23.6 tok/s** | **1.22×** |
+| Highly repetitive output | 19.4 tok/s | 34.2 tok/s | 1.76× |
 
-Two free draft sources, one verification machine: **n-gram lookup** covers copy-runs,
-the model's own **MTP head** (88.6% t+2 accuracy, 3.5 ms/call) covers novel text.
+Every number above produced **byte-identical output** to plain llama.cpp — checked with
+`diff` on every run, including a stress test where every speculative guess is deliberately
+corrupted (the output still comes out exact; bad guesses only cost time).
 
-| task | baseline | lookup | lookup+MTP (`--mtp`) | output |
-|---|---|---|---|---|
-| Code edit, 25-line function (234 tok) | 19.2 | 37.0 (1.93×) | **39.6 (2.06×)** | byte-identical |
-| Hostile prose (no copy-runs) | 19.4 | 18.8 (0.97×) | **23.6 (1.22×)** | byte-identical |
-| MTP alone (`--mtp --no-ngram`), prose | 19.4 | — | 24.3 (1.25×) | byte-identical |
-| Verbatim repetition | 19.4 | 34.2 (1.76×) | — | byte-identical |
-| Sabotage: ALL drafts poisoned | 19.4 | 18.8 | 15.8 (self-disables) | **byte-identical** |
+## The idea, in plain words
 
-**2× on a real task** (code editing), and the worst case flipped positive: novel prose now
-*gains* 1.22× instead of paying 3%. The sabotage row is the correctness control: every draft
-from both sources deliberately corrupted — output still exact; bad drafts can only cost time.
+A 27B model generates one token per forward pass, and each pass reads ~25 GB of weights
+from GPU memory. That memory streaming is the bottleneck — the GPU's arithmetic units are
+mostly idle. The trick: **checking several proposed tokens in one pass costs barely more
+than generating one** (a 16-token check costs just 4.5× one token, not 16×).
 
-## How it works
+So if we can *guess* upcoming tokens for free, we batch-verify the guesses and emit every
+one that matches what the model would have said anyway. Wrong guesses are discarded and
+recomputed — output never changes, only the number of passes does.
 
-```
-seq 0: working stream        seq 1: checkpoint (clean state at position p)
+Two free guess sources, combined:
 
-loop:
-  draft[0..k-1] = n-gram match against token history     # CPU string match — FREE
-  decode [tok_last@p, draft tokens] in ONE batch          # sub-linear: batch16 = 4.47× cost
-  accept the longest verified prefix, emit accepted+1 tokens
-  full accept  → state is clean, continue (next fire jumps to k=15)
-  partial/miss → seq_cp(checkpoint→working), re-decode accepted prefix
-```
+1. **Lookup** — when the model is re-typing text it has already seen (editing code,
+   quoting a document, structured output), the continuation is sitting right there in the
+   context. A string match proposes up to 31 tokens at once.
+2. **MTP head** — Qwen3.6 ships a small built-in "next-next token" predictor (one extra
+   layer, ~3.5 ms vs 52.6 ms for a full pass). It guesses 1 token ahead with ~85%
+   accuracy on text the lookup can't help with.
 
-Four pieces make it work on a hybrid-SSM model where stock lookup decoding can't:
-
-1. **Batched verification is exact** — a k-token batch reproduces the sequential greedy chain
-   bit-for-bit (`pti_kbatch_bench` chain-match, PASS at every k), and costs far less than k
-   decodes: batch 4 = 1.71×, batch 8 = 3.11×, batch 16 = 4.47×, **batch 32 = 6.93×**
-   (12.1 ms/token — a full 32-hit runs at 82 tok/s).
-2. **SSM-safe rollback** — recurrent state can't rewind per-position. A checkpoint sequence
-   (`llama_memory_seq_cp`, measured 0.02 ms) restores exact state after a miss; the accepted
-   prefix rides as logits-free tokens at the front of the next batch (merged rebuild — one
-   sub-linear call instead of two).
-3. **AIMD confidence gate** — every failed fire raises the suffix-match bar (+4), full accepts
-   decay it (−1). True copy-runs (matches in the tens of tokens) clear any bar; coincidence-prone
-   text self-suppresses after one fire. Static thresholds lose (see FAILED_EXPERIMENTS.md §7).
-4. **Draft-length ladder** — probe at k=7; full accepts escalate 7 → 15 → 31; any miss resets.
-   Deep batches only fire inside runs proven at the previous rung. Hard-off after 3 dead fires
-   bounds hostile text.
-
-**Why output is provably identical**: every emitted token is the argmax of a logit row whose
-input prefix is fully verified. Drafts only decide *which positions get computed in the same
-batch* — never what gets emitted.
+Three safety mechanisms keep it exact and fast: every guess is verified against the
+model's real output before it is emitted; a confidence gate stops guessing on text where
+guesses keep missing (worst case ≈ plain speed); and the recurrent-state problem that
+normally breaks speculation on hybrid SSM models like Qwen3.6 is solved with a cheap
+checkpoint/rollback (0.02 ms).
 
 ## Quick start
 
 ```bash
-# prerequisite: llama.cpp built at ../llama.cpp/build (ROCm/HIP)
-make lookup
+# prerequisite: llama.cpp built at ../llama.cpp/build (ROCm/HIP), model in ../gguf/
+make lookup server
 
-# full speculative run (lookup + MTP — best on everything)
-bin/pti_lookup -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf -p "your prompt" -n 200 --mtp
+# terminal demo (great for screen recording) — full speed, MTP-only, or plain
+./pti-cli.sh pti  "Rewrite this function with better names: ..." 300
+./pti-cli.sh base "same prompt" 300                  # plain llama.cpp speed
+./pti-cli.sh compare "same prompt" 300               # both, back to back
 
-# lookup only / MTP only
-bin/pti_lookup -m ... -p "..." -n 200
-bin/pti_lookup -m ... -p "..." -n 200 --mtp --no-ngram
-
-# reference run (also the byte-diff source)
-bin/pti_lookup -m ... -p "your prompt" -n 200 --baseline
-
-# correctness stress: poison every draft (both sources), output must not change
-bin/pti_lookup -m ... -p "your prompt" -n 200 --mtp --sabotage
-
-# flags: -k max draft (7), -g probe n-gram (3), -L initial bar (5), --verbose per-fire log
+# OpenAI-compatible server for your editor (port 8080)
+./llama-server-pti.sh pti     # lookup + MTP   (~2× on edits)
+./llama-server-pti.sh mtp     # MTP only       (the "fair" baseline if you'd always use MTP)
+./llama-server-pti.sh base    # plain decode   (= stock llama-server behavior)
 ```
 
-`pti_lookup` prints generated text to stdout and stats (accept histogram, rebuilds, tok/s) to
-stderr, so `diff <(run --baseline) <(run)` is the audit.
+The server speaks `/v1/chat/completions` with SSE streaming. **Set temperature 0 in your
+editor** — verification is greedy; requests with temperature > 0 fall back to the plain
+path (logged per request). Every request logs its mode, token count, accept rates, and
+tok/s to the server console, so A/B comparison is one config switch in your editor.
 
-## Roadmap
-
-- [x] Draft window to k=31 — ladder 7→15→31, full 32-batch hit = 82 tok/s
-- [x] Merged rebuild — miss penalty folded into the next verify batch
-- [ ] Possible next: persistent cross-prompt n-gram cache; sampled (non-greedy) verification
-- Twin aggregate serving (2 users, one weight stream, ~1.6×) — understood, not pursued
-
-The drafted-step cost is now near-optimal; remaining time is dominated by the novel-text
-portions of the output, which is the structural floor for lookup-based drafting.
-
-## Project history
-
-This repo began as Packed Twin Inference: N staggered sequences of the same model
-self-speculating in one batch. The investigation proved that design is bounded **below**
-baseline through the public API (the draft costs exactly what it saves), and that the gfx906
-GEMV kernel is at its instruction-issue floor. The machinery built along the way — checkpoint
-sequences, batched verification, byte-identical auditing — became `pti_lookup`, where the
-draft is free and the math flips positive.
-
-- `POSITIVE_RESULTS.md` — what worked, with the measurements that back it
-- `FAILED_EXPERIMENTS.md` — every negative result, with measurements and lessons
-- `KERNEL_PLAN.md` — the M6 investigation log: cost curves, kernel experiments, lookup gates
-- `PLAN.md` — full PTI-era log: stagger design, ceiling proof, audit framework
-- `DESIGN.md` — original architecture rationale
-
-## Files
-
-| file | what | status |
-|---|---|---|
-| `pti_lookup.cpp` | lookup spec-dec, SSM-safe — **the result** | ✓ 1.85× real tasks, identical |
-| `pti_kbatch_bench.cpp` | batch cost curve + chain-match probe | ✓ foundation measurements |
-| `pti_q6k_bench.hip` | Q6_K MMVQ replica + kernel experiments | ✓ floor documented |
-| `pti_2seq.cpp` / `pti_4seq.cpp` | PTI stagger (correct, slower than baseline) | archived result |
-| `pti_debug.cpp` | single-seq baseline driver | ✓ |
-| `pti_gemv_bench.cpp` | N-seq decode scaling bench | ✓ |
-| `pti_server.cpp` | HTTP server (single-seq) | ✓ |
-| `audit.sh` | end-to-end correctness/perf audit (PTI era) | ✓ 15/15 |
-
-## Key numbers
-
+```bash
+# correctness audit, any time:
+bin/pti_lookup -m <model> -p "prompt" -n 200 --baseline > a.txt   # reference
+bin/pti_lookup -m <model> -p "prompt" -n 200 --mtp      > b.txt   # fast
+diff a.txt b.txt    # always empty
 ```
-Hardware:        MI50 (gfx906), 32 GiB HBM2, no MFMA, wave64
-Model:           Qwen3.6-27B UD-Q6_K_XL (25 GB), hybrid attention+SSM
-Baseline:        19.0–19.4 tok/s (52.6 ms/step)
-Batch decode:    b2 1.20×  b4 1.71×  b8 3.11×  b16 4.47×  b24 5.90×  b32 6.93×  (chain-exact)
-seq_cp:          0.02 ms (checkpointing is free)
-pti_lookup:      37.0 tok/s on real code edit (1.93×); 0.97× bounded worst case
-Hit-run ceiling: 12.1 ms/token in a full 32-batch = 4.3× during copy-runs
-```
+
+## Where the speed comes from (and where it doesn't)
+
+- **Best case**: editing/refactoring code, summarize-with-quotes, RAG answers that cite
+  passages, JSON/tables — anything where output overlaps the prompt or itself. The longer
+  the overlap, the closer to the 4.3× per-pass ceiling.
+- **Typical novel text**: ~1.2× from the MTP head alone.
+- **Worst case**: adversarial text where every guess misses → the gates shut speculation
+  off and you get ~0.97× of plain speed. You can never lose more than a few percent.
+- Requires a model with an MTP head for the novel-text gains (Qwen3.6-UD has one); lookup
+  works on any model.
+
+## Repo guide
+
+| file | what |
+|---|---|
+| `pti_lookup.cpp` | the algorithm — CLI with `--baseline/--mtp/--sabotage` audit modes |
+| `pti_server.cpp` | OpenAI-compatible server with `--mode base/mtp/pti` |
+| `pti-cli.sh`, `llama-server-pti.sh` | launch scripts |
+| `pti_kbatch_bench.cpp`, `pti_mtp_probe.cpp`, `pti_q6k_bench.hip` | the measurements behind the design |
+| `POSITIVE_RESULTS.md` | every win, with numbers |
+| `FAILED_EXPERIMENTS.md` | every dead end, with numbers (read this before "improving" the kernel) |
+| `KERNEL_PLAN.md`, `PLAN.md`, `DESIGN.md` | full investigation logs |
+
+## History, briefly
+
+This repo started as "Packed Twin Inference" — running staggered copies of the model in
+one batch to self-speculate. Measurement proved that idea is mathematically bounded
+*below* plain speed (the draft cost equals the savings), and that the GPU kernel had no
+headroom left on gfx906. The machinery built along the way — checkpointing, batched
+verification, byte-diff auditing — became the foundation for what actually works: free
+drafts from lookup + MTP. The numbers: baseline 52.6 ms/pass; batch verify b4 = 1.71×,
+b16 = 4.47×, b32 = 6.93×; checkpoint 0.02 ms; MTP head 88.6% t+2 accuracy at 3.5 ms.

@@ -1,0 +1,31 @@
+Here is a Python function:
+
+def analyze_log_file(path, level_filter, max_lines):
+    counts = {"ERROR": 0, "WARN": 0, "INFO": 0, "DEBUG": 0}
+    matched_entries = []
+    line_number = 0
+    with open(path, "r") as handle:
+        for raw_line in handle:
+            line_number += 1
+            if line_number > max_lines:
+                break
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split(" ", 2)
+            if len(parts) < 3:
+                continue
+            timestamp, level, message = parts
+            if level not in counts:
+                continue
+            counts[level] += 1
+            if level_filter is None or level == level_filter:
+                matched_entries.append({
+                    "line": line_number,
+                    "timestamp": timestamp,
+                    "level": level,
+                    "message": message,
+                })
+    return counts, matched_entries
+
+Rewrite this function exactly as-is, but rename the variable 'counts' to 'level_counts'. Output only the code.
