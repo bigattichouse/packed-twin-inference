@@ -62,14 +62,25 @@ Past states are all *behind*. A ring buffer of history cannot provide forward st
 
 ---
 
-## 5. MTP head as a bonus-token source
+## 5. ~~MTP head as a bonus-token source~~ — **CONCLUSION OVERTURNED by M7.0**
 
 The UD-Q6_K_XL model ships a Multi-Token-Prediction head (`nextn_predict_layers=1`).
-**Hypothesis**: use it to add a free 5th token per step.
-**Reality**: the head takes `(tok_t, h_t)` and predicts t+1 — the same position the main model's
-logits already cover. It is not a next-next predictor; chaining it requires `h_{t+1}`, which
-needs a full pass anyway. **Lesson**: verify what an auxiliary head actually predicts before
-planning around it.
+**Original claim (analytical)**: the head takes `(tok_t, h_t)` and predicts t+1 — redundant
+with the main logits, not a next-next predictor.
+
+**What was actually wrong**: that conclusion came from reading the graph wiring, which is
+input-agnostic. The same wiring fed with the *just-emitted* token (DeepSeek-V3 semantics) is
+a t+2 drafter. Never tested empirically — until M7.0 (`pti_mtp_probe`, 2026-06-10):
+
+```
+Variant A (same-index → t+1):  72.7%   not ~99% ⇒ NOT a redundant output head
+Variant B (shifted    → t+2):  88.6%   ⇒ genuine next-next drafter, 3.5 ms/call
+```
+
+**Real lesson (replaces the old one)**: an analytical reading of graph wiring cannot determine
+what a head predicts — the input convention decides, and only an empirical probe settles it.
+The probe cost ~30 minutes; the wrong conclusion sat unchallenged for weeks because it was
+never promoted from "analysis" to "measurement." See POSITIVE_RESULTS.md and KERNEL_PLAN.md M7.
 
 ---
 

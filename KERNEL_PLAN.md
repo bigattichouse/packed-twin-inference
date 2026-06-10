@@ -321,7 +321,29 @@ lookup-based drafting.
 5. The residual ~0.04 parity gap is the cost of the single probe fire — acceptable; a
    cross-step persistent-suppression flag could reclaim it if needed.
 
-### M6.5 — Twin aggregate serving (Path B)
+### M7.0 — MTP head semantics probe — **DONE: head is a t+2 drafter (old analysis wrong)**
+
+The Phase-3 analysis concluded the `nextn_predict_layers=1` head predicts t+1 (redundant).
+That was an analytical reading of input-agnostic graph wiring, never run. `pti_mtp_probe`
+measures both input conventions over a 150-token greedy chain (hostile prose):
+
+```
+Variant A (same-index:  consumed tok @ p,  h(p)) vs t+1:  72.7%
+Variant B (shifted:     emitted tok @ p+1, h(p)) vs t+2:  88.6%   ← DeepSeek semantics
+MTP call: 3.50 ms mean (1-layer decode + logits)
+```
+
+B ≫ A and A ≪ 99% ⇒ the head was trained shifted: it is a genuine next-next drafter at
+**88.6% accuracy on novel text** — and that is a lower bound (no MTP prompt-prefill in the
+probe). Economics at b=2 verify (1.20×): breakeven accept ≈ 20%. We have 88.6%.
+
+**M7.1 — integration (2×2 matrix)**: `--mtp` adds MTP 1-token drafts on steps where the
+n-gram has no fire (novel text); `--no-ngram` isolates MTP alone. Cells: base, base+MTP,
+lookup, lookup+MTP. MTP misses ride the existing merged-rebuild pending path; sabotage must
+stay byte-identical. Projected: hostile prose 18.8 → ~25–26 tok/s (1.3×); the edit task's
+novel-text half accelerates on top of the copy-run gains.
+
+### M6.5 — Twin aggregate serving (Path B) — declined by user, not pursued
 
 - 2 independent prompts, 1 seq each, one decode per step, aggregate tok/s vs 2× sequential baseline.
 - **Gate**: ≥1.6× aggregate today (sanity: implied by N=2 = 1.25×); ≥1.7× post-kernel.

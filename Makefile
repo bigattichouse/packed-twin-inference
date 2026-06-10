@@ -203,6 +203,15 @@ $(PTI_LOOKUP): pti_lookup.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
 	@echo "Built $@"
 
+# ── pti_mtp_probe: M7.0 MTP head semantics probe ─────────────────────────────
+PTI_MTPPROBE := $(BINDIR)/pti_mtp_probe
+
+mtpprobe: $(PTI_MTPPROBE)
+
+$(PTI_MTPPROBE): pti_mtp_probe.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
+
 # ── pti_kbatch_bench: M6.0 k-token batch cost curve ──────────────────────────
 kbench: $(PTI_KBENCH)
 
