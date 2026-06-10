@@ -337,11 +337,28 @@ B ≫ A and A ≪ 99% ⇒ the head was trained shifted: it is a genuine next-nex
 **88.6% accuracy on novel text** — and that is a lower bound (no MTP prompt-prefill in the
 probe). Economics at b=2 verify (1.20×): breakeven accept ≈ 20%. We have 88.6%.
 
-**M7.1 — integration (2×2 matrix)**: `--mtp` adds MTP 1-token drafts on steps where the
-n-gram has no fire (novel text); `--no-ngram` isolates MTP alone. Cells: base, base+MTP,
-lookup, lookup+MTP. MTP misses ride the existing merged-rebuild pending path; sabotage must
-stay byte-identical. Projected: hostile prose 18.8 → ~25–26 tok/s (1.3×); the edit task's
-novel-text half accelerates on top of the copy-run gains.
+**M7.1 — integration (2×2 matrix) — DONE (2026-06-10)**: `--mtp` adds MTP 1-token drafts on
+steps where the n-gram has no fire (novel text); `--no-ngram` isolates MTP alone. MTP misses
+ride the merged-rebuild pending path; MTP fires are excluded from the AIMD bar; self-disable
+guard if live accept <30% after 10 fires.
+
+```
+                       hostile prose        long code edit (234 tok)
+base                   19.4                 19.2
+base+MTP               24.3  (1.25×)        —
+lookup                 18.8  (0.97×)        37.0  (1.93×)
+lookup+MTP             23.6  (1.22×)        39.6  (2.06×)   ← 2× on a real task
+all cells byte-identical; sabotage of BOTH draft sources: identical, MTP self-disables
+```
+
+**Bug found during integration**: multi-token batches in the MTP context produce garbage
+(~48% live accept vs 88.6% probe — alternating good/bad candidates exactly matching
+"2-pair feeds corrupt"). The probe and pti_mtp.cpp had only ever fed 1-token MTP batches.
+Workaround: feed only the LAST emitted pair each step (flat 3.5 ms; cache gaps at multi-emit
+positions cost ~4 accept points: 87% → 83%). Root-cause fix in the llama-ext MTP graph is
+open work; a proper fix recovers ~4% accept and removes the gap caveat.
+
+Live MTP accept rates: 83–87% on novel prose, 81% on edit-task novel segments.
 
 ### M6.5 — Twin aggregate serving (Path B) — declined by user, not pursued
 

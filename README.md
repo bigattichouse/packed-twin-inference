@@ -1,27 +1,29 @@
 # packed-twin-inference
 
-**Lossless speculative decoding for hybrid-SSM models — 1.85× on real editing tasks,
-byte-identical output, public llama.cpp API only.**
+**Lossless speculative decoding for hybrid-SSM models — 2.06× on real editing tasks, 1.22×
+on novel prose, byte-identical output, public llama.cpp API (+small ext) only.**
 
 Target: Qwen3.6-27B (hybrid attention + Mamba/SSM) on AMD MI50 (gfx906, 32 GiB).
-The working result is **`pti_lookup`** — n-gram lookup speculative decoding with SSM-safe
+The working result is **`pti_lookup`** — speculative decoding with two zero-cost draft
+sources (n-gram lookup for copy-runs, the model's own MTP head for novel text) and SSM-safe
 rollback. No custom kernels, no model changes, no quality loss.
 
 ## Results (June 2026, greedy, measured)
 
-| task | baseline | pti_lookup | ratio | output |
-|---|---|---|---|---|
-| Code edit, 25-line function (234 tok) | 19.2 | **37.0** | **1.93×** | byte-identical |
-| Code edit, short function (93 tok) | 19.4 | 29.9 | 1.54× | byte-identical |
-| Verbatim repetition (best case) | 19.4 | 34.2 | 1.76× | byte-identical |
-| Hostile prose (worst case) | 19.4 | 18.8 | 0.97× | byte-identical |
-| Sabotage: 100% poisoned drafts | 19.4 | 18.8 | 0.97× | **byte-identical** |
+Two free draft sources, one verification machine: **n-gram lookup** covers copy-runs,
+the model's own **MTP head** (88.6% t+2 accuracy, 3.5 ms/call) covers novel text.
 
-The speedup comes from **copy-runs** — spans the model re-emits from the prompt or its own
-output. Editing, refactoring, summarize-with-quotes, RAG answers quoting passages, structured
-output: real gains that grow with output length. Novel free-form prose: no gain, bounded ~4%
-loss. The sabotage row is the correctness control: every draft deliberately corrupted, output
-still exact (slower is the only penalty bad drafts can inflict).
+| task | baseline | lookup | lookup+MTP (`--mtp`) | output |
+|---|---|---|---|---|
+| Code edit, 25-line function (234 tok) | 19.2 | 37.0 (1.93×) | **39.6 (2.06×)** | byte-identical |
+| Hostile prose (no copy-runs) | 19.4 | 18.8 (0.97×) | **23.6 (1.22×)** | byte-identical |
+| MTP alone (`--mtp --no-ngram`), prose | 19.4 | — | 24.3 (1.25×) | byte-identical |
+| Verbatim repetition | 19.4 | 34.2 (1.76×) | — | byte-identical |
+| Sabotage: ALL drafts poisoned | 19.4 | 18.8 | 15.8 (self-disables) | **byte-identical** |
+
+**2× on a real task** (code editing), and the worst case flipped positive: novel prose now
+*gains* 1.22× instead of paying 3%. The sabotage row is the correctness control: every draft
+from both sources deliberately corrupted — output still exact; bad drafts can only cost time.
 
 ## How it works
 
@@ -63,14 +65,18 @@ batch* — never what gets emitted.
 # prerequisite: llama.cpp built at ../llama.cpp/build (ROCm/HIP)
 make lookup
 
-# speculative run
-bin/pti_lookup -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf -p "your prompt" -n 200
+# full speculative run (lookup + MTP — best on everything)
+bin/pti_lookup -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf -p "your prompt" -n 200 --mtp
+
+# lookup only / MTP only
+bin/pti_lookup -m ... -p "..." -n 200
+bin/pti_lookup -m ... -p "..." -n 200 --mtp --no-ngram
 
 # reference run (also the byte-diff source)
 bin/pti_lookup -m ... -p "your prompt" -n 200 --baseline
 
-# correctness stress: poison every draft, output must not change
-bin/pti_lookup -m ... -p "your prompt" -n 200 --sabotage
+# correctness stress: poison every draft (both sources), output must not change
+bin/pti_lookup -m ... -p "your prompt" -n 200 --mtp --sabotage
 
 # flags: -k max draft (7), -g probe n-gram (3), -L initial bar (5), --verbose per-fire log
 ```

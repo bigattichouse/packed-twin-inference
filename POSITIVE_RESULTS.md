@@ -25,6 +25,26 @@ token. A string match costs nothing, so every accepted draft is pure profit.
 The real-task accept histogram is the strongest evidence it does real work: on the rename-edit
 task, 8 full 7-token accepts on unchanged lines and exactly 2 misses — at the two rename points.
 
+## 1b. MTP head drafting — 2.06× on real tasks, novel text flipped positive (M7)
+
+The model's `nextn` head, probed empirically (M7.0), is a **t+2 drafter at 88.6%** when fed
+the just-emitted token — overturning the earlier analytical conclusion (FAILED_EXPERIMENTS §5).
+One MTP call = 3.5 ms vs 52.6 ms full pass. Integrated as the novel-text draft source
+(lookup keeps copy-runs):
+
+```
+                  hostile prose      long code edit
+lookup            18.8  (0.97×)      37.0  (1.93×)
+lookup+MTP        23.6  (1.22×)      39.6  (2.06×)    ← 2× on a real task
+MTP alone         24.3  (1.25×)      —
+```
+
+All byte-identical, including sabotage of both draft sources (MTP self-disables via its
+<30%-accept guard). Live MTP accept: 81–87%. Caveat discovered: multi-token batches in the
+MTP context produce garbage (≈48% live accept, alternating pattern) — worked around with
+last-pair-only feeds (flat 3.5 ms/step, −4 accept points); root-cause fix in the ext graph
+is open.
+
 ## 2. Batched verification is EXACT on a hybrid-SSM model, and sub-linear in cost
 
 `pti_kbatch_bench` chain-match: a k-token single-sequence batch reproduces the sequential

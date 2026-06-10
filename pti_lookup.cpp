@@ -40,6 +40,7 @@
  */
 
 #include "../llama.cpp/include/llama.h"
+#include "../llama.cpp/src/llama-ext.h"   // pre-norm hidden access for MTP (M7.1)
 
 #include <cstdio>
 #include <cstdlib>
@@ -113,6 +114,41 @@ static int ngram_draft(const llama_token *hist, int n_hist,
     return 0;
 }
 
+// ── MTP feed + predict (M7.1) ─────────────────────────────────────────────────
+// Feeds the MTP context one batch of (emitted token @ q, h(q-1)) pairs to keep
+// its 1-layer attention cache contiguous over the emitted stream, with logits
+// on the last pair → candidate for the position after the last emitted token.
+// Returns -1 on failure (caller simply drafts nothing).
+static llama_token mtp_feed(
+        llama_context *ctx_mtp,
+        llama_context *ctx_main,
+        struct llama_batch *mb,            // pre-allocated, embd-capable
+        const llama_token *toks,           // emitted tokens
+        const int         *h_idx,          // their logits batch indices in ctx_main
+        llama_pos          pos0,           // position of toks[0]
+        int                n,
+        int32_t            n_embd,
+        int32_t            n_vocab)
+{
+    if (!ctx_mtp || n <= 0) return -1;
+    mb->n_tokens = 0;
+    for (int j = 0; j < n; j++) {
+        const float *h = llama_get_embeddings_pre_norm_ith(ctx_main, h_idx[j]);
+        if (!h) return -1;
+        mb->token[j]     = toks[j];
+        mb->pos[j]       = pos0 + j;
+        mb->n_seq_id[j]  = 1;
+        mb->seq_id[j][0] = 0;
+        mb->logits[j]    = (j == n - 1) ? 1 : 0;
+        memcpy(mb->embd + (size_t)j * n_embd, h, (size_t)n_embd * sizeof(float));
+        mb->n_tokens++;
+    }
+    if (llama_decode(ctx_mtp, *mb) != 0) return -1;
+    float *logits = llama_get_logits_ith(ctx_mtp, n - 1);
+    if (!logits) return -1;
+    return (llama_token)argmax_f(logits, n_vocab);
+}
+
 struct LookupArgs {
     int  max_new      = 120;
     int  n_gpu_layers = 99;
@@ -123,6 +159,8 @@ struct LookupArgs {
     bool baseline     = false;
     bool sabotage     = false;
     bool verbose      = false;
+    bool use_mtp      = false;  // M7.1: MTP t+2 draft on novel-text steps (88.6% probe)
+    bool no_ngram     = false;  // disable lookup (isolates MTP: the base+MTP cell)
     char model_path[512] = {};
     char prompt[4096]    = {};
 };
@@ -147,6 +185,28 @@ static int run_lookup(const LookupArgs *args) {
     struct llama_context *ctx = llama_init_from_model(model, cparams);
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return 1; }
     llama_memory_t mem = llama_get_memory(ctx);
+
+    // ── MTP draft context (M7.1) ─────────────────────────────────────────────
+    // The nextn head, fed (emb(emitted tok @ q), h(q-1)), predicts q+1 at
+    // 88.6% (M7.0 probe). One 1-layer decode ≈ 3.5 ms vs 52.6 ms full pass.
+    struct llama_context *ctx_mtp = nullptr;
+    int32_t n_embd = llama_model_n_embd(model);
+    if (args->use_mtp && !args->baseline) {
+        llama_set_embeddings_pre_norm(ctx, true, false);
+        struct llama_context_params mp = llama_context_default_params();
+        mp.n_ctx     = DEFAULT_CTX * 2;
+        mp.n_batch   = DEFAULT_CTX;
+        mp.n_seq_max = 1;
+        mp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_mtp = llama_init_from_model(model, mp);
+        if (ctx_mtp) {
+            llama_set_embeddings_pre_norm(ctx_mtp, true, true);
+            fprintf(stderr, "MTP draft context: active\n");
+        } else {
+            fprintf(stderr, "MTP draft context: UNAVAILABLE (no nextn head?) — continuing without\n");
+        }
+    }
 
     static llama_token hist[MAX_TOKENS];
     int n_hist = llama_tokenize(vocab, args->prompt, (int32_t)strlen(args->prompt),
@@ -177,6 +237,18 @@ static int run_lookup(const LookupArgs *args) {
     int n_steps = 0, n_drafted_steps = 0, n_rebuilds = 0;
     int n_accept_hist[MAX_DRAFT + 2] = {};   // index = accepted drafts in a drafted step
     int n_draft_tok = 0, n_draft_acc = 0;
+    int n_mtp_fire = 0, n_mtp_acc = 0;
+
+    // MTP state: candidate predicting the token after tok_last (M7.1)
+    struct llama_batch mtp_batch = {};
+    llama_token mtp_cand = -1;
+    if (ctx_mtp) {
+        mtp_batch = llama_batch_init(MAX_DRAFT + 40, n_embd, 1);
+        mtp_batch.token = (llama_token *)malloc((MAX_DRAFT + 40) * sizeof(llama_token));
+        // seed: (tok_last @ p, h of prefill's last token) → candidate for p+1
+        int h0 = batch.n_tokens - 1;
+        mtp_cand = mtp_feed(ctx_mtp, ctx, &mtp_batch, &tok_last, &h0, p, 1, n_embd, n_vocab);
+    }
 
     double t_start = now_sec();
 
@@ -222,10 +294,21 @@ static int run_lookup(const LookupArgs *args) {
         int n_pend  = 0;
         while (n_gen < args->max_new && !llama_vocab_is_eog(vocab, tok_last)) {
             llama_token draft[MAX_DRAFT];
-            int k = (n_zero >= 3) ? 0
+            int k = (args->no_ngram || n_zero >= 3) ? 0
                   : ngram_draft(hist, n_hist, args->ngram_g, L_dyn, k_cur, draft);
+
+            // MTP fallback (M7.1): novel-text step, no n-gram fire → 1-token
+            // t+2 draft (88.6% probe accuracy). Disable if it proves <30%.
+            bool mtp_fired = false;
+            if (k == 0 && ctx_mtp && mtp_cand != -1
+                && !(n_mtp_fire >= 10 && n_mtp_acc * 10 < n_mtp_fire * 3)) {
+                draft[0] = mtp_cand;
+                k = 1;
+                mtp_fired = true;
+            }
+
             if (k + 1 > args->max_new - n_gen) k = args->max_new - n_gen - 1;
-            if (k < 0) k = 0;
+            if (k < 0) { k = 0; mtp_fired = false; }
             if (args->sabotage) {
                 for (int i = 0; i < k; i++) draft[i] = (draft[i] + 1) % n_vocab;
             }
@@ -272,7 +355,11 @@ static int run_lookup(const LookupArgs *args) {
                 if (i < k && draft[i] != a) break;   // a is the correction; rest invalid
             }
             int acc = e - 1;                          // accepted drafts this step
-            if (k > 0) {
+            if (k > 0 && mtp_fired) {
+                // MTP fires tracked separately — they must not move the AIMD bar
+                n_mtp_fire++;
+                n_mtp_acc += acc;
+            } else if (k > 0) {
                 n_accept_hist[acc < MAX_DRAFT+1 ? acc : MAX_DRAFT+1]++;
                 n_draft_acc += acc;
                 if (acc == k) {
@@ -285,7 +372,25 @@ static int run_lookup(const LookupArgs *args) {
                 }
             }
             if (args->verbose && k > 0)
-                fprintf(stderr, "\n[draft k=%d acc=%d L_dyn=%d k_cur=%d pend=%d]", k, acc, L_dyn, k_cur, n_pend);
+                fprintf(stderr, "\n[%s k=%d acc=%d L_dyn=%d k_cur=%d pend=%d]",
+                        mtp_fired ? "mtp" : "draft", k, acc, L_dyn, k_cur, n_pend);
+
+            // MTP cache feed + next candidate (M7.1): pair each emitted token
+            // a_j (at position p+1+j) with its source hidden state h(p+j) from
+            // logits index base+j. Must run before the next main-ctx decode
+            // overwrites the pre-norm buffer.
+            if (ctx_mtp && !stop) {
+                // Single-pair feed, LAST emitted token only (flat 3.5 ms/step).
+                // Multi-token MTP batches are broken (~48% accept vs 88.6% probe
+                // — graph issue at n_tokens>1; probe/pti_mtp only ever fed one).
+                // Per-pair sequential feeds match the probe but cost e×3.5 ms —
+                // fatal on 32-token copy-run accepts. Last-pair-only leaves
+                // position gaps in the MTP cache for multi-emit steps; the
+                // probe already showed the head tolerates missing history.
+                int h_idx = base + e - 1;
+                mtp_cand = mtp_feed(ctx_mtp, ctx, &mtp_batch,
+                                    &tok_last, &h_idx, p + e, 1, n_embd, n_vocab);
+            }
 
             if (stop) { p += e; break; }
 
@@ -312,14 +417,20 @@ static int run_lookup(const LookupArgs *args) {
     double elapsed = now_sec() - t_start;
 
     fprintf(stderr, "\n\n════════════════════════════════════════════════════\n");
-    fprintf(stderr, "  PTI-lookup results (%s%s)\n",
-            args->baseline ? "baseline" : "lookup", args->sabotage ? "+sabotage" : "");
+    fprintf(stderr, "  PTI-lookup results (%s%s%s%s)\n",
+            args->baseline ? "baseline" : (args->no_ngram ? "mtp-only" : "lookup"),
+            (!args->baseline && args->use_mtp && !args->no_ngram) ? "+mtp" : "",
+            args->sabotage ? "+sabotage" : "",
+            (args->use_mtp && !ctx_mtp) ? " [MTP UNAVAILABLE]" : "");
     fprintf(stderr, "  Tokens generated:   %d\n", n_gen);
     fprintf(stderr, "  Decode steps:       %d  (%.2f tok/step)\n", n_steps, (double)n_gen / n_steps);
     if (!args->baseline) {
         fprintf(stderr, "  Drafted steps:      %d / %d\n", n_drafted_steps, n_steps);
         fprintf(stderr, "  Draft tokens:       %d proposed, %d accepted (%.0f%%)\n",
                 n_draft_tok, n_draft_acc, n_draft_tok ? 100.0 * n_draft_acc / n_draft_tok : 0.0);
+        if (ctx_mtp)
+            fprintf(stderr, "  MTP fires:          %d, accepted %d (%.0f%%)\n",
+                    n_mtp_fire, n_mtp_acc, n_mtp_fire ? 100.0 * n_mtp_acc / n_mtp_fire : 0.0);
         fprintf(stderr, "  Rebuilds (miss):    %d\n", n_rebuilds);
         fprintf(stderr, "  Accept histogram:   ");
         for (int i = 0; i <= MAX_DRAFT; i++)
@@ -330,6 +441,12 @@ static int run_lookup(const LookupArgs *args) {
     fprintf(stderr, "════════════════════════════════════════════════════\n");
 
     llama_batch_free(batch);
+    if (ctx_mtp) {
+        free(mtp_batch.token);
+        mtp_batch.token = nullptr;
+        llama_batch_free(mtp_batch);
+        llama_free(ctx_mtp);
+    }
     llama_free(ctx);
     llama_model_free(model);
     return 0;
@@ -346,6 +463,8 @@ static void usage(const char *prog) {
         "  -L <int>     Min suffix match to fire (default: 5)\n"
         "  -ngl <int>   GPU layers       (default: 99)\n"
         "  --baseline   Plain greedy loop (reference)\n"
+        "  --mtp        MTP t+2 draft on novel-text steps (M7.1)\n"
+        "  --no-ngram   Disable lookup drafts (with --mtp: MTP-only mode)\n"
         "  --sabotage   Corrupt all drafts (correctness stress)\n"
         "  --verbose    Per-step accept log\n",
         prog);
@@ -366,6 +485,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--baseline")) args.baseline = true;
         else if (!strcmp(argv[i], "--sabotage")) args.sabotage = true;
         else if (!strcmp(argv[i], "--verbose"))  args.verbose  = true;
+        else if (!strcmp(argv[i], "--mtp"))      args.use_mtp  = true;
+        else if (!strcmp(argv[i], "--no-ngram")) args.no_ngram = true;
         else if (!strcmp(argv[i], "--help"))     { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
     }
