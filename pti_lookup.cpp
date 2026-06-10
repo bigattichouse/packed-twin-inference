@@ -57,10 +57,21 @@ static double now_sec() {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// Greedy pick with deterministic tie-breaking (same rule as pti_server).
+// Different batch sizes run different kernel configs whose reductions differ
+// by ~1e-3 on logits — invisible except at genuine near-ties (the <think>
+// open/close decision is a reliable knife-edge), where plain argmax flips
+// between modes and breaks byte-identity. Among tokens within EPS of the
+// max, the LOWEST id wins — identical in every mode by construction.
+static constexpr float ARGMAX_EPS = 0.05f;
+
 static int32_t argmax_f(const float *v, int32_t n) {
     int32_t best = 0;
     for (int32_t i = 1; i < n; i++)
         if (v[i] > v[best]) best = i;
+    float cut = v[best] - ARGMAX_EPS;
+    for (int32_t i = 0; i < best; i++)
+        if (v[i] >= cut) return i;        // earliest id within the tie band
     return best;
 }
 

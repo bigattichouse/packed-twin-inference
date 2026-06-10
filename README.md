@@ -16,15 +16,20 @@ The name is the design:
   on hybrid-SSM models, where recurrent state cannot rewind — the piece stock lookup
   decoding lacks.
 
-| what you're generating | plain llama.cpp | this project | speedup |
-|---|---|---|---|
-| Code edits (rewrite a function) | 19.2 tok/s | **39.6 tok/s** | **2.06×** |
-| Fresh prose / new code | 19.4 tok/s | **23.6 tok/s** | **1.22×** |
-| Highly repetitive output | 19.4 tok/s | 34.2 tok/s | 1.76× |
+| what you're generating | plain | +MTP only | PTI (lookup+MTP) | best |
+|---|---|---|---|---|
+| Code edits (rewrite a function) | 19.3 | 25.2 | **38.5** | **1.99×** |
+| Fresh prose / new code | 19.1 | **23.7** | 21.8 | 1.24× |
+| Structured / patterned output | 18.1 | **23.7** | 22.2 | 1.31× |
 
-Every number above produced **byte-identical output** to plain llama.cpp — checked with
-`diff` on every run, including a stress test where every speculative guess is deliberately
-corrupted (the output still comes out exact; bad guesses only cost time).
+*(tok/s, one consistent build, measured 2026-06-10; peak observed on the edit task across
+runs: 39.6 = 2.06×.)* Every row produced **byte-identical output across all three modes**
+— checked with `diff` on every run, including a stress test where every speculative guess
+is deliberately corrupted (the output still comes out exact; bad guesses only cost time).
+
+Honest mode guidance from the table: `pti` wins big on editing/copy-heavy work; on novel
+text the lookup probes cost slightly more than they find, so plain `mtp` mode can edge it
+out — pick per workload (one flag, or per-request).
 
 ## The idea, in plain words
 
@@ -91,6 +96,30 @@ diff a.txt b.txt    # always empty
   off and you get ~0.97× of plain speed. You can never lose more than a few percent.
 - Requires a model with an MTP head for the novel-text gains (Qwen3.6-UD has one); lookup
   works on any model.
+
+## Prior art, and what's actually new here
+
+The components are established, and we cite them rather than claim them:
+**speculative decoding** (draft-then-verify: Leviathan et al. / Chen et al., 2023),
+**prompt-lookup drafting** (Saxena, 2023 — mainline llama.cpp ships `llama-lookup`),
+**MTP-head drafting** (DeepSeek-V3 proposes reusing its MTP module for speculation;
+vLLM ships it for DeepSeek models on datacenter GPUs).
+
+What this repo adds on top:
+
+1. **Draft-verify on a hybrid-SSM model.** Recurrent state cannot rewind, which is why
+   stock lookup decoding doesn't run on models like Qwen3.6. The twin-checkpoint
+   rollback + merged rebuild makes it work, measured at ~2× — to our knowledge the
+   first working lossless spec-dec on a hybrid-SSM model in the llama.cpp ecosystem.
+2. **Byte-identity made real, not aspirational.** "Lossless" claims in spec-dec usually
+   mean "same distribution in theory." We enforce `diff`-clean and documented what it
+   took: Q8_0 KV is batch-size-dependent under flash attention, unified KV flips fp
+   near-ties, and exact ties need deterministic tie-breaking. Anyone shipping spec-dec
+   silently hits these; we measured them.
+3. **The measured system around the drafts**: AIMD confidence gating, the 7→15→31 draft
+   ladder, merged rebuild, MTP probe methodology — plus an honest trail
+   (`FAILED_EXPERIMENTS.md`) of everything that didn't work, including the project's
+   own original idea.
 
 ## Status & roadmap
 
