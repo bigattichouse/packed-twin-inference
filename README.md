@@ -6,6 +6,13 @@ PTI packs N staggered token streams into a single `llama_decode` call. Each step
 tokens via a verify/accept chain. At 100% accept (greedy decoding) it emits up to N tokens per step.
 The overhead per step determines whether this beats baseline.
 
+> **June 2026 — the investigation concluded** (see `KERNEL_PLAN.md`): the stagger design is
+> mathematically bounded below baseline via the public API, and the GEMV kernel is at its
+> instruction-issue floor on gfx906. The machinery built for PTI (checkpoint sequences, batched
+> verification, byte-identical audit) was redirected into **`pti_lookup`** — n-gram lookup
+> speculative decoding with SSM-safe rollback — which **beats baseline 1.4–1.76× on copy-run
+> text (34.2 tok/s peak) with byte-identical output and a bounded ~0.96× worst case.**
+
 ---
 
 ## Honest Status (June 2026)
@@ -234,7 +241,10 @@ make audit-quick
 
 | File | Purpose | Status |
 |---|---|---|
-| `pti_2seq.cpp` | **2-seq PTI — optimal N, public API** | ✓ **16.3 tok/s, byte-identical** |
+| `pti_lookup.cpp` | **M6.4 n-gram lookup spec-dec — beats baseline on copy-runs** | ✓ **34.2 tok/s peak (1.76×), byte-identical** |
+| `pti_kbatch_bench.cpp` | M6.0 k-token batch cost curve + chain-match probe | ✓ batch verify exact, sub-linear cost |
+| `pti_q6k_bench.hip` | M6.1/2 Q6_K MMVQ replica + variant experiments | ✓ kernel floor documented |
+| `pti_2seq.cpp` | 2-seq PTI — optimal N for stagger design, public API | ✓ 16.3 tok/s, byte-identical |
 | `pti_4seq.cpp` | 4-sequence PTI — public llama.cpp API, correct algorithm | ✓ 14.6 tok/s, byte-identical |
 | `pti_debug.cpp` | Single-sequence baseline for comparison | ✓ |
 | `pti_gemv_bench.cpp` | GEMV scaling + context isolation benchmark | ✓ |

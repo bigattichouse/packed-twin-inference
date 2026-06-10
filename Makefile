@@ -194,6 +194,15 @@ $(PTI_Q6K): pti_q6k_bench.hip | $(BINDIR)
 q6kbench-run: $(PTI_Q6K)
 	$(PTI_Q6K)
 
+# ── pti_lookup: M6.4 n-gram lookup speculative decoding ──────────────────────
+PTI_LOOKUP := $(BINDIR)/pti_lookup
+
+lookup: $(PTI_LOOKUP)
+
+$(PTI_LOOKUP): pti_lookup.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
+
 # ── pti_kbatch_bench: M6.0 k-token batch cost curve ──────────────────────────
 kbench: $(PTI_KBENCH)
 
