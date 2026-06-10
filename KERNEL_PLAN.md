@@ -411,6 +411,36 @@ fork). Both branches are equally greedy; the claim in README is scoped according
 live `/mode base|mtp|pti` switching, `/clear`). Per-turn full re-prefill (~0.3 s short
 convos). Smoke-tested: 20.6 tok/s pti on a thinking-heavy reply, mtp 80%.
 
+### M7.4 — Sampled verification (temperature > 0) — **DONE (2026-06-10)**
+
+User requirement: "I don't want to code at temperature 0." Previously temp>0 fell back to
+plain decode (zero speedup for real editor settings).
+
+**Design — sample-and-match**: at each verified position, SAMPLE from the target logits
+(temperature applied) instead of argmax; accept the draft while the sample agrees, emit the
+sample at the first mismatch. For deterministic drafts (ours: lookup + MTP argmax) this IS
+the optimal rejection scheme (accept prob = p_τ(draft), correction ~ residual), so output is
+exactly plain temperature sampling — drafts only decide what got batched.
+
+**Position-keyed RNG**: `u = splitmix64(seed ^ position)` — counter-based, not sequential —
+so every mode consumes randomness identically per position. A fixed seed reproduces a run,
+and cross-mode byte-identity survives at temp > 0 (same fp-noise caveat: at higher temps,
+samples sit near CDF boundaries more often, so occasional cross-batch-shape flips are
+expected and documented).
+
+**Measured (seed 42)**:
+```
+code edit  τ=0.25:  base 18.5 → pti 37.0  (2.00×)  byte-identical, full 31-accepts
+prose      τ=0.70:  base 17.8 → pti 17.0  (0.96× — floor holds; MTP accept 56%)
+sabotage   τ=0.25:  all drafts poisoned → byte-identical to seeded baseline
+server API τ=0.25:  35.6 tok/s, 6.13 tok/step (lookup 172/221, mtp 22/27)
+```
+
+Coding temps (0.2–0.4) keep ~the full speedup (sharp distributions on copy-runs); chat
+temps degrade gracefully toward the gated parity floor. Implemented in pti_lookup
+(`-t/--seed`), pti_server (request `temperature`/`seed` fields, fallback removed), pti_chat
+(`-t/--seed` flags + live `/temp` command).
+
 ### M6.5 — Twin aggregate serving (Path B) — declined by user, not pursued
 
 - 2 independent prompts, 1 seq each, one decode per step, aggregate tok/s vs 2× sequential baseline.

@@ -80,10 +80,11 @@ make lookup server chat
 ./llama-server-pti.sh base    # plain decode   (= stock llama-server behavior)
 ```
 
-The server speaks `/v1/chat/completions` with SSE streaming. **Set temperature 0 in your
-editor** — verification is greedy; requests with temperature > 0 fall back to the plain
-path (logged per request). Every request logs its mode, token count, accept rates, and
-tok/s to the server console, so A/B comparison is one config switch in your editor.
+The server speaks `/v1/chat/completions` with SSE streaming, **at any temperature** —
+sampled verification keeps speculation active (τ=0.25 code edit: 35.6 tok/s through the
+API; a fixed request `"seed"` reproduces a run exactly). Every request logs its mode,
+temperature, seed, accept rates, and tok/s to the server console, so A/B comparison is
+one config switch in your editor.
 
 ```bash
 # correctness audit, any time:
@@ -134,12 +135,14 @@ table above. Open items, in value order:
 
 1. **Multi-token MTP-context batches produce garbage** (llama-ext graph bug; the
    last-pair-only workaround costs ~4 accept points and leaves cache gaps)
-2. **Sampled verification** — temperature > 0 currently falls back to plain decode;
-   proper speculative sampling would bring the speedup to default chat settings
-3. **Context ceiling** — 49k usable today (f16, exact); a lazier/smaller MTP context or
-   `--kv-q8` (which trades away cross-mode byte-identity) reaches further
-4. **Persistent cross-request n-gram cache** — editor sessions resend similar code;
-   drafts could fire from earlier requests' history
+2. ~~Sampled verification~~ — **done**: speculation active at any temperature
+   (sample-and-match, position-keyed RNG; τ=0.25 code edit keeps the full 2.0×,
+   seeded runs reproduce byte-for-byte; chat temps degrade gracefully to the floor)
+3. **Context ceiling** — 49k usable exact; `--kv-q8 -c 196608` verified working (~96k
+   usable, MTP active) at the cost of cross-mode byte-identity
+4. **Persistent cross-request n-gram cache + prompt cache** — pti_server re-prefills
+   every request; at huge contexts the prefill dominates (llama-server reuses slots —
+   we don't yet). Matters before big-context editor use is practical.
 
 Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kernel
 (the only path past the current verify-cost curve; major project).

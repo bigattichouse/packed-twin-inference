@@ -6,9 +6,11 @@
  *   --mode mtp    + MTP head drafting            (1-token t+2 drafts, ~85% accept)
  *   --mode pti    + n-gram lookup drafting       (up to 31-token drafts on copy-runs)
  *
- * All modes emit byte-identical text at temperature 0 (verified speculation).
- * Requests with temperature > 0 fall back to the plain path (logged) —
- * sampled verification is future work.
+ * Speculation is active at ANY temperature (M7.4 sample-and-match): at
+ * temp > 0 each verified position samples from the target logits with a
+ * position-keyed RNG, so output is exactly plain temperature sampling and
+ * a fixed "seed" reproduces a run. Measured at temp 0.25 on a code edit:
+ * 2.0× with output byte-identical to the same-seed plain run.
  *
  * Per-request console log: mode, tokens, tok/s, draft accept rates.
  *
@@ -124,6 +126,34 @@ static int32_t argmax_f(const float *v, int32_t n) {
     return best;
 }
 
+// ── sampled verification (M7.4): sample-and-match ───────────────────────────
+// temp > 0: each verified position SAMPLES from the target logits; drafts are
+// accepted while the sample agrees. Output is exactly plain temperature
+// sampling — drafts only decide what got batched. RNG is keyed on
+// (seed, position) so every mode consumes randomness identically.
+static uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static int32_t sample_pos(const float *logits, int32_t n, float temp,
+                          uint64_t seed, llama_pos pos) {
+    if (temp <= 0.0f) return argmax_f(logits, n);
+    float max_l = logits[0];
+    for (int32_t i = 1; i < n; i++) if (logits[i] > max_l) max_l = logits[i];
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; i++) sum += exp((double)(logits[i] - max_l) / temp);
+    double u = (double)(splitmix64(seed ^ (uint64_t)(pos + 1)) >> 11) / 9007199254740992.0;
+    double acc = 0.0, target = u * sum;
+    for (int32_t i = 0; i < n; i++) {
+        acc += exp((double)(logits[i] - max_l) / temp);
+        if (acc >= target) return i;
+    }
+    return n - 1;
+}
+
 static void batch_add(struct llama_batch *b, llama_token tok,
                       llama_pos pos, llama_seq_id seq, bool want_logits) {
     b->token       [b->n_tokens] = tok;
@@ -206,15 +236,9 @@ struct GenStats {
 using TokenSink = std::function<bool(const std::string &)>;
 
 static GenStats run_generate(const std::string &prompt, int max_new,
-                             float temperature, int mode, const TokenSink &sink) {
+                             float temperature, uint64_t seed, int mode,
+                             const TokenSink &sink) {
     GenStats stats;
-
-    // Verified speculation is greedy-only: sampled requests run the plain path.
-    if (temperature > 0.0f && mode != MODE_BASE) {
-        fprintf(stderr, "  [note] temperature=%.2f > 0 → plain decode (speculation is greedy-only)\n",
-                temperature);
-        mode = MODE_BASE;
-    }
     stats.mode = mode_name(mode);
 
     // ── main context ─────────────────────────────────────────────────────────
@@ -292,7 +316,8 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     }
 
     llama_pos   p        = (llama_pos)n_hist;
-    llama_token tok_last = (llama_token)argmax_f(llama_get_logits_ith(ctx, batch.n_tokens - 1), G.n_vocab);
+    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, batch.n_tokens - 1),
+                                                   G.n_vocab, temperature, seed, p);
     hist[n_hist++] = tok_last;
     if (!sink(token_to_str(tok_last))) goto done_early;
     stats.n_gen = 1;
@@ -375,7 +400,8 @@ static GenStats run_generate(const std::string &prompt, int max_new,
             int e = 0;
             bool stop = false, aborted = false;
             for (int i = 0; i <= k; i++) {
-                llama_token a = (llama_token)argmax_f(llama_get_logits_ith(ctx, base + i), G.n_vocab);
+                llama_token a = (llama_token)sample_pos(llama_get_logits_ith(ctx, base + i),
+                                                        G.n_vocab, temperature, seed, p + i + 1);
                 if (!llama_vocab_is_eog(G.vocab, a)) {
                     if (!sink(token_to_str(a))) { aborted = true; }
                 }
@@ -527,6 +553,9 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
     std::string prompt      = messages_to_prompt(j["messages"]);
     float       temperature = j.value("temperature", G.args.temperature);
     int         max_tokens  = j.value("max_tokens",  G.args.max_tokens);
+    // seed: honor the OpenAI-style request field; absent → time-derived
+    uint64_t    seed        = j.contains("seed") ? (uint64_t)j["seed"].get<int64_t>()
+                                                 : (uint64_t)now_sec() * 1000003ull;
     std::string id          = make_id();
 
     // per-request mode override: {"pti_mode": "base"|"mtp"|"pti"}
@@ -538,13 +567,14 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
         else if (m == "pti")  mode = MODE_PTI;
     }
 
-    fprintf(stderr, "[%s] mode=%s temp=%.2f max_tokens=%d\n",
-            id.c_str(), mode_name(mode), temperature, max_tokens);
+    fprintf(stderr, "[%s] mode=%s temp=%.2f seed=%llu max_tokens=%d\n",
+            id.c_str(), mode_name(mode), temperature,
+            (unsigned long long)seed, max_tokens);
 
     res.set_chunked_content_provider("text/event-stream",
-        [prompt, temperature, max_tokens, mode, id](size_t /*offset*/,
-                                                     httplib::DataSink &sink) -> bool {
-            GenStats stats = run_generate(prompt, max_tokens, temperature, mode,
+        [prompt, temperature, seed, max_tokens, mode, id](size_t /*offset*/,
+                                                           httplib::DataSink &sink) -> bool {
+            GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
                 [&sink, &id](const std::string &text) -> bool {
                     auto chunk = sse_chunk(text, id);
                     return sink.write(chunk.c_str(), chunk.size());
@@ -571,8 +601,8 @@ static void usage(const char *prog) {
         "                 differ between modes (batch-size-dependent numerics)\n"
         "  --mode <m>     base | mtp | pti (default: pti)\n"
         "  --verbose      Full llama/ggml logs (default: WARN+ only)\n"
-        "  --temp <float> Default temperature (default: 0.0 — REQUIRED for speedup;\n"
-        "                 temp > 0 falls back to plain decode)\n"
+        "  --temp <float> Default temperature (default: 0.0 = greedy; >0 uses\n"
+        "                 sampled verification — speculation stays active)\n"
         "  -n <int>       Default max tokens (default: 1024)\n\n"
         "Endpoints:\n"
         "  GET  /v1, /health           connectivity check\n"
@@ -632,7 +662,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
         "\nPTI server on http://0.0.0.0:%d\n"
         "  Mode        : %s   (per-request override: \"pti_mode\")\n"
-        "  Temperature : %.2f (temp > 0 disables speculation for that request)\n"
+        "  Temperature : %.2f (sampled verification: speculation active at any temp)\n"
         "  Context     : %d tokens\n"
         "  KV cache    : %s (usable ctx = n_ctx/2 — checkpoint stream)\n\n",
         args.port, mode_name(args.mode), args.temperature, args.n_ctx,

@@ -24,6 +24,8 @@
 #include "../llama.cpp/include/llama.h"
 #include "../llama.cpp/src/llama-ext.h"
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -75,6 +77,30 @@ static int32_t argmax_f(const float *v, int32_t n) {
     for (int32_t i = 0; i < best; i++)
         if (v[i] >= cut) return i;
     return best;
+}
+
+// ── sampled verification (M7.4): sample-and-match, position-keyed RNG ────────
+static uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static int32_t sample_pos(const float *logits, int32_t n, float temp,
+                          uint64_t seed, llama_pos pos) {
+    if (temp <= 0.0f) return argmax_f(logits, n);
+    float max_l = logits[0];
+    for (int32_t i = 1; i < n; i++) if (logits[i] > max_l) max_l = logits[i];
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; i++) sum += exp((double)(logits[i] - max_l) / temp);
+    double u = (double)(splitmix64(seed ^ (uint64_t)(pos + 1)) >> 11) / 9007199254740992.0;
+    double acc = 0.0, target = u * sum;
+    for (int32_t i = 0; i < n; i++) {
+        acc += exp((double)(logits[i] - max_l) / temp);
+        if (acc >= target) return i;
+    }
+    return n - 1;
 }
 
 static void batch_add(struct llama_batch *b, llama_token tok,
@@ -143,6 +169,8 @@ struct G {
     int     mode    = MODE_PTI;
     int     max_new = 1024;
     int     draft_k = 7, ngram_g = 3, ngram_L = 5;
+    float    temperature = 0.0f;
+    uint64_t seed        = 42;
 } g;
 
 static void print_token(llama_token tok, std::string *collect) {
@@ -190,7 +218,8 @@ static std::string generate_turn(const std::string &prompt) {
     double t_prefill = now_sec() - t_pre0;
 
     llama_pos   p        = (llama_pos)n_hist;
-    llama_token tok_last = (llama_token)argmax_f(llama_get_logits_ith(g.ctx, batch.n_tokens - 1), g.n_vocab);
+    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(g.ctx, batch.n_tokens - 1),
+                                                   g.n_vocab, g.temperature, g.seed, p);
     hist[n_hist++] = tok_last;
     int n_gen = 1, n_steps = 0;
     int ng_fire = 0, ng_acc = 0, mtp_fire = 0, mtp_acc = 0;
@@ -259,7 +288,8 @@ static std::string generate_turn(const std::string &prompt) {
         llama_token tok_last_old = tok_last;
         int e = 0; bool stop = false;
         for (int i = 0; i <= k; i++) {
-            llama_token a = (llama_token)argmax_f(llama_get_logits_ith(g.ctx, base + i), g.n_vocab);
+            llama_token a = (llama_token)sample_pos(llama_get_logits_ith(g.ctx, base + i),
+                                                    g.n_vocab, g.temperature, g.seed, p + i + 1);
             if (!llama_vocab_is_eog(g.vocab, a)) print_token(a, &reply);
             hist[n_hist++] = a;
             n_gen++; e++; tok_last = a;
@@ -328,8 +358,10 @@ int main(int argc, char **argv) {
             const char *m = argv[++i];
             g.mode = !strcmp(m, "base") ? MODE_BASE : !strcmp(m, "mtp") ? MODE_MTP : MODE_PTI;
         }
+        else if (!strcmp(argv[i], "-t")     && i+1 < argc) g.temperature = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i+1 < argc) g.seed = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose")) g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [--mode base|mtp|pti] [-n max] [-c ctx] [--verbose]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [--mode base|mtp|pti] [-t temp] [--seed n] [-n max] [-c ctx] [--verbose]\n", argv[0]); return 1; }
     }
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
 
@@ -364,9 +396,11 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
         "\n══ pti_chat ═══════════════════════════════════════════\n"
-        "  mode: %s%s   /mode base|mtp|pti   /clear   /quit\n"
+        "  mode: %s  temp: %.2f  seed: %llu%s\n"
+        "  /mode base|mtp|pti   /temp <t>   /clear   /quit\n"
         "═══════════════════════════════════════════════════════\n\n",
-        mode_name(g.mode), g.ctx_mtp ? "" : "  [no MTP head: mtp/pti degrade to lookup]");
+        mode_name(g.mode), g.temperature, (unsigned long long)g.seed,
+        g.ctx_mtp ? "" : "  [no MTP head: mtp/pti degrade to lookup]");
 
     std::vector<Msg> msgs;
     char line[8192];
@@ -383,6 +417,11 @@ int main(int argc, char **argv) {
             const char *m = line + 6;
             g.mode = !strcmp(m, "base") ? MODE_BASE : !strcmp(m, "mtp") ? MODE_MTP : MODE_PTI;
             fprintf(stderr, "[mode: %s]\n", mode_name(g.mode));
+            continue;
+        }
+        if (!strncmp(line, "/temp ", 6)) {
+            g.temperature = atof(line + 6);
+            fprintf(stderr, "[temp: %.2f]\n", g.temperature);
             continue;
         }
 

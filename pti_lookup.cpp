@@ -42,6 +42,8 @@
 #include "../llama.cpp/include/llama.h"
 #include "../llama.cpp/src/llama-ext.h"   // pre-norm hidden access for MTP (M7.1)
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -90,6 +92,46 @@ static int32_t argmax_f(const float *v, int32_t n) {
     for (int32_t i = 0; i < best; i++)
         if (v[i] >= cut) return i;        // earliest id within the tie band
     return best;
+}
+
+// ── sampled verification (M7.4): sample-and-match ───────────────────────────
+// At temp > 0 each verified position SAMPLES from the target logits; the
+// draft is accepted while the sample agrees and the sample itself is emitted
+// at the first mismatch. Output is exactly plain temperature sampling — the
+// drafts only decide what got batched (provably unbiased for deterministic
+// drafts: accept prob = p(draft), correction ~ residual — the optimal
+// rejection scheme degenerates to this).
+//
+// The RNG is keyed on (seed, position) — counter-based, not sequential — so
+// every mode consumes randomness identically per position and byte-identity
+// across modes survives at temp > 0 (same fp near-tie caveat as greedy).
+
+static uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static int32_t sample_pos(const float *logits, int32_t n, float temp,
+                          uint64_t seed, llama_pos pos) {
+    if (temp <= 0.0f) return argmax_f(logits, n);
+
+    float max_l = logits[0];
+    for (int32_t i = 1; i < n; i++) if (logits[i] > max_l) max_l = logits[i];
+
+    // softmax at temperature; single pass for the normalizer
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; i++) sum += exp((double)(logits[i] - max_l) / temp);
+
+    double u = (double)(splitmix64(seed ^ (uint64_t)(pos + 1)) >> 11)
+             / 9007199254740992.0;                       // [0,1) from top 53 bits
+    double acc = 0.0, target = u * sum;
+    for (int32_t i = 0; i < n; i++) {
+        acc += exp((double)(logits[i] - max_l) / temp);
+        if (acc >= target) return i;
+    }
+    return n - 1;
 }
 
 static void print_token(const struct llama_vocab *vocab, int32_t tok) {
@@ -189,6 +231,8 @@ struct LookupArgs {
     bool verbose      = false;
     bool use_mtp      = false;  // M7.1: MTP t+2 draft on novel-text steps (88.6% probe)
     bool no_ngram     = false;  // disable lookup (isolates MTP: the base+MTP cell)
+    float    temperature = 0.0f;   // M7.4: >0 → sampled verification (sample-and-match)
+    uint64_t seed        = 42;     // counter-based RNG key; fixed default = reproducible
     char model_path[512] = {};
     char prompt[4096]    = {};
 };
@@ -254,7 +298,8 @@ static int run_lookup(const LookupArgs *args) {
     if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "Prefill failed\n"); return 1; }
 
     llama_pos   p        = (llama_pos)n_hist;
-    llama_token tok_last = (llama_token)argmax_f(llama_get_logits_ith(ctx, batch.n_tokens - 1), n_vocab);
+    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, batch.n_tokens - 1),
+                                                   n_vocab, args->temperature, args->seed, p);
     hist[n_hist++] = tok_last;
 
     fprintf(stderr, "Output: ");
@@ -286,7 +331,8 @@ static int run_lookup(const LookupArgs *args) {
             batch_clear(&batch);
             batch_add(&batch, tok_last, p, 0, true);
             if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "\nDecode failed\n"); break; }
-            tok_last = (llama_token)argmax_f(llama_get_logits_ith(ctx, 0), n_vocab);
+            tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, 0),
+                                               n_vocab, args->temperature, args->seed, p + 1);
             p++;
             print_token(vocab, tok_last);
             hist[n_hist++] = tok_last;
@@ -387,7 +433,8 @@ static int run_lookup(const LookupArgs *args) {
             int e = 0;
             bool stop = false;
             for (int i = 0; i <= k; i++) {
-                llama_token a = (llama_token)argmax_f(llama_get_logits_ith(ctx, base + i), n_vocab);
+                llama_token a = (llama_token)sample_pos(llama_get_logits_ith(ctx, base + i),
+                                                        n_vocab, args->temperature, args->seed, p + i + 1);
                 print_token(vocab, a);
                 hist[n_hist++] = a;
                 n_gen++; e++;
@@ -502,6 +549,8 @@ static void usage(const char *prog) {
         "  -k <int>     Max draft tokens   (default: 7, batch = k+1)\n"
         "  -g <int>     N-gram probe len   (default: 3)\n"
         "  -L <int>     Min suffix match to fire (default: 5)\n"
+        "  -t <float>   Temperature (default: 0 = greedy; >0 = sampled verification)\n"
+        "  --seed <u64> RNG seed, counter-keyed by position (default: 42)\n"
         "  -ngl <int>   GPU layers       (default: 99)\n"
         "  --baseline   Plain greedy loop (reference)\n"
         "  --mtp        MTP t+2 draft on novel-text steps (M7.1)\n"
@@ -522,6 +571,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-k")   && i+1 < argc) args.draft_k      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-g")   && i+1 < argc) args.ngram_g      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-L")   && i+1 < argc) args.ngram_L      = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t")   && i+1 < argc) args.temperature  = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i+1 < argc) args.seed       = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "-ngl") && i+1 < argc) args.n_gpu_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--baseline")) args.baseline = true;
         else if (!strcmp(argv[i], "--sabotage")) args.sabotage = true;
