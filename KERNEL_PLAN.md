@@ -265,6 +265,23 @@ lookup drafts fire on PROMPT n-grams (history includes the prompt by constructio
 36 decode steps (2.58 tok/step), 80% draft acceptance. This is the workload class of code
 assistants (edit/refactor/quote), summarization-with-quotes, and RAG.
 
+### M6.4b — Adaptive draft length (k-escalation) — **DONE**
+
+M6.0 curve extension: k=12 costs 4.43×, **k=16 costs 4.47×** (≈ same as 12 — ggml leaves the
+MMVQ path past ncols=8 for a flatter-cost kernel; chain-match still PASS). A full 16-batch hit
+runs at 15.6 ms/token = 64 tok/s. Policy: fire at probe size k=7; on full accept jump to k=15
+(batch 16); on any miss reset to 7. Plus hard-off after 3 zero-accept fires (worst-case bound).
+
+```
+task                          baseline   v1(k=7)   v2(adaptive)   identical
+long code edit (234 tok)      19.2       —         35.5  (1.85×)  ✓  9× full-15 accepts
+short code edit (93 tok)      19.4       28.2      29.9  (1.54×)  ✓
+hostile prose                 19.4       18.6      18.7  (0.96×)  ✓  bound unchanged
+```
+
+The longer the copy-runs, the closer to the batch-16 ceiling (3.6×): real editing tasks with
+bigger functions/documents sit at 1.8–2× and rising with output length.
+
 **Findings**:
 1. **Byte-identical output on every run** — including 100% poisoned drafts with 20 rebuilds.
    The SSM checkpoint-rollback (seq_cp + re-decode accepted prefix) is correct.

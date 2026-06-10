@@ -197,10 +197,20 @@ static int run_lookup(const LookupArgs *args) {
         // copy-runs have L in the tens and clear any bar; parallel-structure
         // text (long shared phrases, divergent continuations) ratchets the
         // bar up after a couple of misses and stops firing → baseline parity.
-        int L_dyn = args->ngram_L;
+        //
+        // Adaptive draft length: a full accept means we are inside a copy-run,
+        // so the next fire jumps to MAX_DRAFT (batch 16 costs 4.47× for up to
+        // 16 tokens = 15.6 ms/tok — M6.0 curve). Any miss resets to draft_k.
+        //
+        // Hard-off: after 3 zero-accept fires, drafting is disabled for the
+        // rest of the generation — bounds the worst case on hostile text.
+        int L_dyn   = args->ngram_L;
+        int k_cur   = args->draft_k;
+        int n_zero  = 0;
         while (n_gen < args->max_new && !llama_vocab_is_eog(vocab, tok_last)) {
             llama_token draft[MAX_DRAFT];
-            int k = ngram_draft(hist, n_hist, args->ngram_g, L_dyn, args->draft_k, draft);
+            int k = (n_zero >= 3) ? 0
+                  : ngram_draft(hist, n_hist, args->ngram_g, L_dyn, k_cur, draft);
             if (k + 1 > args->max_new - n_gen) k = args->max_new - n_gen - 1;
             if (k < 0) k = 0;
             if (args->sabotage) {
@@ -239,11 +249,17 @@ static int run_lookup(const LookupArgs *args) {
             if (k > 0) {
                 n_accept_hist[acc < MAX_DRAFT+1 ? acc : MAX_DRAFT+1]++;
                 n_draft_acc += acc;
-                if (acc == k) L_dyn = L_dyn > args->ngram_L ? L_dyn - 1 : args->ngram_L;
-                else          L_dyn += 4;
+                if (acc == k) {
+                    L_dyn = L_dyn > args->ngram_L ? L_dyn - 1 : args->ngram_L;
+                    k_cur = MAX_DRAFT;                // in a copy-run: go long
+                } else {
+                    L_dyn += 4;
+                    k_cur = args->draft_k;            // back to probe size
+                    if (acc == 0) n_zero++;
+                }
             }
             if (args->verbose && k > 0)
-                fprintf(stderr, "\n[draft k=%d acc=%d L_dyn=%d]", k, acc, L_dyn);
+                fprintf(stderr, "\n[draft k=%d acc=%d L_dyn=%d k_cur=%d]", k, acc, L_dyn, k_cur);
 
             if (stop) { p += e; break; }
 
@@ -279,7 +295,8 @@ static int run_lookup(const LookupArgs *args) {
                 n_draft_tok, n_draft_acc, n_draft_tok ? 100.0 * n_draft_acc / n_draft_tok : 0.0);
         fprintf(stderr, "  Rebuilds (miss):    %d\n", n_rebuilds);
         fprintf(stderr, "  Accept histogram:   ");
-        for (int i = 0; i <= args->draft_k; i++) fprintf(stderr, "%d:%d ", i, n_accept_hist[i]);
+        for (int i = 0; i <= MAX_DRAFT; i++)
+            if (n_accept_hist[i]) fprintf(stderr, "%d:%d ", i, n_accept_hist[i]);
         fprintf(stderr, "\n");
     }
     fprintf(stderr, "  Throughput:         %.1f tok/s  (loop)\n", n_gen / elapsed);

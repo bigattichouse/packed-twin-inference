@@ -30,7 +30,7 @@
 
 #define MAX_TOKENS  4096
 #define DEFAULT_CTX 2048
-#define CHAIN_LEN   9       // g[0..8]: inputs g[0..7], expected outputs g[1..8]
+#define CHAIN_LEN   17      // g[0..16]: inputs g[0..15], expected outputs g[1..16]
 
 static double now_sec() {
     struct timespec ts;
@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n\n");
 
     // ── 3. Cost curve: k-token batch from restored checkpoint ───────────────
-    const int ks[]  = {1, 2, 3, 4, 6, 8};
+    const int ks[]  = {1, 2, 4, 8, 12, 16};
     const int n_ks  = (int)(sizeof(ks) / sizeof(ks[0]));
     double mean_ms[8] = {};
     int    mism  [8] = {};

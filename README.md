@@ -10,8 +10,9 @@ The overhead per step determines whether this beats baseline.
 > mathematically bounded below baseline via the public API, and the GEMV kernel is at its
 > instruction-issue floor on gfx906. The machinery built for PTI (checkpoint sequences, batched
 > verification, byte-identical audit) was redirected into **`pti_lookup`** — n-gram lookup
-> speculative decoding with SSM-safe rollback — which **beats baseline 1.4–1.76× on copy-run
-> text (34.2 tok/s peak) with byte-identical output and a bounded ~0.96× worst case.**
+> speculative decoding with SSM-safe rollback and adaptive draft length — which delivers
+> **1.85× on real code-editing tasks (35.5 vs 19.2 tok/s), byte-identical output, and a
+> bounded ~0.96× worst case on hostile text.**
 
 ---
 
@@ -241,7 +242,7 @@ make audit-quick
 
 | File | Purpose | Status |
 |---|---|---|
-| `pti_lookup.cpp` | **M6.4 n-gram lookup spec-dec — beats baseline on copy-runs** | ✓ **34.2 tok/s peak (1.76×), byte-identical** |
+| `pti_lookup.cpp` | **M6.4 n-gram lookup spec-dec — beats baseline on real tasks** | ✓ **35.5 tok/s on code edit (1.85×), byte-identical** |
 | `pti_kbatch_bench.cpp` | M6.0 k-token batch cost curve + chain-match probe | ✓ batch verify exact, sub-linear cost |
 | `pti_q6k_bench.hip` | M6.1/2 Q6_K MMVQ replica + variant experiments | ✓ kernel floor documented |
 | `pti_2seq.cpp` | 2-seq PTI — optimal N for stagger design, public API | ✓ 16.3 tok/s, byte-identical |
