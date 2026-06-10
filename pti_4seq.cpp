@@ -275,6 +275,7 @@ static int run_pti4(const PTIArgs *args) {
     // is NOT included here. See "Init overhead" in the stats below for the honest total.
 
     for (int step = 0; step < args->max_new - 1; step++) {
+        if (n_gen >= args->max_new) break;
         if (llama_vocab_is_eog(vocab, tok_a)) break;
 
         batch_clear(&step_batch);
@@ -304,12 +305,35 @@ static int run_pti4(const PTIArgs *args) {
                     if (args->verbose)
                         fprintf(stderr, "\n[4-ACCEPT pos=%d]", pos_a-1);
 
-                    print_token(vocab, actual_next);  n_gen++;
+                    // M5.3: emit all 4 confirmed tokens, then rebuild stagger
+                    // from D's state (3 reinit_seq calls). D is confirmed through
+                    // pos_d-1; copying D→A bridges A forward 3 positions at once.
+                    // Fall back to single-emit near token limit or if eog in chain.
+                    bool full_emit = (n_gen + 4 <= args->max_new)
+                                  && !llama_vocab_is_eog(vocab, actual_next)
+                                  && !llama_vocab_is_eog(vocab, next_from_b)
+                                  && !llama_vocab_is_eog(vocab, next_from_c)
+                                  && !llama_vocab_is_eog(vocab, next_from_d);
 
-                    tok_a = actual_next;
-                    tok_b = next_from_b;
-                    tok_c = next_from_c;
-                    tok_d = next_from_d;
+                    if (full_emit) {
+                        print_token(vocab, actual_next);  n_gen++;
+                        print_token(vocab, next_from_b);  n_gen++;
+                        print_token(vocab, next_from_c);  n_gen++;
+                        print_token(vocab, next_from_d);  n_gen++;
+                        llama_memory_seq_rm(mem, 0, 0, -1);
+                        llama_memory_seq_cp(mem, 3, 0, 0, -1);
+                        tok_a = next_from_d;
+                        pos_a = pos_d;
+                        tok_b = reinit_seq(mem, ctx, &step_batch, n_vocab, 0, 1, next_from_d, pos_d, &pos_b);
+                        tok_c = reinit_seq(mem, ctx, &step_batch, n_vocab, 1, 2, tok_b,       pos_b, &pos_c);
+                        tok_d = reinit_seq(mem, ctx, &step_batch, n_vocab, 2, 3, tok_c,       pos_c, &pos_d);
+                    } else {
+                        print_token(vocab, actual_next);  n_gen++;
+                        tok_a = actual_next;
+                        tok_b = next_from_b;
+                        tok_c = next_from_c;
+                        tok_d = next_from_d;
+                    }
 
                 } else {
                     // ── 3-accept: D wrong, re-init D ──────────────────────

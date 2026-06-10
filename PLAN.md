@@ -328,63 +328,98 @@ But 63 - 6 = 57 VGPRs → still only 4 waves. Full improvement requires MFMA.
 
 ---
 
-### M5.3 — State-copy reinit (critical for multi-emit throughput)
+### M5.3 — Multi-emit with decode reinit (DONE)
 
-The throughput math reveals a key insight:
+**Implemented**: 4-token emit on 4-accept with 3 `reinit_seq` calls to rebuild stagger.
 
+**Throughput math (measured, n=50, greedy, MI50):**
 ```
-Current pti_4seq (single-emit):  1 token  / (1.86 × 53ms) = 10.2 tok/s  ← SLOWER
-Multi-emit, decode reinit (3×):  4 tokens / (1.86+3.0) × 53ms = 15.6 tok/s ← still slower
-Multi-emit, state-copy reinit:   4 tokens / (1.86 × 53ms)      = 40.9 tok/s ← 2.15× faster
-```
-
-The decode reinit (3 single-seq llama_decode calls per 4-accept) costs 3× baseline,
-wiping out the 4-token gain. The fix: **ring buffer of A's SSM+KV states**.
-
-**How state-copy reinit works:**
-After each step, save seq 0 (A)'s SSM state and KV to a ring buffer entry.
-On 4-accept: instead of calling llama_decode 3× to advance B, C, D:
-1. B ← ring_buf[n-1] (A's state from 1 step ago, at position n+2)
-2. C ← ring_buf[n-2] (A's state from 2 steps ago, at position n+1)
-3. D ← ring_buf[n-3] (A's state from 3 steps ago, at position n)
-4. Call llama_memory_seq_cp to copy KV positions for each
-
-**Memory cost**: 3 saved states × 149.62 MB (SSM+KV per seq) = ~449 MB.
-MI50 has 32 GB; this is 1.4% of VRAM. Affordable.
-
-**llama.cpp support**: `llama_memory_seq_cp` copies both KV and recurrent (SSM)
-state. The ring buffer stores the raw state tensors after each step. On 4-accept,
-we overwrite seqs 1,2,3 with ring buffer entries then update their KV positions.
-
-**Expected throughput after state-copy reinit (at current 1.86× step overhead):**
-```
-4 tokens / (1.86 × 53ms) = 40.9 tok/s  (2.15× baseline, no kernel change needed!)
+Baseline (single-seq):            19.0 tok/s   (52.6 ms/step)
+M5.3 single-emit (pre-this step): ~10.2 tok/s  (1 tok / 1.86×)  estimated
+M5.3 multi-emit (measured):       14.6 tok/s   (steady-state, 15/15 audit PASS)
 ```
 
-This is achievable WITHOUT the MFMA kernel (M5.4). The state-copy reinit is the
-highest-priority next implementation step.
+**Why only 14.6 tok/s, not 41 tok/s (plan error):**
 
-**Implementation plan:**
-1. Add `RingBuffer` struct to pti_4seq.cpp: circular array of 3 llama_state snapshots
-2. After each step: call `llama_state_get_data` to snapshot seq 0 → ring_buf[step % 3]
-3. On 4-accept path: call `llama_state_set_data` to restore ring_buf[n-k] into seq k
-4. Advance all sequence positions by 4 (KV-copy + position update)
-5. Emit 4 tokens (actual, from_b, from_c, from_d verified chain)
-6. Audit: output bytes identical to baseline at greedy (all tokens agree)
+The original plan predicted ~41 tok/s using a "ring buffer of A's past states", claiming
+that past states could rebuild B/C/D without decode calls. This was incorrect:
 
-**API note**: `llama_state_get_data` / `llama_state_set_data` are public llama.cpp
-functions that serialize/deserialize the full context state (KV + SSM + sampler).
-They work on the full context, not per-sequence — so we need a per-seq API or
-extract only the SSM state tensors manually.
+After 4-emit, new A must be at pos_d (3 positions ahead of its current KV). B/C/D must
+be 1, 2, 3 positions further still. A's PAST states are all BEHIND the new target
+positions — they provide no shortcut. For a **forward stagger**, there is no way to
+advance 4 positions without 3 decode calls. The 3 reinit_seq calls are irreducible.
 
-**Alternative**: instead of ring buffer, use llama_memory_seq_cp differently:
-- After each step, BEFORE advancing, copy seq 0 KV to a saved slot
-- Maintain 3 saved slots (seq 4, 5, 6 in a context with n_seq_max=7)
-- On 4-accept: cp saved_k to seq 1,2,3 and set SSM state from ring
+**Actual cost breakdown (per 4-accept step):**
+```
+1 quad-decode (N=4):  1.86 × 52.6ms = 97.8ms
+3 reinit_seq (N=1):   3 × 52.6ms   = 157.8ms
+Total:                               255.6ms for 4 tokens = 63.9ms/token → 15.6 tok/s est.
+                                     (measured: 14.6 tok/s, close match)
+```
 
-Use `llama_context` with n_seq_max=7 (4 active + 3 saved history slots).
+**Multi-emit improvement**: 14.6/10.2 = **1.43× better than single-emit** (same M5.1 kernel).
+Still 0.77× of baseline — PTI 4-seq with forward stagger + decode reinit cannot reach baseline.
 
-### M5.4 — MFMA vectorization (after M5.3 state-copy reinit, if still > 1.5×)
+**Ceiling analysis:**
+```
+Best possible with decode reinit (N=4 overhead → 0):
+  4 tokens / (0 + 3 × 52.6ms) = 25.4 tok/s = 1.34× baseline
+
+Even with perfect zero-overhead quad-decode, 3 reinits cost more than the gain.
+Decode reinit is an asymptotic ceiling of ~1.34× baseline. Not 2×.
+```
+
+**Audit**: 15/15 PASS, byte-identical output at greedy, token count exact.
+
+---
+
+### Path to >2× baseline — speculative batch reinit
+
+The 3 reinits are sequential single-seq decodes (N=1). If we could replace them with
+one N=4 batch call (using A's confirmed state for C and D speculatively), the cost
+drops to 1 quad-batch for reinit:
+
+```
+Speculative reinit (1 N=4 batch instead of 3 N=1):
+  quad-decode: 1.86×
+  spec-reinit: 1.86×
+  Total: 3.72× for 4 tokens = 0.93×/token → 20.4 tok/s (1.07× baseline)
+
+With MFMA (1.1× overhead):
+  quad-decode: 1.1×
+  spec-reinit: 1.1×
+  Total: 2.2× for 4 tokens = 0.55×/token → 34.5 tok/s (1.82× baseline)
+```
+
+**Speculative reinit concept:**
+After 4-emit, copy D→A (free), then run ONE N=4 batch:
+- Seq 0 (A): decode next_from_d at pos_d → exact p1
+- Seq 1 (B): decode next_from_d at pos_d (same as A, from D's state) → exact p1
+- Seq 2 (C): speculative: decode p1_guess at pos_d+1 using D's state (missing pos_d KV!) → approx p2
+- Seq 3 (D): speculative: decode p2_guess at pos_d+2 using D's state (missing pos_d, pos_d+1!) → approx p3
+
+C and D's speculative states are WRONG for SSM/hybrid models: they're missing KV entries
+and SSM updates for positions pos_d and pos_d+1. For a transformer-only model this would
+be only slightly wrong (attention still covers all positions, KV missing 1-2 entries).
+For Qwen3.6-27B with SSM layers, the SSM state would accumulate error across those
+2 missed steps.
+
+**Empirical test (M5.3b, skip D reinit)**: implemented and tested on Qwen3.6-27B at greedy.
+
+```
+Result: 10 4-accept, 9 3-accept (47% D miss rate)  → 13.7 tok/s  (WORSE than exact 14.6)
+```
+
+D's stale SSM state (missing 3 position updates) causes wrong predictions ~47% of the time.
+The 3-accept penalty (extra reinit + 1 fewer token emitted) more than cancels the saved call.
+Output tokens remain correct (greedy argmax is eventually right), but throughput degrades.
+
+**Conclusion: M5.3b speculative reinit is NOT viable for Qwen3.6-27B's hybrid SSM architecture.**
+The SSM recurrent state cannot tolerate 3 missed update steps. For pure-transformer models
+(no SSM), speculative reinit might work (attention over 3 missing KV entries is negligible),
+but that is a different model class.
+
+### M5.4 — MFMA vectorization (after speculative reinit, if still > 1.5×)
 
 **Applicable to gfx906 (MI50)**: the first AMD GPU with Matrix Fused Multiply-Add (MFMA).  
 Available instruction: `v_mfma_f32_16x16x4f16` — computes C[16×16] += A[16×4] × B[4×16].
@@ -414,29 +449,32 @@ PTI at full pipeline: 4 × 18.9 / 1.10 ≈ 68 tok/s target.
 ### Quick reference: M5 expected outcomes
 
 ```
-M5.0 (baseline):          1.95×   measured
-M5.1 (loop swap):         1.86×   MEASURED (done, 19/19 audit pass)
-M5.2 (VGPR analysis):     done — N=4=63 VGPRs→4 waves, N=1=27 VGPRs→9 waves
-M5.3 (state-copy reinit): ~1.86×  overhead unchanged, but multi-emit now ~40 tok/s
-M5.4 (MFMA):              ~1.1×   target (frees VGPRs→AGPRs, restores occupancy)
+M5.0 (baseline):                  1.95×    measured
+M5.1 (loop swap):                 1.86×    MEASURED (done, 19/19 audit pass)
+M5.2 (VGPR analysis):             done  —  N=4=63 VGPRs→4 waves, N=1=27 VGPRs→9 waves
+M5.3 (multi-emit, decode reinit): 1.86×    overhead unchanged; measured 14.6 tok/s (done)
+M5.3b (speculative batch reinit): ~3.72×   combined step; ~20 tok/s estimate (untested)
+M5.4 (MFMA):                      ~1.1×    target (frees VGPRs→AGPRs, restores occupancy)
 
 PTI tok/s at each stage (19 tok/s baseline):
-  M5.0 current (single-emit):            ~10 tok/s  (1 tok / 1.95× step)
-  M5.1 current (single-emit):            ~10 tok/s  (1 tok / 1.86× step)
-  M5.3 (state-copy reinit, multi-emit):  ~41 tok/s  (4 tok / 1.86× step, 2.15× baseline)
-  M5.4 (MFMA + multi-emit):              ~69 tok/s  (4 tok / 1.10× step, 3.6× baseline)
+  M5.0 single-emit:                ~10 tok/s  (1 tok / 1.95× step)
+  M5.1 single-emit:                ~10 tok/s  (1 tok / 1.86× step)
+  M5.3 multi-emit, decode reinit:  14.6 tok/s MEASURED  (4 tok / 4.86× step, 0.77× baseline)
+  M5.3b speculative batch reinit:  ~20 tok/s  estimate  (4 tok / 3.72× step, 1.07× baseline)
+  M5.4 MFMA + decode reinit:       ~19 tok/s  estimate  (4 tok / 4.1× step, barely 1×)
+  M5.4 MFMA + spec batch reinit:   ~35 tok/s  estimate  (4 tok / 2.2× step, 1.82× baseline)
 ```
 
-**The key insight**: the bottleneck was never the kernel overhead for the final number.
-At 1.86× step overhead with 4-token multi-emit (state-copy reinit):
-```
-4 tokens / (1.86 × 53 ms) = 40.9 tok/s  (2.15× baseline, no MFMA needed)
-```
-The 3-decode reinit killed this throughput (4/4.86 = 15.6 tok/s). State-copy reinit
-restores it by replacing 3 decode calls with 3 memory-copy calls (~1 ms each).
+**Key insight**: 3 sequential reinit calls dominate the cost. To beat baseline requires
+speculative batch reinit (1 N=4 call instead of 3 N=1 calls), which needs empirical
+validation on a hybrid SSM model. Without that, 4-seq PTI is capped at ~0.77× baseline.
 
-M5.3 (state-copy reinit) is the HIGHEST priority next implementation step.  
-M5.4 (MFMA) adds another 1.7× on top of that, but is not required to beat baseline.
+Optimal N without speculative reinit: **2-seq** gives best throughput at ~16.7 tok/s:
+```
+2-seq: 1 dual-decode (1.27×) + 1 reinit (1×) = 2.27× for 2 tokens → 16.7 tok/s
+3-seq: 1 triple-decode (1.71×) + 2 reinits (2×) = 3.71× for 3 tokens → 15.3 tok/s
+4-seq: 1 quad-decode (1.86×) + 3 reinits (3×) = 4.86× for 4 tokens → 14.6 tok/s (measured)
+```
 
 ---
 
@@ -780,11 +818,12 @@ llama.cpp/
 | M3 | MTP analysis — no bonus tokens on hybrid model | no gain | done |
 | **M4a** | **pti_server: single-sequence baseline** | **19 tok/s** | **done** |
 | **M4b** | **pti_4seq: correct PTI, byte-identical output at greedy** | **10 tok/s** | **done** |
-| M4c | pti_server: correct PTI loop | 10 tok/s | deferred until multi-emit |
+| M4c | pti_server: correct PTI loop | deferred — PTI 4-seq (14.6 tok/s) < server baseline (19 tok/s) |
 | **M5.1** | **mmvq.cu loop swap (i-outer/j-inner) + LICM hoist** | **10 tok/s (step 1.86×)** | **done** |
 | **M5.2** | **VGPR ISA analysis: 27→63 VGPRs, 9→4 waves/SIMD** | diagnostic | **done** |
-| **M5.3** | **State-copy reinit + multi-emit (4 tokens per step)** | **~41 tok/s** | **next** |
-| M5.4 | mmvq.cu MFMA (AGPRs, restore occupancy) | ~69 tok/s | future |
+| **M5.3** | **Multi-emit, decode reinit (4 tok/4-accept, 3 reinit calls)** | **14.6 tok/s** | **done** |
+| M5.3b | Speculative reinit (skip D) — empirically ruled out: 47% miss, 13.7 tok/s | N/A | ruled out |
+| M5.4 | mmvq.cu MFMA (AGPRs, restore occupancy) | ~35 tok/s est. (with M5.3b) | future |
 | M6 | llama-cli --pti flag, public API | 60–75 | future |
 
 ---
@@ -819,11 +858,11 @@ llama.cpp/
 
 ```
 Hardware:       MI50, 32 GiB HBM2, ~1 TB/s peak, 383 GB/s measured D2D
-Model (best):   UD-Q6_K_XL, 25 GB, 19.4 tok/s baseline, MTP head present
+Model (best):   UD-Q6_K_XL, 25 GB, 19.0 tok/s baseline, MTP head present
 Weight ceiling: 254 GB/s (Q8_0 GEMV), 393 GB/s (Q5_K_M GEMV, llama.cpp)
-Overhead:       2.04× at N=4; from 4× MMVQ compute + attn/SSM scaling with N
-                Activation traffic (~480 MB/step) is <2% of weight traffic (~25 GB/step)
-Current best:   38.1 tok/s (4-seq, pti_4seq.cpp, 1.96× baseline)
-Honest (-n 80): ~32 tok/s amortized (includes 7 startup decode steps, one-time)
-Target:         60–75 tok/s after kernel rewrite (M4)
+Overhead:       1.86× at N=4 (after M5.1 loop swap); decode reinit costs 3× per 4-accept
+Current best:   14.6 tok/s (4-seq, M5.3 multi-emit, pti_4seq.cpp) — 0.77× baseline
+Next target:    ~20 tok/s (speculative batch reinit, M5.3b)
+MFMA target:    ~35 tok/s (M5.4 + M5.3b combined)
+Path to >2×:    speculative batch reinit reduces 3 N=1 reinits → 1 N=4 reinit
 ```
