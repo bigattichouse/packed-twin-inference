@@ -63,6 +63,7 @@ PTI_4SEQ   := $(BINDIR)/pti_4seq
 PTI_SERVER := $(BINDIR)/pti_server
 PTI_DEBUG  := $(BINDIR)/pti_debug
 PTI_BENCH  := $(BINDIR)/pti_gemv_bench
+PTI_KBENCH := $(BINDIR)/pti_kbatch_bench
 
 # ── llama.cpp paths ───────────────────────────────────────────────────────────
 LLAMA_DIR    ?= ../llama.cpp
@@ -81,10 +82,10 @@ NGL         ?= 99
 
 # ── Phony targets ─────────────────────────────────────────────────────────────
 .PHONY: all cuda test cuda-test shared cuda-shared clean help \
-        llama mtp 4seq server debug bench audit all-llama \
+        llama mtp 4seq server debug bench kbench audit all-llama \
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
-        4seq-run 4seq-run-base
+        4seq-run 4seq-run-base kbench-run
 
 
 # ── bin/ directory ────────────────────────────────────────────────────────────
@@ -180,6 +181,16 @@ bench: $(PTI_BENCH)
 $(PTI_BENCH): pti_gemv_bench.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
 	@echo "Built $@"
+
+# ── pti_kbatch_bench: M6.0 k-token batch cost curve ──────────────────────────
+kbench: $(PTI_KBENCH)
+
+$(PTI_KBENCH): pti_kbatch_bench.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
+
+kbench-run: $(PTI_KBENCH)
+	$(PTI_KBENCH) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -ngl $(NGL)
 
 # ── pti_server: PTI HTTP server (OpenAI-compatible) ───────────────────────────
 server: $(PTI_SERVER)
