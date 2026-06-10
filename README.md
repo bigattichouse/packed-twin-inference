@@ -92,6 +92,23 @@ diff a.txt b.txt    # always empty
 - Requires a model with an MTP head for the novel-text gains (Qwen3.6-UD has one); lookup
   works on any model.
 
+## Status & roadmap
+
+Working and validated end-to-end (CLI + server, all byte-identical): the numbers in the
+table above. Open items, in value order:
+
+1. **Multi-token MTP-context batches produce garbage** (llama-ext graph bug; the
+   last-pair-only workaround costs ~4 accept points and leaves cache gaps)
+2. **Sampled verification** — temperature > 0 currently falls back to plain decode;
+   proper speculative sampling would bring the speedup to default chat settings
+3. **Context ceiling** — 49k usable today (f16, exact); a lazier/smaller MTP context or
+   `--kv-q8` (which trades away cross-mode byte-identity) reaches further
+4. **Persistent cross-request n-gram cache** — editor sessions resend similar code;
+   drafts could fire from earlier requests' history
+
+Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kernel
+(the only path past the current verify-cost curve; major project).
+
 ## Repo guide
 
 | file | what |

@@ -360,6 +360,30 @@ open work; a proper fix recovers ~4% accept and removes the gap caveat.
 
 Live MTP accept rates: 83–87% on novel prose, 81% on edit-task novel segments.
 
+### M7.2 — Three-mode server + experiment harness — **DONE (2026-06-10)**
+
+`pti_server` rewritten around the M6.4c/M7.1 loop: `--mode base|mtp|pti` (per-request
+override via `"pti_mode"`), greedy speculation with temp>0 fallback, per-request stats.
+Scripts: `llama-server-pti.sh` (editor A/B), `pti-cli.sh` (raw streaming for video,
+`compare` runs all three modes). Measured through the HTTP API: edit task base 18.0 →
+**pti 36.6 tok/s (2.03×)**, all modes byte-identical.
+
+**Exactness findings (each one broke cross-mode identity until fixed):**
+1. **Q8_0 KV + flash attention is batch-size-dependent** — the same position decoded in a
+   1-token vs 2-token batch can argmax differently. KV must stay f16.
+2. **`kv_unified=true` flips near-ties too** — proven-exact config is non-unified + f16
+   (cost: usable ctx = n_ctx/2; default 98304 → 49k usable, ~30 GB peak with MTP ctx;
+   131k OOMs the MTP context on 32 GB).
+3. **Even f16 non-unified flips at genuine fp ties** (~1e-3 kernel noise between batch
+   shapes; the `<think>` open/close decision on chat templates is a reliable knife-edge).
+   Fix: deterministic tie-breaking — among tokens within ε=0.05 of the max logit, lowest
+   id wins, applied identically in every mode. Identity then holds unconditionally
+   (validated: 3-mode test + edit task through the API).
+
+**Open after M7.2**: multi-token MTP graph bug (root cause), sampled verification
+(temp>0 falls back to plain today), context ceiling (lazy/smaller MTP ctx or --kv-q8),
+persistent cross-request n-gram cache.
+
 ### M6.5 — Twin aggregate serving (Path B) — declined by user, not pursued
 
 - 2 independent prompts, 1 seq each, one decode per step, aggregate tok/s vs 2× sequential baseline.
