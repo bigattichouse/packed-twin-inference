@@ -308,11 +308,24 @@ static int run_lookup(const LookupArgs *args) {
             int k = (args->no_ngram || n_zero >= 3) ? 0
                   : ngram_draft(hist, n_hist, args->ngram_g, L_dyn, k_cur, draft);
 
-            // MTP fallback (M7.1): novel-text step, no n-gram fire → 1-token
+            bool mtp_alive = ctx_mtp && mtp_cand != -1
+                          && !(n_mtp_fire >= 10 && n_mtp_acc * 10 < n_mtp_fire * 3);
+
+            // MTP arbitration (M7.3): the MTP candidate predicts the SAME
+            // position as draft[0]. At the probe rung (k_cur == draft_k —
+            // the ladder hasn't earned trust yet), a disagreement marks the
+            // n-gram fire as coincidental: veto it and fire the MTP draft
+            // instead (85-90% right). Makes mtp-only the floor of pti mode.
+            // Escalated rungs (15/31) skip the veto — full accepts at the
+            // previous rung are stronger evidence than one MTP vote.
+            if (k > 0 && mtp_alive && k_cur <= args->draft_k && mtp_cand != draft[0]) {
+                k = 0;                                     // veto the fire
+            }
+
+            // MTP fallback (M7.1): no (surviving) n-gram fire → 1-token
             // t+2 draft (88.6% probe accuracy). Disable if it proves <30%.
             bool mtp_fired = false;
-            if (k == 0 && ctx_mtp && mtp_cand != -1
-                && !(n_mtp_fire >= 10 && n_mtp_acc * 10 < n_mtp_fire * 3)) {
+            if (k == 0 && mtp_alive) {
                 draft[0] = mtp_cand;
                 k = 1;
                 mtp_fired = true;

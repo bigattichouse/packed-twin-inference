@@ -16,20 +16,23 @@ The name is the design:
   on hybrid-SSM models, where recurrent state cannot rewind — the piece stock lookup
   decoding lacks.
 
-| what you're generating | plain | +MTP only | PTI (lookup+MTP) | best |
+| what you're generating | plain | lookup only | MTP only | **PTI (lookup+MTP)** |
 |---|---|---|---|---|
-| Code edits (rewrite a function) | 19.3 | 25.2 | **38.5** | **1.99×** |
-| Fresh prose / new code | 19.1 | **23.7** | 21.8 | 1.24× |
-| Structured / patterned output | 18.1 | **23.7** | 22.2 | 1.31× |
+| Code edits (rewrite a function) | 19.3 | 37.5 | 25.2 | **39.9 (2.07×)** |
+| Fresh prose / new code | 19.1 | 18.9 | 23.7 | **23.7 (1.24×)** |
+| Structured / patterned output | 18.1 | 18.4 | 23.7 | **24.8 (1.37×)** |
 
-*(tok/s, one consistent build, measured 2026-06-10; peak observed on the edit task across
-runs: 39.6 = 2.06×.)* Every row produced **byte-identical output across all three modes**
-— checked with `diff` on every run, including a stress test where every speculative guess
-is deliberately corrupted (the output still comes out exact; bad guesses only cost time).
+*(tok/s, one consistent build, 2026-06-10.)* `pti` mode is best-or-tied on every text
+class: the two draft sources **arbitrate** — when the MTP head disagrees with a fresh
+n-gram match, the match is treated as coincidence and the MTP draft fires instead, so
+MTP-only performance is the floor and copy-run performance is the ceiling.
 
-Honest mode guidance from the table: `pti` wins big on editing/copy-heavy work; on novel
-text the lookup probes cost slightly more than they find, so plain `mtp` mode can edge it
-out — pick per workload (one flag, or per-request).
+**Exactness, precisely**: every emitted token is verified against the model's own logits
+before emission — corrupted drafts can never change the output (the `--sabotage` test
+proves this unconditionally). Byte-identity across modes additionally holds everywhere
+except at genuine floating-point near-ties (logit gap below kernel batch-shape noise),
+where modes may take different — equally greedy — branches; deterministic tie-breaking
+(ε=0.05) makes these rare (one occurrence across the table above).
 
 ## The idea, in plain words
 

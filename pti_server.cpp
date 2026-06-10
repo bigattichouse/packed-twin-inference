@@ -308,8 +308,18 @@ static GenStats run_generate(const std::string &prompt, int max_new,
 
             if (mode == MODE_PTI && n_zero < 3)
                 k = ngram_draft(hist.data(), n_hist, G.args.ngram_g, L_dyn, k_cur, draft);
-            if (k == 0 && ctx_mtp && mtp_cand != -1
-                && !(stats.mtp_fire >= 10 && stats.mtp_acc * 10 < stats.mtp_fire * 3)) {
+
+            bool mtp_alive = ctx_mtp && mtp_cand != -1 && mode >= MODE_MTP
+                          && !(stats.mtp_fire >= 10 && stats.mtp_acc * 10 < stats.mtp_fire * 3);
+
+            // MTP arbitration (M7.3): at the probe rung, an MTP disagreement
+            // with draft[0] marks the n-gram fire as coincidental — veto it.
+            // Makes mtp mode the floor of pti mode (measured: best-or-tied
+            // on every text class). Escalated rungs skip the veto.
+            if (k > 0 && mtp_alive && k_cur <= G.args.draft_k && mtp_cand != draft[0])
+                k = 0;
+
+            if (k == 0 && mtp_alive) {
                 draft[0] = mtp_cand;
                 k = 1;
                 mtp_fired = true;

@@ -384,6 +384,33 @@ Scripts: `llama-server-pti.sh` (editor A/B), `pti-cli.sh` (raw streaming for vid
 (temp>0 falls back to plain today), context ceiling (lazy/smaller MTP ctx or --kv-q8),
 persistent cross-request n-gram cache.
 
+### M7.3 — MTP arbitration + pti_chat + 4-column matrix — **DONE (2026-06-10)**
+
+**MTP arbitration** (user's idea: "MTP as the floor"): the MTP candidate predicts the same
+position as `draft[0]`. At the probe rung (k_cur == draft_k), an MTP disagreement marks the
+n-gram fire as coincidental → veto it and fire the MTP draft instead. Escalated rungs
+(15/31) skip the veto — full accepts at the previous rung outweigh one MTP vote (and a
+~10-15% false-veto would truncate proven 31-token runs).
+
+```
+                    base   lookup-only   mtp-only   pti(arb)      identity
+code edit           19.3   37.5          25.2       39.9 (2.07×)  all ==base
+fresh prose         19.1   18.9          23.7       23.7 (1.24×)  lookup-only diverged*
+structured output   18.1   18.4          23.7       24.8 (1.37×)  all ==base
+```
+
+pti(arb) is best-or-tied on every row — floor achieved AND edit improved (38.5 → 39.9:
+doomed probe fires became MTP 2-emits).
+
+*Identity scoping (honest)*: verification correctness is unconditional (sabotage-proof).
+Byte-identity across batch shapes holds except at genuine fp near-ties wider than the
+ε=0.05 tie-break band — observed twice today (the <think> boundary; a prose continuation
+fork). Both branches are equally greedy; the claim in README is scoped accordingly.
+
+**pti_chat**: interactive llama-cli equivalent (chat template, streaming, per-turn stats,
+live `/mode base|mtp|pti` switching, `/clear`). Per-turn full re-prefill (~0.3 s short
+convos). Smoke-tested: 20.6 tok/s pti on a thinking-heavy reply, mtp 80%.
+
 ### M6.5 — Twin aggregate serving (Path B) — declined by user, not pursued
 
 - 2 independent prompts, 1 seq each, one decode per step, aggregate tok/s vs 2× sequential baseline.

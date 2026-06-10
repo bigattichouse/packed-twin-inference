@@ -203,6 +203,15 @@ $(PTI_LOOKUP): pti_lookup.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
 	@echo "Built $@"
 
+# ── pti_chat: interactive chat CLI (llama-cli equivalent, mode-switchable) ───
+PTI_CHAT := $(BINDIR)/pti_chat
+
+chat: $(PTI_CHAT)
+
+$(PTI_CHAT): pti_chat.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
+
 # ── pti_mtp_probe: M7.0 MTP head semantics probe ─────────────────────────────
 PTI_MTPPROBE := $(BINDIR)/pti_mtp_probe
 
