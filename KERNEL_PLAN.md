@@ -251,11 +251,19 @@ prompt class                      baseline   lookup    ratio   identical
 adversarial prose                 19.4       18.6      0.96×   ✓ (1 fire, suppressed)
 adversarial + sabotaged drafts    19.4       18.5      0.95×   ✓ (gate bounds damage)
 code w/ parallel structure        19.3       18.8      0.97×   ✓ (1 fire, suppressed)
+REAL TASK: code edit (rename a    19.4       28.2      1.45×   ✓ (8 full 7-accepts; the
+  var, re-emit function)                                       2 misses = the rename points)
 verbatim repetition               19.4       27.2      1.40×   ✓ (4× full 7-accepts)
 verbatim repetition (no AIMD)     19.4       34.2      1.76×   ✓ (6× full 7-accepts)
 stress: 20 rebuilds (sabotage,    19.4       13.8      0.71×   ✓ ← correctness machinery
   pre-AIMD, every draft poisoned)                              exercised hard, output exact
 ```
+
+**Real-task validation (2026-06-10)**: input-grounded editing — paste a Python function, ask for
+one variable renamed, output only the code. The model re-emits ~90% of the prompt verbatim;
+lookup drafts fire on PROMPT n-grams (history includes the prompt by construction). 93 tokens in
+36 decode steps (2.58 tok/step), 80% draft acceptance. This is the workload class of code
+assistants (edit/refactor/quote), summarization-with-quotes, and RAG.
 
 **Findings**:
 1. **Byte-identical output on every run** — including 100% poisoned drafts with 20 rebuilds.
