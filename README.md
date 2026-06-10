@@ -29,10 +29,13 @@ MTP-only performance is the floor and copy-run performance is the ceiling.
 
 **Exactness, precisely**: every emitted token is verified against the model's own logits
 before emission — corrupted drafts can never change the output (the `--sabotage` test
-proves this unconditionally). Byte-identity across modes additionally holds everywhere
-except at genuine floating-point near-ties (logit gap below kernel batch-shape noise),
-where modes may take different — equally greedy — branches; deterministic tie-breaking
-(ε=0.05) makes these rare (one occurrence across the table above).
+proves this unconditionally, at any temperature). Byte-identity across modes additionally
+holds everywhere except at genuine floating-point near-ties (logit gap below kernel
+batch-shape noise), where modes may take different — equally valid — branches;
+deterministic tie-breaking (ε=0.05) makes these rare. At temperature > 0, sampling is
+position-seeded: a fixed seed reproduces a run byte-for-byte (τ=0.25 code edit: pti
+output identical to the seeded plain run), with occasional cross-mode flips at high
+temperatures where samples land near CDF boundaries.
 
 ## The idea, in plain words
 
@@ -74,10 +77,14 @@ make lookup server chat
 ./pti-cli.sh base "same prompt" 300                  # plain llama.cpp speed
 ./pti-cli.sh compare "same prompt" 300               # both, back to back
 
-# OpenAI-compatible server for your editor (port 8080)
+# OpenAI-compatible server for your editor (port 8080) — any temperature
 ./llama-server-pti.sh pti     # lookup + MTP   (~2× on edits)
 ./llama-server-pti.sh mtp     # MTP only       (the "fair" baseline if you'd always use MTP)
 ./llama-server-pti.sh base    # plain decode   (= stock llama-server behavior)
+
+# interactive chat with live mode/temp switching (llama-cli equivalent)
+bin/pti_chat -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf --mode pti -t 0.25
+#   > your message ...      /mode base|mtp|pti    /temp 0.7    /clear    /quit
 ```
 
 The server speaks `/v1/chat/completions` with SSE streaming, **at any temperature** —
@@ -133,16 +140,16 @@ What this repo adds on top:
 Working and validated end-to-end (CLI + server, all byte-identical): the numbers in the
 table above. Open items, in value order:
 
-1. **Multi-token MTP-context batches produce garbage** (llama-ext graph bug; the
+1. **Prompt cache for the server** *(next up)* — pti_server re-prefills every request;
+   at big contexts the prefill dominates editor latency (llama-server reuses slots).
+   Hybrid-SSM constraint: recurrent state can't rewind, so the cache can fast-path
+   conversation *extensions* (delta prefill) and must full-prefill on divergence.
+2. **Multi-token MTP-context batches produce garbage** (upstream graph issue; the
    last-pair-only workaround costs ~4 accept points and leaves cache gaps)
-2. ~~Sampled verification~~ — **done**: speculation active at any temperature
-   (sample-and-match, position-keyed RNG; τ=0.25 code edit keeps the full 2.0×,
-   seeded runs reproduce byte-for-byte; chat temps degrade gracefully to the floor)
 3. **Context ceiling** — 49k usable exact; `--kv-q8 -c 196608` verified working (~96k
    usable, MTP active) at the cost of cross-mode byte-identity
-4. **Persistent cross-request n-gram cache + prompt cache** — pti_server re-prefills
-   every request; at huge contexts the prefill dominates (llama-server reuses slots —
-   we don't yet). Matters before big-context editor use is practical.
+4. ~~Sampled verification~~ — **done** (M7.4): speculation active at any temperature;
+   τ=0.25 code edit keeps the full 2.0×, seeded runs reproduce byte-for-byte
 
 Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kernel
 (the only path past the current verify-cost curve; major project).
@@ -151,9 +158,11 @@ Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kern
 
 | file | what |
 |---|---|
-| `pti_lookup.cpp` | the algorithm — CLI with `--baseline/--mtp/--sabotage` audit modes |
-| `pti_server.cpp` | OpenAI-compatible server with `--mode base/mtp/pti` |
+| `pti_lookup.cpp` | the algorithm — CLI with `--baseline/--mtp/--sabotage/-t` audit modes |
+| `pti_server.cpp` | OpenAI-compatible server, `--mode base/mtp/pti`, any temperature |
+| `pti_chat.cpp` | interactive chat (llama-cli equivalent): live `/mode`, `/temp`, per-turn stats |
 | `pti-cli.sh`, `llama-server-pti.sh` | launch scripts |
+| `llama.cpp-patch/`, `llama.cpp-files/` | the one (optional) llama.cpp patch + mirrored files |
 | `pti_kbatch_bench.cpp`, `pti_mtp_probe.cpp`, `pti_q6k_bench.hip` | the measurements behind the design |
 | `POSITIVE_RESULTS.md` | every win, with numbers |
 | `FAILED_EXPERIMENTS.md` | every dead end, with numbers (read this before "improving" the kernel) |

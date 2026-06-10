@@ -45,6 +45,38 @@ MTP context produce garbage (≈48% live accept, alternating pattern) — worked
 last-pair-only feeds (flat 3.5 ms/step, −4 accept points); root-cause fix in the ext graph
 is open.
 
+## 1c. MTP arbitration — mtp mode becomes the floor of pti mode (M7.3)
+
+The MTP candidate predicts the same position as the first lookup token, so when the
+n-gram fires at the probe rung, the two draft sources vote: agreement keeps the lookup
+draft; disagreement vetoes it as coincidence and fires the MTP draft instead. Escalated
+ladder rungs (15/31) skip the veto — earned trust outweighs one ~85%-accurate vote.
+
+```
+                  base   lookup-only   mtp-only   pti(arbitrated)
+code edit         19.3   37.5          25.2       39.9  (2.07×)
+fresh prose       19.1   18.9          23.7       23.7  (1.24×)
+structured        18.1   18.4          23.7       24.8  (1.37×)
+```
+
+pti went from losing to mtp-only on novel text to best-or-tied on every class — and the
+veto *improved* the edit task (doomed probe fires became MTP 2-emits).
+
+## 1d. Sampled verification — full speedup at coding temperatures (M7.4)
+
+Sample-and-match: every verified position samples from the target logits; drafts are
+accepted while the sample agrees. For deterministic drafts this is the optimal rejection
+scheme — output is exactly plain temperature sampling. Position-keyed RNG
+(`splitmix64(seed ^ pos)`) makes seeded runs reproducible and lets all modes consume
+randomness identically.
+
+```
+code edit  τ=0.25:  base 18.5 → pti 37.0  (2.00×)  byte-identical to seeded baseline
+prose      τ=0.70:  0.96× (floor holds; MTP accept drops to 56%)
+sabotage   τ=0.25:  all drafts poisoned → byte-identical
+server API τ=0.25:  35.6 tok/s end-to-end
+```
+
 ## 2. Batched verification is EXACT on a hybrid-SSM model, and sub-linear in cost
 
 `pti_kbatch_bench` chain-match: a k-token single-sequence batch reproduces the sequential
