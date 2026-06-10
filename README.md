@@ -11,11 +11,11 @@ rollback. No custom kernels, no model changes, no quality loss.
 
 | task | baseline | pti_lookup | ratio | output |
 |---|---|---|---|---|
-| Code edit, 25-line function (234 tok) | 19.2 | **35.5** | **1.85×** | byte-identical |
+| Code edit, 25-line function (234 tok) | 19.2 | **37.0** | **1.93×** | byte-identical |
 | Code edit, short function (93 tok) | 19.4 | 29.9 | 1.54× | byte-identical |
 | Verbatim repetition (best case) | 19.4 | 34.2 | 1.76× | byte-identical |
-| Hostile prose (worst case) | 19.4 | 18.7 | 0.96× | byte-identical |
-| Sabotage: 100% poisoned drafts | 19.4 | 13.8 | 0.71× | **byte-identical** |
+| Hostile prose (worst case) | 19.4 | 18.8 | 0.97× | byte-identical |
+| Sabotage: 100% poisoned drafts | 19.4 | 18.8 | 0.97× | **byte-identical** |
 
 The speedup comes from **copy-runs** — spans the model re-emits from the prompt or its own
 output. Editing, refactoring, summarize-with-quotes, RAG answers quoting passages, structured
@@ -40,15 +40,18 @@ Four pieces make it work on a hybrid-SSM model where stock lookup decoding can't
 
 1. **Batched verification is exact** — a k-token batch reproduces the sequential greedy chain
    bit-for-bit (`pti_kbatch_bench` chain-match, PASS at every k), and costs far less than k
-   decodes: batch 4 = 1.71×, batch 8 = 3.11×, **batch 16 = 4.47×** (15.6 ms/token).
+   decodes: batch 4 = 1.71×, batch 8 = 3.11×, batch 16 = 4.47×, **batch 32 = 6.93×**
+   (12.1 ms/token — a full 32-hit runs at 82 tok/s).
 2. **SSM-safe rollback** — recurrent state can't rewind per-position. A checkpoint sequence
-   (`llama_memory_seq_cp`, measured 0.02 ms) plus one batched re-decode of the accepted prefix
-   rebuilds exact state after a miss.
+   (`llama_memory_seq_cp`, measured 0.02 ms) restores exact state after a miss; the accepted
+   prefix rides as logits-free tokens at the front of the next batch (merged rebuild — one
+   sub-linear call instead of two).
 3. **AIMD confidence gate** — every failed fire raises the suffix-match bar (+4), full accepts
    decay it (−1). True copy-runs (matches in the tens of tokens) clear any bar; coincidence-prone
    text self-suppresses after one fire. Static thresholds lose (see FAILED_EXPERIMENTS.md §7).
-4. **Adaptive draft length** — probe at k=7; inside a confirmed copy-run jump to k=15
-   (batch 16 costs the same as batch 12). Hard-off after 3 dead fires bounds hostile text.
+4. **Draft-length ladder** — probe at k=7; full accepts escalate 7 → 15 → 31; any miss resets.
+   Deep batches only fire inside runs proven at the previous rung. Hard-off after 3 dead fires
+   bounds hostile text.
 
 **Why output is provably identical**: every emitted token is the argmax of a logit row whose
 input prefix is fully verified. Drafts only decide *which positions get computed in the same
@@ -77,10 +80,13 @@ stderr, so `diff <(run --baseline) <(run)` is the audit.
 
 ## Roadmap
 
-- [ ] Draft window k=24/32 — batch-16 cost flatness suggests headroom above 16
-- [ ] Merged rebuild — fold the miss penalty into the next verify batch (sub-linear batching
-      makes one call cheaper than two)
+- [x] Draft window to k=31 — ladder 7→15→31, full 32-batch hit = 82 tok/s
+- [x] Merged rebuild — miss penalty folded into the next verify batch
+- [ ] Possible next: persistent cross-prompt n-gram cache; sampled (non-greedy) verification
 - Twin aggregate serving (2 users, one weight stream, ~1.6×) — understood, not pursued
+
+The drafted-step cost is now near-optimal; remaining time is dominated by the novel-text
+portions of the output, which is the structural floor for lookup-based drafting.
 
 ## Project history
 
@@ -116,8 +122,8 @@ draft is free and the math flips positive.
 Hardware:        MI50 (gfx906), 32 GiB HBM2, no MFMA, wave64
 Model:           Qwen3.6-27B UD-Q6_K_XL (25 GB), hybrid attention+SSM
 Baseline:        19.0–19.4 tok/s (52.6 ms/step)
-Batch decode:    b2 1.20×  b4 1.71×  b8 3.11×  b12 4.43×  b16 4.47×  (chain-exact)
+Batch decode:    b2 1.20×  b4 1.71×  b8 3.11×  b16 4.47×  b24 5.90×  b32 6.93×  (chain-exact)
 seq_cp:          0.02 ms (checkpointing is free)
-pti_lookup:      35.5 tok/s on real code edit (1.85×); 0.96× bounded worst case
-Hit-run ceiling: 15.6 ms/token in a full 16-batch = 3.4× during copy-runs
+pti_lookup:      37.0 tok/s on real code edit (1.93×); 0.97× bounded worst case
+Hit-run ceiling: 12.1 ms/token in a full 32-batch = 4.3× during copy-runs
 ```

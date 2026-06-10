@@ -282,6 +282,30 @@ hostile prose                 19.4       18.6      18.7  (0.96×)  ✓  bound un
 The longer the copy-runs, the closer to the batch-16 ceiling (3.6×): real editing tasks with
 bigger functions/documents sit at 1.8–2× and rising with output length.
 
+### M6.4c — k=31 ladder + merged rebuild — **DONE**
+
+Curve extension: k=24 = 5.90× (13.7 ms/tok), **k=32 = 6.93× (12.1 ms/tok)**, chain-match PASS —
+a full 32-batch hit runs at 82 tok/s (4.3×). Ladder policy: probe k=7 → full accept → 15 → full
+→ 31; reset on miss. Deep batches only fire inside runs proven at the previous rung.
+
+Merged rebuild: on a miss, the accepted prefix rides as logits-free "pending" tokens at the
+front of the NEXT batch instead of its own decode call (sub-linear batching: cost(e+1+k) <
+cost(e) + cost(1+k)). While pending exists, seq0 sits at the checkpoint; a full accept of the
+merged batch clears it. Sabotage stress on the pending path: byte-identical.
+
+```
+task                       baseline   k15    +ladder31   +merged   identical
+long code edit (234 tok)   19.2       35.5   36.5        37.0      ✓  (1.93×)
+repeat                     19.4       27.2   —           26.8      ✓
+hostile prose              19.4       18.7   —           18.8      ✓
+sabotage                   19.4       18.5   —           18.8      ✓
+```
+
+Accept histogram on the long edit shows the ladder working: `7:3 15:2 26:1 31:3` —
+three full 31-token accepts. Drafted-step cost is now near-optimal; remaining time is
+dominated by the novel-text (non-copy) portions of the output, which is the true floor for
+lookup-based drafting.
+
 **Findings**:
 1. **Byte-identical output on every run** — including 100% poisoned drafts with 20 rebuilds.
    The SSM checkpoint-rollback (seq_cp + re-decode accepted prefix) is correct.

@@ -48,7 +48,7 @@
 
 #define MAX_TOKENS   8192
 #define DEFAULT_CTX  2048
-#define MAX_DRAFT    15
+#define MAX_DRAFT    31     // batch 32 = 6.93× cost, 12.1 ms/token, chain-exact (M6.0)
 
 static double now_sec() {
     struct timespec ts;
@@ -157,7 +157,9 @@ static int run_lookup(const LookupArgs *args) {
             args->sabotage ? "+SABOTAGE" : "", args->draft_k, args->ngram_g, args->ngram_L);
 
     // ── Prefill seq 0 ────────────────────────────────────────────────────────
-    struct llama_batch batch = llama_batch_init(n_hist + MAX_DRAFT + 2, 0, 2);
+    // capacity: prefill needs n_hist; merged step batches need pending(≤120)+1+MAX_DRAFT
+    int batch_cap = n_hist > 160 ? n_hist : 160;
+    struct llama_batch batch = llama_batch_init(batch_cap + 4, 0, 2);
     batch_clear(&batch);
     for (int i = 0; i < n_hist; i++)
         batch_add(&batch, hist[i], (llama_pos)i, 0, i == n_hist - 1);
@@ -198,15 +200,26 @@ static int run_lookup(const LookupArgs *args) {
         // text (long shared phrases, divergent continuations) ratchets the
         // bar up after a couple of misses and stops firing → baseline parity.
         //
-        // Adaptive draft length: a full accept means we are inside a copy-run,
-        // so the next fire jumps to MAX_DRAFT (batch 16 costs 4.47× for up to
-        // 16 tokens = 15.6 ms/tok — M6.0 curve). Any miss resets to draft_k.
+        // Adaptive draft length ladder: full accept escalates 7 → 15 → 31
+        // (batch 16 = 15.6 ms/tok, batch 32 = 12.1 ms/tok — M6.0 curve).
+        // Any miss resets to draft_k. Deep batches only fire inside runs
+        // that have already proven themselves at the previous rung.
         //
         // Hard-off: after 3 zero-accept fires, drafting is disabled for the
         // rest of the generation — bounds the worst case on hostile text.
+        //
+        // Merged rebuild: on a miss, the accepted prefix is NOT re-decoded in
+        // its own call. It rides as logits-free "pending" tokens at the front
+        // of the NEXT batch (batching is sub-linear, so one call of e+1+k
+        // beats cost(e) + cost(1+k)). While pending exists, seq0 sits at the
+        // checkpoint state and seq1 is not refreshed; a full accept of a
+        // merged batch consumes pending and makes seq0 clean again.
         int L_dyn   = args->ngram_L;
         int k_cur   = args->draft_k;
         int n_zero  = 0;
+        llama_token pend_tok[128];
+        llama_pos   pend_pos[128];
+        int n_pend  = 0;
         while (n_gen < args->max_new && !llama_vocab_is_eog(vocab, tok_last)) {
             llama_token draft[MAX_DRAFT];
             int k = (n_zero >= 3) ? 0
@@ -217,13 +230,26 @@ static int run_lookup(const LookupArgs *args) {
                 for (int i = 0; i < k; i++) draft[i] = (draft[i] + 1) % n_vocab;
             }
 
-            if (k > 0) {
-                // refresh checkpoint: seq1 = S(p)
+            // overflow guard: flush pending alone if the merged batch would not fit
+            if (n_pend + 1 + k > 120) {
+                batch_clear(&batch);
+                for (int i = 0; i < n_pend; i++)
+                    batch_add(&batch, pend_tok[i], pend_pos[i], 0, false);
+                if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "\nFlush failed\n"); break; }
+                n_pend = 0;
+            }
+
+            if (k > 0 && n_pend == 0) {
+                // refresh checkpoint: seq1 = S(p). Skipped while pending exists —
+                // seq1 already holds the checkpoint the pending tokens build on.
                 llama_memory_seq_rm(mem, 1, 0, -1);
                 llama_memory_seq_cp(mem, 0, 1, 0, -1);
             }
 
             batch_clear(&batch);
+            for (int i = 0; i < n_pend; i++)
+                batch_add(&batch, pend_tok[i], pend_pos[i], 0, false);
+            const int base = n_pend;                 // batch index of first logits token
             batch_add(&batch, tok_last, p, 0, true);
             for (int i = 0; i < k; i++)
                 batch_add(&batch, draft[i], p + 1 + i, 0, true);
@@ -237,7 +263,7 @@ static int run_lookup(const LookupArgs *args) {
             int e = 0;
             bool stop = false;
             for (int i = 0; i <= k; i++) {
-                llama_token a = (llama_token)argmax_f(llama_get_logits_ith(ctx, i), n_vocab);
+                llama_token a = (llama_token)argmax_f(llama_get_logits_ith(ctx, base + i), n_vocab);
                 print_token(vocab, a);
                 hist[n_hist++] = a;
                 n_gen++; e++;
@@ -251,7 +277,7 @@ static int run_lookup(const LookupArgs *args) {
                 n_draft_acc += acc;
                 if (acc == k) {
                     L_dyn = L_dyn > args->ngram_L ? L_dyn - 1 : args->ngram_L;
-                    k_cur = MAX_DRAFT;                // in a copy-run: go long
+                    k_cur = k_cur <= args->draft_k ? 15 : MAX_DRAFT;   // ladder: 7→15→31
                 } else {
                     L_dyn += 4;
                     k_cur = args->draft_k;            // back to probe size
@@ -259,25 +285,26 @@ static int run_lookup(const LookupArgs *args) {
                 }
             }
             if (args->verbose && k > 0)
-                fprintf(stderr, "\n[draft k=%d acc=%d L_dyn=%d k_cur=%d]", k, acc, L_dyn, k_cur);
+                fprintf(stderr, "\n[draft k=%d acc=%d L_dyn=%d k_cur=%d pend=%d]", k, acc, L_dyn, k_cur, n_pend);
 
             if (stop) { p += e; break; }
 
             if (e == k + 1 || k == 0) {
-                // full accept (or plain step): seq0 consumed exactly the
-                // verified tokens → state is clean S(p+e)
+                // full accept (or plain step): the batch consumed pending +
+                // exactly the verified tokens → seq0 clean at S(p+e)
+                n_pend = 0;
                 p += e;
             } else {
-                // partial: seq0 consumed wrong tail tokens → rebuild from checkpoint
+                // partial: seq0 consumed wrong tail → restore checkpoint and
+                // queue the accepted prefix as pending for the next batch
                 n_rebuilds++;
                 llama_memory_seq_rm(mem, 0, 0, -1);
-                llama_memory_seq_cp(mem, 1, 0, 0, -1);      // S(p)
-                batch_clear(&batch);
-                batch_add(&batch, tok_last_old, p, 0, false);
-                for (int i = 0; i < e - 1; i++)              // accepted drafts only
-                    batch_add(&batch, draft[i], p + 1 + i, 0, false);
-                if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "\nRebuild failed\n"); break; }
-                p += e;                                      // seq0 = S(p+e) clean
+                llama_memory_seq_cp(mem, 1, 0, 0, -1);       // S(ckpt)
+                pend_tok[n_pend] = tok_last_old;  pend_pos[n_pend] = p;  n_pend++;
+                for (int i = 0; i < e - 1; i++) {            // accepted drafts only
+                    pend_tok[n_pend] = draft[i];  pend_pos[n_pend] = p + 1 + i;  n_pend++;
+                }
+                p += e;
             }
         }
     }

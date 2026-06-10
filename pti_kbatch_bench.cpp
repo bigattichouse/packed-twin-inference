@@ -30,7 +30,7 @@
 
 #define MAX_TOKENS  4096
 #define DEFAULT_CTX 2048
-#define CHAIN_LEN   17      // g[0..16]: inputs g[0..15], expected outputs g[1..16]
+#define CHAIN_LEN   33      // g[0..32]: inputs g[0..31], expected outputs g[1..32]
 
 static double now_sec() {
     struct timespec ts;
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Prompt: %d tokens\n", n_prompt);
 
     // ── 1. Prefill seq 0, checkpoint to seq 1 ───────────────────────────────
-    struct llama_batch batch = llama_batch_init(n_prompt + 16, 0, 2);
+    struct llama_batch batch = llama_batch_init(n_prompt + CHAIN_LEN + 4, 0, 2);
     batch_clear(&batch);
     for (int i = 0; i < n_prompt; i++)
         batch_add(&batch, prompt_toks[i], (llama_pos)i, 0, i == n_prompt - 1);
@@ -124,10 +124,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n\n");
 
     // ── 3. Cost curve: k-token batch from restored checkpoint ───────────────
-    const int ks[]  = {1, 2, 4, 8, 12, 16};
+    const int ks[]  = {1, 2, 4, 8, 16, 24, 32};
     const int n_ks  = (int)(sizeof(ks) / sizeof(ks[0]));
-    double mean_ms[8] = {};
-    int    mism  [8] = {};
+    double mean_ms[16] = {};
+    int    mism  [16] = {};
     double cp_ms_total = 0.0;
     int    cp_count    = 0;
 
@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  baseline step (k=1):       %.1f ms → %.1f tok/s\n", base, 1000.0 / base);
     fprintf(stderr, "\n  Lookup throughput model: tok/s = (1+E[j]) / (cost_k + miss×(rebuild+cp))\n");
     fprintf(stderr, "  e.g. k=4, E[j]=2, miss=30%%: %.1f tok/s\n",
-            1000.0 * 3.0 / (mean_ms[3] + 0.3 * (mean_ms[3] + cp_mean)));
+            1000.0 * 3.0 / (mean_ms[2] + 0.3 * (mean_ms[2] + cp_mean)));
     fprintf(stderr, "════════════════════════════════════════════════════════════\n");
 
     llama_batch_free(batch);
