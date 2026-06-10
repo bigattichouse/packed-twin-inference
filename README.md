@@ -93,6 +93,24 @@ diff a.txt b.txt    # always empty
 | `FAILED_EXPERIMENTS.md` | every dead end, with numbers (read this before "improving" the kernel) |
 | `KERNEL_PLAN.md`, `PLAN.md`, `DESIGN.md` | full investigation logs |
 
+## Why "packed twin inference"?
+
+The name predates the final design, but both words still point at the two load-bearing
+mechanisms:
+
+- **Packed** — the speedup comes from packing many token positions into one weight pass:
+  verifying a 32-token draft costs 6.93× one token, not 32×, because the 25 GB weight
+  read is shared across all of them. One weight load, many useful computations — the
+  project's founding thesis, surviving on a different axis (positions of one stream,
+  rather than parallel streams).
+- **Twin** — every draft is verified against, and healed from, a *twin* of the working
+  sequence's state. The twin checkpoint is what makes speculation safe on hybrid-SSM
+  models, where recurrent state cannot rewind — and it is exactly the piece stock
+  lookup decoding lacks.
+
+The whole system in one sentence: **draft forward, verify in a packed batch, and when a
+draft misses, fall back to your twin.**
+
 ## History, briefly
 
 This repo started as "Packed Twin Inference" — running staggered copies of the model in
