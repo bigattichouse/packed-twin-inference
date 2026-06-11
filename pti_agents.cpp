@@ -484,6 +484,33 @@ static const char *BOSS_PROMPT =
     "Rules: pieces must be independent (no shared mutable state mid-flight); exported symbols\n"
     "must not collide across pieces; keep pieces similar in size. Emit the envelope only.";
 
+// lean worker preamble — the framework lives in the boss, NOT here (design §3/§5.2)
+static const char *WORKER_PREAMBLE =
+    "You implement ONE piece of a larger program. You are given a frozen shared interface and\n"
+    "a spec for YOUR PIECE ONLY. Produce just that piece: the implementation (plus a quick\n"
+    "inline test only if natural) for your declared exports, in the given language, and nothing\n"
+    "else — no prose, no other functions, no re-declaring the shared interface. Match the\n"
+    "declared signatures exactly. Output only code.";
+
+// assemble a lane's prompt from the work order: preamble + shared + this piece's spec
+static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
+    std::string user = "Shared interface (the public params you may rely on):\n";
+    user += wo.shared + "\n\n";
+    if (p.is_boss) {                       // boss SELF lane: knows the workers' declared exports
+        user += "The workers are separately producing these exports: ";
+        bool first = true;
+        for (auto &q : wo.pieces) {
+            if (q.is_boss) continue;
+            for (auto &e : q.exports) { user += (first ? "" : ", ") + e; first = false; }
+        }
+        user += ".\n\n";
+    }
+    user += "Your piece";
+    if (!p.language.empty()) user += " (" + p.language + ")";
+    user += ": " + p.instruction + "\n\nSpec:\n" + p.blueprint;
+    return apply_chat_template({ {"system", WORKER_PREAMBLE}, {"user", user} });
+}
+
 int main(int argc, char **argv) {
     char  model_path[512] = {};
     char  task[2048] = {};
@@ -508,6 +535,7 @@ int main(int argc, char **argv) {
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
+    if (task[0] && max_new == 96) max_new = 1536;   // pipeline pieces need room for think + code (boss writes the most)
     {   // non-unified KV gives n_ctx/n_seq_max per lane; ensure each lane fits its prompt + gen
         int need = (max_new + 320) * n_streams;
         if (n_ctx < need) n_ctx = need;
@@ -550,10 +578,38 @@ int main(int argc, char **argv) {
                 el, trim(plan).size(), trim(plan).c_str());
         WorkOrder wo = parse_work_order(plan);
         print_work_order(wo);
+        if (!wo.ok) { llama_free(G.ctx); llama_model_free(G.model); llama_backend_free(); return 2; }
+
+        // ── PA.1b: FAN-OUT + PARALLEL — each piece becomes a lane in the gate'd packed loop
+        int nlanes = (int)wo.pieces.size();
+        if (nlanes > n_streams) {
+            fprintf(stderr, "warn: %d pieces > n_seq_max %d — using first %d\n", nlanes, n_streams, n_streams);
+            nlanes = n_streams;
+        }
+        std::vector<Stream> lanes(nlanes);
+        for (int i = 0; i < nlanes; i++) {
+            std::string lp = build_lane_prompt(wo, wo.pieces[i]);
+            lanes[i].prompt_toks.resize(MAX_TOKENS);
+            int ln = llama_tokenize(G.vocab, lp.c_str(), (int32_t)lp.size(),
+                                    lanes[i].prompt_toks.data(), MAX_TOKENS, true, true);
+            lanes[i].prompt_toks.resize(ln > 0 ? ln : 0);
+        }
+        fprintf(stderr, "\n══ PA.1b FAN-OUT + PARALLEL — %d lanes, cap %d/lane ══\n", nlanes, max_new);
+        double w = 0, pf = 0, t1 = now_sec();
+        int tot = run_streams(lanes, max_new, /*packed=*/true, &w, &pf);
+        fprintf(stderr, "  %d tok, %.1f tok/s aggregate (%.1fs decode +%.1fs prefill, %.1fs wall)\n",
+                tot, w > 0 ? tot / w : 0.0, w, pf, now_sec() - t1);
+        for (int i = 0; i < nlanes; i++) {
+            std::string body = lanes[i].text;
+            size_t bth = body.find("</think>");
+            if (bth != std::string::npos) body = body.substr(bth + 8);
+            printf("\n───── lane %s [%s, seq %d] ─────\n%s\n",
+                   wo.pieces[i].id.c_str(), wo.pieces[i].is_boss ? "BOSS" : "worker", i, trim(body).c_str());
+        }
         llama_free(G.ctx);
         llama_model_free(G.model);
         llama_backend_free();
-        return wo.ok ? 0 : 2;
+        return 0;
     }
 
     // independent worker-shaped prompts (PA.1 will generate these from a plan).
