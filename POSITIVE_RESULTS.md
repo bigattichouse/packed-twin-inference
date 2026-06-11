@@ -194,3 +194,33 @@ packed lanes byte-identical to solo on all 4 streams (96 tok each), asserted in-
 (`kv_unified=false` + f16 KV + ε=0.05 tie-break; the binary exits non-zero on divergence).
 This is the correctness foundation for cooperation: a lane's output does not depend on which
 siblings share its batch.
+
+### Scaling streams: `-s` is configurable (1..16), but 4 is the sweet spot — measured
+
+Sweeping lanes (UD-Q6_K_XL, n=96/lane), packed *absolute* throughput and the gate:
+
+| N  | packed tok/s | speedup vs true 19.3 baseline | byte-identity gate |
+|----|------|------|------|
+| 4  | **37.4** | **1.93×** | PASS (4/4 identical) |
+| 8  | 21.5 | 1.11× | FAIL (2/8 lanes) |
+| 16 | 26.5 | 1.37× | FAIL (3/16 lanes) |
+
+More lanes do **not** win, for two measured reasons:
+
+1. **Idle-sequence SSM tax.** The *sequential* (one-live-lane) rate itself falls as
+   `n_seq_max` grows — 19.3 → 13.6 → 7.5 tok/s at N=4/8/16 — though only one lane is ever
+   live. On this hybrid-SSM model with non-unified KV, the recurrent state is processed for
+   **every allocated sequence each decode step**, live or not. So packed throughput peaks
+   near N=4, and the in-binary "aggregate" (packed ÷ same-config sequential) is *inflated*
+   at high N because its denominator is degraded by the same tax (N=16 prints 3.54× but is
+   only 1.37× vs the real baseline). The k-batch microbench has no such tax — k tokens share
+   ONE sequence — which is why it over-predicted high-N gains.
+2. **Byte-identity breaks past 4.** At N=8/16 a few lanes diverge from their solo run, but
+   the divergences are **equally-valid near-ties** (e.g. solo `' etc'` vs packed `' but'`) —
+   the same "fp near-tie wider than ε=0.05" bound the project ships under, just more frequent
+   at higher batch occupancy. Verification correctness is intact; strict byte-*determinism*
+   is not, above 4.
+
+Conclusion: keep `-s` for experiments, but **4 is the operating point** — it maximizes packed
+throughput *and* is the largest gate-clean (byte-identical) lane count. This matches the
+coordinator + 3-workers design; now measured, not assumed.

@@ -49,6 +49,14 @@ Everything below is measured and lives in the codebase already.
 - **Cost curve** (one batched step vs one single-token step): 1.20×@b2, 1.71×@b4,
   3.11×@b8, 4.47×@b16, 6.93×@b32; ≈12.1 ms/tok at b32. 4 real lanes sit at b4 = 1.71×
   for decode, ~1.86× including the per-step overhead measured end-to-end.
+- **Idle-sequence SSM tax — measured, and it caps useful N low (PA.0, 2026-06-11).**
+  Per-decode cost scales with `n_seq_max` (allocated lanes), not just *live* lanes: one live
+  stream runs at 19.3 / 13.6 / 7.5 tok/s in a context built for N = 4 / 8 / 16, because the
+  hybrid model's recurrent state is processed for every allocated sequence each step. Packed
+  throughput therefore **peaks near N=4** (37.4 tok/s) and *falls* at 8/16. The k-batch
+  microbench (k tokens in ONE seq) has no such tax, so it over-predicts high-N gains. The
+  lane count is configurable (`-s 1..16`) but **4 is the operating point**. See
+  POSITIVE_RESULTS §12.
 - **inject(seq, text)** = tokenize + prefill into that seq at its current position. Same
   mechanics as the M7.5 delta prefill. This is how fan-out, refill, broadcast, and gather
   all move tokens into a stream.
@@ -87,8 +95,12 @@ solo *modulo floating-point near-ties wider than ε* (observed elsewhere at `<th
 boundaries and repetition forks). That is the same honesty bound the rest of the project
 ships under. **PA.0's acceptance gate is to verify this empirically** — run each stream
 packed and again alone, assert identical output (§9). The cooperative model is built on
-this holding; do not assume it, measure it. **Measured 2026-06-11 (PA.0): PASS** — 4 lanes
-byte-identical packed-vs-solo at n=96, with `kv_unified=false` + f16 KV + ε=0.05 tie-break.
+this holding; do not assume it, measure it. **Measured 2026-06-11 (PA.0): PASS at N=4** — 4
+lanes byte-identical packed-vs-solo at n=96 (`kv_unified=false` + f16 KV + ε=0.05). At
+**N≥8 the gate FAILS** on a few lanes — but the flips are equally-valid near-ties (solo
+`' etc'` vs packed `' but'`), the fp-near-tie-wider-than-ε bound, just more frequent at
+higher batch occupancy. So byte-*determinism* holds at the design point (4) and degrades
+above it; verification correctness is unaffected. Another reason the operating point is 4.
 
 ---
 
@@ -429,11 +441,11 @@ quality matters more than the extra ~0.25×, do PA.4 first.
 | **PA.3** | speculation stacking (MTP/lookup per stream, `n_seq_max=8`) | ~2.4× aggregate; per-lane output still reproducible |
 | **PA.4** | bidirectional coordination: worker `ASK`→boss `REPLY`, plus boss GUIDE/KILL (independent of PA.3) | a worker blocked on an ambiguous spec gets an answer and finishes; boss kills+retries a sabotaged runaway within N tokens; Q&A stays within `q_budget` |
 
-**Immediate next action:** PA.0 is built (`make agents`), measured (**~1.9× aggregate**,
-1.87–1.95× run-to-run), and the **byte-identity gate PASSES** (2026-06-11; 4 lanes identical
-packed-vs-solo, `kv_unified=false`, exits non-zero on divergence). Next: make the lane count
-configurable (boss picks **4–16** by cleanest split, bounded by the measured speed/ctx
-tradeoff), then **PA.1** (boss → workers → gather pipeline).
+**Immediate next action:** PA.0 is built (`make agents`), measured (**~1.9×** at N=4,
+37.4 tok/s packed), the **byte-identity gate PASSES at N=4**, and the lane count is now
+**configurable (`-s 1..16`)**. An N-sweep settled the "more lanes?" question: **4 is the
+sweet spot** — higher N loses on speed (idle-seq SSM tax, §2) *and* byte-identity (near-ties,
+§2.1). Default stays 4. Next: **PA.1** (boss → workers → gather pipeline).
 
 ---
 
@@ -453,3 +465,7 @@ tradeoff), then **PA.1** (boss → workers → gather pipeline).
   default; chat is the exception, and every round is serial.
 - **Memory:** one model in VRAM (~24 GB, loaded once); lanes add only KV/SSM state, and at
   fixed `n_ctx` that is a *subdivision* of an already-paid pool, not new allocation.
+- **Lane count:** configurable (`-s 1..16`), **default 4** — the measured sweet spot. More
+  lanes lose to the idle-sequence SSM tax (§2) *and* break byte-identity (§2.1), so the boss
+  should split into ≤4 lanes (itself + ≤3 workers) on this hardware. (User's criterion: "if
+  we still win on speed… if not, I'm fine with 4" — measurement says we don't win past 4.)

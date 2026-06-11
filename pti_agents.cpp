@@ -1,9 +1,10 @@
 /*
  * pti_agents.cpp — PA.0: packed-agents plumbing demo
  *
- * Four independent prompt streams decode in ONE llama_context with one
- * batched llama_decode per step (one token per live stream). Measures the
- * aggregate throughput against the same four prompts run sequentially.
+ * N independent prompt streams (default 4, -s up to 16) decode in ONE
+ * llama_context with one batched llama_decode per step (one token per live
+ * stream). Measures aggregate throughput vs the same prompts run sequentially,
+ * and asserts each packed lane is byte-identical to its solo run.
  *
  * Expected from the M5.1 measurement (4-seq batch = 1.86× one stream):
  *   aggregate ≈ 4 / 1.86 ≈ 2.15× the sequential token rate.
@@ -12,8 +13,8 @@
  * into coordinator + 3 workers with plan / fan-out / parallel / gather.
  *
  * Build:  make agents
- * Run:    bin/pti_agents -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf
- *         (runs sequential then packed on 4 built-in prompts, prints ratio)
+ * Run:    bin/pti_agents -m ../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf [-s 8]
+ *         (runs sequential then packed on N built-in prompts; prints ratio + gate)
  */
 
 #include "../llama.cpp/include/llama.h"
@@ -26,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define N_STREAMS     4
+#define MAX_STREAMS   16
 #define PREFILL_CHUNK 1024
 #define MAX_TOKENS    32768
 
@@ -112,11 +113,12 @@ static bool prefill_stream(Stream &st, llama_seq_id seq, llama_batch &batch, int
     return true;
 }
 
-// run `count` streams (1 = sequential one at a time; N_STREAMS = packed).
-// Returns total generated tokens; *wall_out = decode-loop seconds (prefill excluded).
+// run all streams: packed=false → one at a time in seq 0 (solo reference);
+// packed=true → one batched decode per step. Returns total generated tokens;
+// *wall_out = decode-loop seconds (prefill excluded).
 static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
                        double *wall_out, double *prefill_out) {
-    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, N_STREAMS);
+    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, (int)streams.size());
     int total = 0;
     double wall = 0.0, prefill = 0.0;
 
@@ -145,7 +147,7 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
         for (;;) {
             // one token per live stream, one decode for all of them
             batch_clear(&batch);
-            int order[N_STREAMS], n_live = 0;
+            std::vector<int> order(streams.size()); int n_live = 0;
             for (int s = 0; s < (int)streams.size(); s++) {
                 Stream &st = streams[s];
                 if (!st.live || st.n_gen >= max_new) { st.live = false; continue; }
@@ -207,19 +209,27 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
 
 int main(int argc, char **argv) {
     char  model_path[512] = {};
-    int   max_new = 96;
-    int   n_ctx   = 16384;
+    int   max_new   = 96;
+    int   n_ctx     = 16384;
+    int   n_streams = 4;
     bool  show_text = false;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(model_path, argv[++i], sizeof(model_path)-1);
-        else if (!strcmp(argv[i], "-n")   && i+1 < argc) max_new = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-c")   && i+1 < argc) n_ctx   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-n")   && i+1 < argc) max_new   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-c")   && i+1 < argc) n_ctx     = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--streams")) && i+1 < argc) n_streams = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-n max] [-c ctx] [--text] [--verbose]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
+    if (n_streams < 1) n_streams = 1;
+    if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
+    {   // non-unified KV gives n_ctx/n_seq_max per lane; ensure each lane fits its prompt + gen
+        int need = (max_new + 320) * n_streams;
+        if (n_ctx < need) n_ctx = need;
+    }
 
     llama_log_set(pti_log_cb, nullptr);
     llama_backend_init();
@@ -235,24 +245,37 @@ int main(int argc, char **argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t)n_ctx;
     cp.n_batch = PREFILL_CHUNK;
-    cp.n_seq_max = N_STREAMS;
+    cp.n_seq_max = (uint32_t)n_streams;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.kv_unified      = false;   // M7.2 exactness: unified KV flips fp near-ties by batch shape
     G.ctx = llama_init_from_model(G.model, cp);
     if (!G.ctx) { fprintf(stderr, "context failed\n"); return 1; }
     G.mem = llama_get_memory(G.ctx);
 
-    // four independent worker-shaped prompts (PA.1 will generate these from a plan)
-    const char *prompts[N_STREAMS] = {
+    // independent worker-shaped prompts (PA.1 will generate these from a plan).
+    // Pool of MAX_STREAMS; the first n_streams are used.
+    const char *prompts[MAX_STREAMS] = {
         "Write a javascript function gravityStep(bird, dt) that applies gravity and velocity to a flappy-bird player object. Output only code.",
         "Write a javascript function spawnPipe(world) that appends a new pipe pair with a random gap to world.pipes. Output only code.",
         "Write a javascript function checkCollision(bird, pipes) that returns true when the bird hits a pipe or the ground. Output only code.",
         "Write a javascript function updateScore(world) that increments world.score when the bird passes a pipe. Output only code.",
+        "Write a javascript function debounce(fn, ms) that returns a debounced version of fn. Output only code.",
+        "Write a javascript function deepClone(obj) that returns a structural deep copy of a JSON-like object. Output only code.",
+        "Write a javascript function formatBytes(n) that formats a byte count as a human-readable string. Output only code.",
+        "Write a javascript function parseQuery(url) that returns an object of the URL query parameters. Output only code.",
+        "Write a javascript function shuffle(arr) that returns a new array with the elements randomly permuted. Output only code.",
+        "Write a javascript function clamp(x, lo, hi) that constrains x to the inclusive range [lo, hi]. Output only code.",
+        "Write a javascript function groupBy(arr, keyFn) that groups array items into a Map by a key function. Output only code.",
+        "Write a javascript function retryAsync(fn, times) that retries an async fn up to N times. Output only code.",
+        "Write a javascript function rgbToHex(r, g, b) that converts an RGB triple to a hex color string. Output only code.",
+        "Write a javascript function memoize(fn) that caches results of a pure single-argument function. Output only code.",
+        "Write a javascript function flatten(arr) that fully flattens an arbitrarily nested array. Output only code.",
+        "Write a javascript function slugify(text) that converts a title string into a URL slug. Output only code.",
     };
 
     auto make_streams = [&]() {
-        std::vector<Stream> v(N_STREAMS);
-        for (int s = 0; s < N_STREAMS; s++) {
+        std::vector<Stream> v(n_streams);
+        for (int s = 0; s < n_streams; s++) {
             v[s].prompt_toks.resize(MAX_TOKENS);
             int n = llama_tokenize(G.vocab, prompts[s], (int32_t)strlen(prompts[s]),
                                    v[s].prompt_toks.data(), MAX_TOKENS, true, true);
@@ -261,23 +284,23 @@ int main(int argc, char **argv) {
         return v;
     };
 
-    fprintf(stderr, "\n══ PA.0 — packed agents plumbing demo (4 streams, -n %d) ══\n\n", max_new);
+    fprintf(stderr, "\n══ PA.0 — packed agents plumbing demo (%d streams, -n %d) ══\n\n", n_streams, max_new);
 
     // ── sequential baseline ──────────────────────────────────────────────────
     auto seq_streams = make_streams();
     double seq_wall = 0, seq_pf = 0;
-    fprintf(stderr, "[1/2] sequential: 4 prompts one at a time...\n");
+    fprintf(stderr, "[1/2] sequential: %d prompts one at a time...\n", n_streams);
     int seq_total = run_streams(seq_streams, max_new, /*packed=*/false, &seq_wall, &seq_pf);
     fprintf(stderr, "      %d tok in %.1fs decode (+%.1fs prefill) = %.1f tok/s\n",
             seq_total, seq_wall, seq_pf, seq_total / seq_wall);
 
     // clear everything between modes
-    for (int s = 0; s < N_STREAMS; s++) llama_memory_seq_rm(G.mem, s, 0, -1);
+    for (int s = 0; s < n_streams; s++) llama_memory_seq_rm(G.mem, s, 0, -1);
 
     // ── packed ───────────────────────────────────────────────────────────────
     auto par_streams = make_streams();
     double par_wall = 0, par_pf = 0;
-    fprintf(stderr, "[2/2] packed: 4 streams, one batched decode per step...\n");
+    fprintf(stderr, "[2/2] packed: %d streams, one batched decode per step...\n", n_streams);
     int par_total = run_streams(par_streams, max_new, /*packed=*/true, &par_wall, &par_pf);
     fprintf(stderr, "      %d tok in %.1fs decode (+%.1fs prefill) = %.1f tok/s\n",
             par_total, par_wall, par_pf, par_total / par_wall);
@@ -286,8 +309,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  PA.0 result\n");
     fprintf(stderr, "  sequential : %5.1f tok/s  (%d tok, %.1fs)\n", seq_total / seq_wall, seq_total, seq_wall);
     fprintf(stderr, "  packed     : %5.1f tok/s  (%d tok, %.1fs)\n", par_total / par_wall, par_total, par_wall);
-    fprintf(stderr, "  aggregate  : %.2fx   (prediction from M5.1: 4/1.86 = 2.15x)\n",
-            (par_total / par_wall) / (seq_total / seq_wall));
+    fprintf(stderr, "  aggregate  : %.2fx   (%d streams packed vs sequential)\n",
+            (par_total / par_wall) / (seq_total / seq_wall), n_streams);
     fprintf(stderr, "  wall-clock : %.2fx   (decode loops, equal token caps)\n",
             seq_wall / par_wall);
     fprintf(stderr, "════════════════════════════════════════════════\n");
@@ -297,7 +320,7 @@ int main(int argc, char **argv) {
     // batch. Exact config: f16 KV (default) + kv_unified=false + ε=0.05 tie-break argmax.
     fprintf(stderr, "\n── byte-identity gate (packed lane == solo) ──\n");
     int gate_fail = 0;
-    for (int s = 0; s < N_STREAMS; s++) {
+    for (int s = 0; s < n_streams; s++) {
         const std::vector<llama_token> &solo = seq_streams[s].gen_toks;
         const std::vector<llama_token> &pack = par_streams[s].gen_toks;
         size_t n = solo.size() < pack.size() ? solo.size() : pack.size();
@@ -317,13 +340,13 @@ int main(int argc, char **argv) {
         }
     }
     if (gate_fail == 0)
-        fprintf(stderr, "  GATE PASS — packed output byte-identical to solo on all %d lanes\n", N_STREAMS);
+        fprintf(stderr, "  GATE PASS — packed output byte-identical to solo on all %d lanes\n", n_streams);
     else
-        fprintf(stderr, "  GATE FAIL — %d/%d lanes diverged (see above)\n", gate_fail, N_STREAMS);
+        fprintf(stderr, "  GATE FAIL — %d/%d lanes diverged (see above)\n", gate_fail, n_streams);
     fprintf(stderr, "════════════════════════════════════════════════\n");
 
     if (show_text) {
-        for (int s = 0; s < N_STREAMS; s++) {
+        for (int s = 0; s < n_streams; s++) {
             printf("\n───── stream %d ─────\n%s\n", s, par_streams[s].text.c_str());
         }
     }
