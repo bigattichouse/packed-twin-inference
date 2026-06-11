@@ -85,7 +85,7 @@ NGL         ?= 99
         llama mtp 4seq server debug bench kbench audit all-llama \
         llama-run-pti llama-run-base \
         mtp-run mtp-run-base \
-        4seq-run 4seq-run-base kbench-run
+        4seq-run 4seq-run-base kbench-run agents agents-run
 
 
 # ── bin/ directory ────────────────────────────────────────────────────────────
@@ -167,6 +167,18 @@ $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 
 4seq-run-base: $(PTI_4SEQ)
 	$(PTI_4SEQ) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
+
+# ── pti_agents: PA.0 packed-agents plumbing demo (4 streams, one context) ─────
+PTI_AGENTS := $(BINDIR)/pti_agents
+
+agents: $(PTI_AGENTS)
+
+$(PTI_AGENTS): pti_agents.cpp | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
+	@echo "Built $@"
+
+agents-run: $(PTI_AGENTS)
+	$(PTI_AGENTS) -m $(MTP_MODEL) -n 96 --text
 
 # ── pti_debug: single-sequence debug script ──────────────────────────────────
 debug: $(PTI_DEBUG)
