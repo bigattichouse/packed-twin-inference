@@ -245,3 +245,10 @@ Fix (designed, §8.4): a **two-queue work-pool** — the boss emits a task list 
 all 4 lanes (incl. slot 0, after its light scaffolding) pop work items on a `DONE` signal;
 slot 0 prioritizes a separate **boss queue** for decisions (questions/grants/gather). That
 keeps every lane balanced *and* full — PA.2.
+
+**PA.2 (pool mechanism)** confirms the fix: `--pool M` runs M items over N lanes with
+refill-on-`DONE` (a finished lane is `seq_rm`'d and prefilled with the next queued item).
+**8 items / 4 lanes = 34.2 tok/s (1.77× baseline), 4 refills** — pool 55.7s vs ~99s
+sequential, and 3× the PA.1b straggler (11 tok/s). Refill keeps the batch full across waves.
+Next: feed the pool from the boss's task list (the boss queue produces items; all lanes,
+slot 0 included, pop them).

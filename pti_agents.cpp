@@ -208,6 +208,85 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
     return total;
 }
 
+// ───────────────────────── PA.2: work-pool ───────────────────────────────────
+// M items over n_lanes; a lane that finishes (EOG or cap) is refilled from the
+// queue (seq_rm + prefill the next item), keeping the batch full while backlog
+// lasts. The pooled fix for the PA.1b straggler.
+static void run_pool(const std::vector<std::string> &items, int n_lanes, int max_new) {
+    int M = (int)items.size();
+    if (n_lanes > M) n_lanes = M;
+    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, n_lanes);
+    std::vector<Stream> lanes(n_lanes);
+    std::vector<int>    lane_item(n_lanes, -1);
+    std::vector<std::string> out(M);
+    int next = 0, total = 0, refills = 0;
+
+    auto start_lane = [&](int L, int item) -> bool {
+        llama_memory_seq_rm(G.mem, L, 0, -1);
+        const std::string &s = items[item];
+        lanes[L].prompt_toks.assign(s.size() + 16, 0);
+        int n = llama_tokenize(G.vocab, s.c_str(), (int32_t)s.size(),
+                               lanes[L].prompt_toks.data(), (int32_t)lanes[L].prompt_toks.size(), true, true);
+        lanes[L].prompt_toks.resize(n > 0 ? n : 0);
+        int last_idx = 0;
+        if (!prefill_stream(lanes[L], L, batch, &last_idx)) return false;
+        lanes[L].tok_last = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
+        lanes[L].pos      = (llama_pos)lanes[L].prompt_toks.size();
+        lanes[L].text     = tok_str(lanes[L].tok_last);
+        lanes[L].n_gen    = 1;
+        lanes[L].live     = !llama_vocab_is_eog(G.vocab, lanes[L].tok_last);
+        lane_item[L]      = item;
+        total++;
+        return true;
+    };
+
+    double t0 = now_sec();
+    for (int L = 0; L < n_lanes && next < M; L++) start_lane(L, next++);
+    double prefill0 = now_sec() - t0;
+
+    double t1 = now_sec();
+    for (;;) {
+        batch_clear(&batch);
+        std::vector<int> ord;
+        for (int L = 0; L < n_lanes; L++)
+            if (lanes[L].live && lanes[L].n_gen < max_new) {
+                batch_add(&batch, lanes[L].tok_last, lanes[L].pos, L, true);
+                ord.push_back(L);
+            }
+        if (ord.empty()) break;
+        if (llama_decode(G.ctx, batch) != 0) { fprintf(stderr, "pool decode failed\n"); break; }
+        std::vector<int> finished;
+        for (size_t i = 0; i < ord.size(); i++) {
+            int L = ord[i];
+            llama_token nxt = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, (int)i), G.n_vocab);
+            lanes[L].pos++; lanes[L].tok_last = nxt; lanes[L].n_gen++; total++;
+            if (llama_vocab_is_eog(G.vocab, nxt) || lanes[L].n_gen >= max_new) {
+                out[lane_item[L]] = lanes[L].text;
+                lanes[L].live = false;
+                finished.push_back(L);
+            } else {
+                lanes[L].text += tok_str(nxt);
+            }
+        }
+        for (int L : finished) {                    // refill from the queue, else idle
+            if (next < M) { start_lane(L, next++); refills++; }
+            else lane_item[L] = -1;
+        }
+    }
+    double wall = now_sec() - t1;
+    llama_batch_free(batch);
+
+    double agg = wall > 0 ? total / wall : 0.0;
+    fprintf(stderr, "\n════════════════════════════════════════════════\n");
+    fprintf(stderr, "  PA.2 work-pool result\n");
+    fprintf(stderr, "  %d items, %d lanes, cap %d/item, %d refills\n", M, n_lanes, max_new, refills);
+    fprintf(stderr, "  %d tok in %.1fs decode (+%.1fs initial prefill)\n", total, wall, prefill0);
+    fprintf(stderr, "  aggregate  : %.1f tok/s = %.2fx vs 19.3 baseline\n", agg, agg / 19.3);
+    fprintf(stderr, "  sequential ≈ %.0fs for the same %d tok; pool did it in %.1fs\n",
+            total / 19.3, total, wall);
+    fprintf(stderr, "════════════════════════════════════════════════\n");
+}
+
 // ───────────────────────── PA.1: work-order envelope ─────────────────────────
 // The boss emits ONE planning block; the harness parses only the thin marker
 // envelope (passing BluePrint bodies through verbatim). Format — design §4:
@@ -519,6 +598,7 @@ int main(int argc, char **argv) {
     int   n_streams = 4;
     bool  show_text = false;
     bool  parse_test = false;
+    int   pool_items = 0;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(model_path, argv[++i], sizeof(model_path)-1);
@@ -527,15 +607,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c")   && i+1 < argc) n_ctx     = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--streams")) && i+1 < argc) n_streams = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--parse-test")) parse_test = true;
+        else if (!strcmp(argv[i], "--pool")  && i+1 < argc) pool_items = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test) return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
     if (task[0] && max_new == 96) max_new = 1536;   // pipeline pieces need room for think + code (boss writes the most)
+    if (pool_items > 0 && max_new == 96) max_new = 256;   // PA.2 pool items: think + a short function
     {   // non-unified KV gives n_ctx/n_seq_max per lane; ensure each lane fits its prompt + gen
         int need = (max_new + 320) * n_streams;
         if (n_ctx < need) n_ctx = need;
@@ -643,6 +725,17 @@ int main(int argc, char **argv) {
         }
         return v;
     };
+
+    // ── PA.2: work-pool test — first M built-in prompts as a queue over n_streams lanes ──
+    if (pool_items > 0) {
+        int M = pool_items < MAX_STREAMS ? pool_items : MAX_STREAMS;
+        std::vector<std::string> items;
+        for (int i = 0; i < M; i++) items.push_back(prompts[i]);
+        fprintf(stderr, "\n══ PA.2 work-pool — %d items, %d lanes, cap %d ══\n", M, n_streams, max_new);
+        run_pool(items, n_streams, max_new);
+        llama_free(G.ctx); llama_model_free(G.model); llama_backend_free();
+        return 0;
+    }
 
     fprintf(stderr, "\n══ PA.0 — packed agents plumbing demo (%d streams, -n %d) ══\n\n", n_streams, max_new);
 

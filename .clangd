@@ -1,0 +1,11 @@
+# clangd config — give the language server the same include paths the Makefile
+# uses (LLAMA_CXXFLAGS), so it resolves the ../llama.cpp headers (gguf.h via
+# ggml/include, llama.h) instead of erroring with a cascade of bogus diagnostics.
+# The real build is g++ via the Makefile; this only affects IDE diagnostics.
+# Verified: `clang++ -fsyntax-only` with these flags parses the pti_*.cpp clean.
+CompileFlags:
+  Add:
+    - -I../llama.cpp/include
+    - -I../llama.cpp/ggml/include
+    - -I../llama.cpp/src
+    - -std=c++17
