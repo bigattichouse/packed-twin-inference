@@ -69,6 +69,8 @@ struct ServerArgs {
     int     draft_k         = 7;       // lookup probe size (ladder: 7→15→31)
     int     ngram_g         = 3;
     int     ngram_L         = 5;
+    bool    strip_reasoning = true;    // <think> → message.reasoning_content (clean agent history)
+    bool    no_think        = false;   // template enable_thinking=false (faster agent loops)
 };
 
 // ── global model (loaded once at startup) ────────────────────────────────────
@@ -227,6 +229,85 @@ static llama_token mtp_feed1(
     float *logits = llama_get_logits_ith(ctx_mtp, 0);
     if (!logits) return -1;
     return (llama_token)argmax_f(logits, n_vocab);
+}
+
+
+// ── Qwen-Coder XML tool-call fallback (M7.8) ─────────────────────────────────
+// This model family often emits <function=NAME><parameter=KEY>VALUE</parameter>
+// ...</function> (optionally wrapped in <tool_call> tags) regardless of the
+// template's declared JSON format; the template-derived PEG parser then fails.
+// Extract such calls and strip them from the visible content.
+static bool parse_xml_function_calls(const std::string &text,
+                                     json &tool_calls_out,
+                                     std::string &content_out) {
+    tool_calls_out = json::array();
+    content_out.clear();
+    size_t pos = 0, copied = 0;
+    int ctr = 0;
+    while (true) {
+        size_t f = text.find("<function=", pos);
+        if (f == std::string::npos) break;
+        size_t name_end = text.find('>', f);
+        if (name_end == std::string::npos) break;
+        std::string name = text.substr(f + 10, name_end - (f + 10));
+        size_t fend = text.find("</function>", name_end);
+        if (fend == std::string::npos) break;            // incomplete: stop
+        std::string body = text.substr(name_end + 1, fend - name_end - 1);
+
+        json args = json::object();
+        size_t bp = 0;
+        while (true) {
+            size_t p0 = body.find("<parameter=", bp);
+            if (p0 == std::string::npos) break;
+            size_t k_end = body.find('>', p0);
+            if (k_end == std::string::npos) break;
+            std::string key = body.substr(p0 + 11, k_end - (p0 + 11));
+            size_t v_end = body.find("</parameter>", k_end);
+            if (v_end == std::string::npos) break;
+            std::string val = body.substr(k_end + 1, v_end - k_end - 1);
+            if (!val.empty() && val.front() == '\n') val.erase(0, 1);
+            if (!val.empty() && val.back()  == '\n') val.pop_back();
+            args[key] = val;
+            bp = v_end + 12;
+        }
+
+        // strip an enclosing <tool_call> wrapper if present
+        size_t block_start = f, block_end = fend + 11;
+        size_t tc = text.rfind("<tool_call>", f);
+        if (tc != std::string::npos && text.find_first_not_of(" \t\n", tc + 11) == f)
+            block_start = tc;
+        size_t tce = text.find("</tool_call>", block_end);
+        if (tce != std::string::npos && text.find_first_not_of(" \t\n", block_end) == tce)
+            block_end = tce + 12;
+
+        content_out += text.substr(copied, block_start - copied);
+        copied = block_end;
+        pos    = block_end;
+
+        tool_calls_out.push_back(json{
+            {"index", ctr}, {"id", "call_x" + std::to_string(++ctr) + "_" + std::to_string((uint32_t)time(nullptr))},
+            {"type", "function"},
+            {"function", {{"name", name}, {"arguments", args.dump()}}}});
+    }
+    content_out += text.substr(copied);
+    return !tool_calls_out.empty();
+}
+
+// remove <think>...</think> spans; returns stripped content, appends reasoning
+static std::string strip_think(const std::string &text, std::string &reasoning) {
+    std::string out;
+    size_t pos = 0;
+    while (true) {
+        size_t t0 = text.find("<think>", pos);
+        if (t0 == std::string::npos) { out += text.substr(pos); break; }
+        out += text.substr(pos, t0 - pos);
+        size_t t1 = text.find("</think>", t0);
+        if (t1 == std::string::npos) { reasoning += text.substr(t0 + 7); break; }
+        reasoning += text.substr(t0 + 7, t1 - (t0 + 7));
+        pos = t1 + 8;
+        while (pos < text.size() && text[pos] == '\n') pos++;   // eat the blank line
+    }
+    return out;
 }
 
 // ── generation ────────────────────────────────────────────────────────────────
@@ -624,6 +705,7 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
             in.add_generation_prompt = true;
             in.use_jinja             = true;
             in.parallel_tool_calls   = j.value("parallel_tool_calls", false);
+            in.enable_thinking       = !G.args.no_think;
             chat_params = common_chat_templates_apply(G_chat_tmpls.get(), in);
             prompt      = chat_params.prompt;
             use_common  = true;
@@ -637,77 +719,177 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
             id.c_str(), mode_name(mode), temperature,
             (unsigned long long)seed, max_tokens, (int)stream, (int)has_tools);
 
-    // parse the finished text into content + tool_calls (jinja path only)
+    // parse the finished text: template parser → XML-function fallback → raw.
+    // Reasoning is stripped to message.reasoning_content unless --reasoning none.
     auto parse_final = [chat_params, use_common](const std::string &full,
                                                  json &message, std::string &finish) {
         message = json{{"role", "assistant"}, {"content", full}};
         finish  = "stop";
-        if (!use_common) return;
-        try {
-            common_chat_parser_params pp(chat_params);
-            try { pp.parser.load(chat_params.parser); } catch (...) {}
-            common_chat_msg msg = common_chat_parse(full, /*is_partial=*/false, pp);
-            std::vector<std::string> ids;
-            int ctr = 0;
-            msg.set_tool_call_ids(ids, [&]() { return "call_" + std::to_string(++ctr) + "_" + std::to_string((uint32_t)time(nullptr)); });
-            message = json::parse(msg.to_json_oaicompat().dump());
-            if (!msg.tool_calls.empty()) finish = "tool_calls";
-        } catch (const std::exception &e) {
-            fprintf(stderr, "  [warn] output parse failed (%s) — returning raw content\n", e.what());
+        bool parsed = false;
+        if (use_common) {
+            try {
+                common_chat_parser_params pp(chat_params);
+                try { pp.parser.load(chat_params.parser); } catch (...) {}
+                if (G.args.strip_reasoning) pp.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                common_chat_msg msg = common_chat_parse(full, /*is_partial=*/false, pp);
+                std::vector<std::string> ids;
+                int ctr = 0;
+                msg.set_tool_call_ids(ids, [&]() { return "call_" + std::to_string(++ctr) + "_" + std::to_string((uint32_t)time(nullptr)); });
+                if (!msg.tool_calls.empty()) {
+                    message = json::parse(msg.to_json_oaicompat().dump());
+                    finish  = "tool_calls";
+                    parsed  = true;
+                } else if (!msg.content.empty() || !msg.reasoning_content.empty()) {
+                    message = json::parse(msg.to_json_oaicompat().dump());
+                    parsed  = true;   // may still get XML-fallback below if markup present
+                }
+            } catch (const std::exception &e) {
+                std::string what = e.what();
+                if (what.size() > 160) what = what.substr(0, 160) + "...";
+                fprintf(stderr, "  [note] template parse failed (%s) — trying XML fallback\n", what.c_str());
+            }
+        }
+        // XML-function fallback: fires when the model used <function=...> markup
+        // that the template parser didn't yield tool calls for.
+        if (finish != "tool_calls" && full.find("<function=") != std::string::npos) {
+            json tcs; std::string stripped;
+            if (parse_xml_function_calls(full, tcs, stripped)) {
+                std::string reasoning;
+                if (G.args.strip_reasoning) stripped = strip_think(stripped, reasoning);
+                message = json{{"role", "assistant"},
+                               {"content", stripped},
+                               {"tool_calls", tcs}};
+                if (!reasoning.empty()) message["reasoning_content"] = reasoning;
+                finish = "tool_calls";
+                fprintf(stderr, "  [note] XML tool-call fallback: %d call(s) extracted\n",
+                        (int)tcs.size());
+                return;
+            }
+        }
+        if (!parsed && G.args.strip_reasoning) {
+            std::string reasoning;
+            std::string stripped = strip_think(full, reasoning);
+            message["content"] = stripped;
+            if (!reasoning.empty()) message["reasoning_content"] = reasoning;
         }
     };
 
     if (!stream) {
         // ── non-streamed completion (LangChain/agent clients) ───────────────
-        std::string full;
-        GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
-            [&full](const std::string &text) -> bool { full += text; return true; });
+        // Sent as chunked JSON with a whitespace heartbeat every ~5 s during
+        // generation: leading whitespace is valid JSON, and it keeps client
+        // fetch timeouts (nanocoder default: 120 s) from killing long turns.
+        res.set_chunked_content_provider("application/json",
+            [prompt, temperature, seed, max_tokens, mode, id, parse_final](
+                    size_t /*offset*/, httplib::DataSink &sink) -> bool {
+                std::string full;
+                double last_beat = now_sec();
+                GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
+                    [&](const std::string &text) -> bool {
+                        full += text;
+                        double now = now_sec();
+                        if (now - last_beat > 5.0) {
+                            last_beat = now;
+                            if (!sink.write(" ", 1)) return false;   // heartbeat
+                        }
+                        return true;
+                    });
 
-        json message; std::string finish;
-        parse_final(full, message, finish);
+                json message; std::string finish;
+                parse_final(full, message, finish);
 
-        json resp = {
-            {"id", id}, {"object", "chat.completion"}, {"created", (int64_t)time(nullptr)},
-            {"model", "pti-server"},
-            {"choices", json::array({ json{{"index", 0}, {"message", message}, {"finish_reason", finish}} })},
-            {"usage", {{"prompt_tokens", stats.n_prompt}, {"completion_tokens", stats.n_gen},
-                       {"total_tokens", stats.n_prompt + stats.n_gen}}},
-            {"pti", {{"mode", stats.mode}, {"tok_s", stats.tok_s}, {"steps", stats.n_steps}}}
-        };
-        res.set_content(resp.dump(), "application/json");
-        G_busy.store(false);
+                json resp = {
+                    {"id", id}, {"object", "chat.completion"}, {"created", (int64_t)time(nullptr)},
+                    {"model", "pti-server"},
+                    {"choices", json::array({ json{{"index", 0}, {"message", message}, {"finish_reason", finish}} })},
+                    {"usage", {{"prompt_tokens", stats.n_prompt}, {"completion_tokens", stats.n_gen},
+                               {"total_tokens", stats.n_prompt + stats.n_gen}}},
+                    {"pti", {{"mode", stats.mode}, {"tok_s", stats.tok_s}, {"steps", stats.n_steps}}}
+                };
+                std::string body = resp.dump();
+                sink.write(body.c_str(), body.size());
+                sink.done();
+                G_busy.store(false);
+                return true;
+            });
         return;
     }
 
-    // ── streamed (SSE). With tools we buffer and emit parsed deltas at the
-    // end (tool-call markup must not leak as raw text); without tools we
-    // stream live as before.
-    bool buffered = use_common && has_tools;
+    // ── streamed (SSE): content flows LIVE through a gate that withholds
+    // <think> spans (when stripping) and tool-call markup; parsed tool_calls
+    // arrive as a structured delta at the end. Nothing buffers needlessly —
+    // long turns show progress immediately (no client timeouts).
     res.set_chunked_content_provider("text/event-stream",
-        [prompt, temperature, seed, max_tokens, mode, id, buffered, parse_final](
+        [prompt, temperature, seed, max_tokens, mode, id, parse_final](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
-            std::string full;
-            GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
-                [&sink, &id, &full, buffered](const std::string &text) -> bool {
-                    full += text;
-                    if (buffered) return true;
-                    auto chunk = sse_chunk(text, id);
-                    return sink.write(chunk.c_str(), chunk.size());
-                });
+            std::string full;          // everything generated (for final parse)
+            std::string pend;          // gate holdback
+            bool tool_mode = false;    // saw tool markup: withhold the rest
+            bool in_think  = false;
+            size_t n_streamed = 0;     // visible chars emitted
 
-            std::string finish = "stop";
-            if (buffered) {
-                json message;
-                parse_final(full, message, finish);
-                json delta = json::object();
-                if (message.contains("content") && !message["content"].is_null()
-                    && !message["content"].get<std::string>().empty())
-                    delta["content"] = message["content"];
-                if (message.contains("tool_calls")) {
-                    delta["tool_calls"] = message["tool_calls"];
-                    int idx = 0;
-                    for (auto &tc : delta["tool_calls"]) tc["index"] = idx++;
+            auto emit = [&](const std::string &t) -> bool {
+                if (t.empty()) return true;
+                n_streamed += t.size();
+                auto chunk = sse_chunk(t, id);
+                return sink.write(chunk.c_str(), chunk.size());
+            };
+
+            // gate: emit visible text; divert think spans (if stripping) and
+            // stop emission at the first tool marker. Partial tags at the
+            // buffer tail are held back until disambiguated.
+            auto feed = [&](const std::string &t) -> bool {
+                full += t;
+                if (tool_mode) return true;
+                pend += t;
+                for (;;) {
+                    size_t tag = std::string::npos;
+                    int    which = -1;   // 0=<think> 1=</think> 2=tool
+                    const char *tags[] = {"<think>", "</think>", "<tool_call", "<function="};
+                    for (int i = 0; i < 4; i++) {
+                        size_t p = pend.find(tags[i]);
+                        if (p != std::string::npos && p < tag) { tag = p; which = i >= 2 ? 2 : i; }
+                    }
+                    if (tag == std::string::npos) break;
+                    std::string before = pend.substr(0, tag);
+                    if (!(in_think && G.args.strip_reasoning)) { if (!emit(before)) return false; }
+                    if (which == 0)      { in_think = true;  pend.erase(0, tag + 7); }
+                    else if (which == 1) { in_think = false; pend.erase(0, tag + 8);
+                                           while (!pend.empty() && pend[0] == '\n') pend.erase(0, 1); }
+                    else                 { tool_mode = true;  pend.clear(); return true; }
                 }
+                // flush all but a possible partial tag at the tail
+                size_t hold = pend.size();
+                size_t lt = pend.rfind('<');
+                if (lt != std::string::npos && pend.size() - lt <= 12) hold = lt;
+                if (hold > 0) {
+                    std::string out = pend.substr(0, hold);
+                    pend.erase(0, hold);
+                    if (!(in_think && G.args.strip_reasoning)) { if (!emit(out)) return false; }
+                }
+                return true;
+            };
+
+            GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode, feed);
+
+            json message; std::string finish;
+            parse_final(full, message, finish);
+
+            // trailing delta: tool_calls and/or any visible content the gate
+            // was still holding (e.g. text after a withheld marker that turned
+            // out not to be a tool call)
+            json delta = json::object();
+            if (finish == "tool_calls" && message.contains("tool_calls")) {
+                delta["tool_calls"] = message["tool_calls"];
+                int idx = 0;
+                for (auto &tc : delta["tool_calls"]) if (!tc.contains("index")) tc["index"] = idx++;
+            }
+            if (message.contains("content") && message["content"].is_string()) {
+                std::string final_content = message["content"].get<std::string>();
+                if (final_content.size() > n_streamed)
+                    delta["content"] = final_content.substr(n_streamed);
+            }
+            if (!delta.empty()) {
                 json choice = {{"delta", delta}, {"index", 0}, {"finish_reason", nullptr}};
                 json chunk  = {{"id", id}, {"object", "chat.completion.chunk"},
                                {"model", "pti-server"}, {"choices", json::array({choice})}};
@@ -736,6 +918,8 @@ static void usage(const char *prog) {
         "                 differ between modes (batch-size-dependent numerics)\n"
         "  --mode <m>     base | mtp | pti (default: pti)\n"
         "  --verbose      Full llama/ggml logs (default: WARN+ only)\n"
+        "  --no-think     Template enable_thinking=false (faster agent loops)\n"
+        "  --reasoning <m> strip (default: <think> → reasoning_content) | none\n"
         "  --temp <float> Default temperature (default: 0.0 = greedy; >0 uses\n"
         "                 sampled verification — speculation stays active)\n"
         "  -n <int>       Default max tokens (default: 1024)\n\n"
@@ -782,6 +966,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-warmup"))               ;      // accepted, no-op
         else if (!strcmp(a, "--host")      && i+1 < argc) ++i;   // accepted, no-op (binds 0.0.0.0)
         else if (!strcmp(a, "--verbose")) g_verbose_logs = true;
+        else if (!strcmp(a, "--no-think")) args.no_think = true;
+        else if (!strcmp(a, "--reasoning") && i+1 < argc) args.strip_reasoning = strcmp(argv[++i], "none") != 0;
         else if (!strcmp(a, "--mode") && i+1 < argc) {
             const char *m = argv[++i];
             args.mode = !strcmp(m, "base") ? MODE_BASE : !strcmp(m, "mtp") ? MODE_MTP : MODE_PTI;
