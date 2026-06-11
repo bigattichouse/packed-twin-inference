@@ -189,5 +189,8 @@ stream (vs the 1.86× microbench) — the gap is real per-step overhead, not the
 model in VRAM (~24 GB, loaded once); the four lanes add only KV/SSM state, which at fixed
 `n_ctx` is a *subdivision* of an already-paid pool. Substrate for the cooperative roadmap
 (`PACKED_AGENTS.md` → `spec/PACKED_AGENTS_DESIGN.md`: boss decomposes → 3 workers → gather).
-Build/run: `make agents && make agents-run`. Remaining PA.0 gate: byte-identity packed-vs-solo
-per lane (`kv_unified=false`).
+Build/run: `make agents && make agents-run`. **Byte-identity gate: PASS** (2026-06-11) —
+packed lanes byte-identical to solo on all 4 streams (96 tok each), asserted in-binary
+(`kv_unified=false` + f16 KV + ε=0.05 tie-break; the binary exits non-zero on divergence).
+This is the correctness foundation for cooperation: a lane's output does not depend on which
+siblings share its batch.

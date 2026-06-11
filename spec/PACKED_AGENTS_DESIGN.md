@@ -87,7 +87,8 @@ solo *modulo floating-point near-ties wider than ε* (observed elsewhere at `<th
 boundaries and repetition forks). That is the same honesty bound the rest of the project
 ships under. **PA.0's acceptance gate is to verify this empirically** — run each stream
 packed and again alone, assert identical output (§9). The cooperative model is built on
-this holding; do not assume it, measure it.
+this holding; do not assume it, measure it. **Measured 2026-06-11 (PA.0): PASS** — 4 lanes
+byte-identical packed-vs-solo at n=96, with `kv_unified=false` + f16 KV + ε=0.05 tie-break.
 
 ---
 
@@ -422,17 +423,17 @@ quality matters more than the extra ~0.25×, do PA.4 first.
 
 | id | deliverable | acceptance gate |
 |---|---|---|
-| **PA.0** | plumbing demo (`pti_agents.cpp`): 4 prompts, one context, packed vs sequential | **DONE (2026-06-10): 1.95× aggregate** (19.3 → 37.7 tok/s, 4 independent buffers). Survivors-continue-after-EOG path is coded but not exercised by this equal-cap run. Remaining: the **byte-identical packed-vs-solo** gate (§2.1) is not yet asserted by the binary. |
+| **PA.0** | plumbing demo (`pti_agents.cpp`): 4 prompts, one context, packed vs sequential | **DONE: ~1.9× aggregate** (1.87–1.95× run-to-run; 19.3 → ~37 tok/s, 4 independent buffers) and **byte-identity gate PASS (2026-06-11)** — all 4 lanes byte-identical packed-vs-solo, asserted in-binary (`kv_unified=false`, exits non-zero on divergence). Survivors-continue-after-EOG path coded, not yet exercised (equal-cap run). |
 | **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task ("class with 3 methods"); boss authors BluePrint, harness routes | end-to-end artifact compiles & passes the boss's smoke test; envelope parses reliably over ≥20 plans; measure plan-tax crossover (risk #3) |
 | **PA.2** | work-queue refill + straggler stats | batch stays full with a >3-piece backlog; report idle-lane-fraction |
 | **PA.3** | speculation stacking (MTP/lookup per stream, `n_seq_max=8`) | ~2.4× aggregate; per-lane output still reproducible |
 | **PA.4** | bidirectional coordination: worker `ASK`→boss `REPLY`, plus boss GUIDE/KILL (independent of PA.3) | a worker blocked on an ambiguous spec gets an answer and finishes; boss kills+retries a sabotaged runaway within N tokens; Q&A stays within `q_budget` |
 
-**Immediate next action:** PA.0 is built (`make agents`) and measured — **1.95× aggregate**
-(predicted 2.15×; the 4-seq step came in at ~2.05× vs M5.1's 1.86×). Remaining PA.0 work:
-(a) add the **byte-identity** check — packed lane == solo, with `kv_unified = false` — which
-the binary does not assert yet; (b) optionally an uneven-length run to exercise the
-survivors-continue path. Then start **PA.1** (the boss → workers → gather pipeline).
+**Immediate next action:** PA.0 is built (`make agents`), measured (**~1.9× aggregate**,
+1.87–1.95× run-to-run), and the **byte-identity gate PASSES** (2026-06-11; 4 lanes identical
+packed-vs-solo, `kv_unified=false`, exits non-zero on divergence). Next: make the lane count
+configurable (boss picks **4–16** by cleanest split, bounded by the measured speed/ctx
+tradeoff), then **PA.1** (boss → workers → gather pipeline).
 
 ---
 

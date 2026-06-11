@@ -77,6 +77,7 @@ static void batch_clear(struct llama_batch *b) { b->n_tokens = 0; }
 struct Stream {
     std::vector<llama_token> prompt_toks;
     std::string  text;        // generated output
+    std::vector<llama_token> gen_toks;  // generated tokens (solo-vs-packed identity gate)
     llama_token  tok_last = 0;
     llama_pos    pos      = 0;
     int          n_gen    = 0;
@@ -133,6 +134,7 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
             streams[s].tok_last = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
             streams[s].pos      = (llama_pos)streams[s].prompt_toks.size();
             streams[s].text     = tok_str(streams[s].tok_last);
+            streams[s].gen_toks.push_back(streams[s].tok_last);
             streams[s].n_gen    = 1;
             streams[s].live     = !llama_vocab_is_eog(G.vocab, streams[s].tok_last);
             total++;
@@ -160,7 +162,7 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
                 st.n_gen++;
                 total++;
                 if (llama_vocab_is_eog(G.vocab, nxt)) st.live = false;
-                else st.text += tok_str(nxt);
+                else { st.text += tok_str(nxt); st.gen_toks.push_back(nxt); }
             }
         }
         wall = now_sec() - t1;
@@ -178,6 +180,7 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
             st.tok_last = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
             st.pos      = (llama_pos)st.prompt_toks.size();
             st.text     = tok_str(st.tok_last);
+            st.gen_toks.push_back(st.tok_last);
             st.n_gen    = 1;
             total++;
 
@@ -190,7 +193,7 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
                 st.pos++;
                 st.n_gen++;
                 total++;
-                if (!llama_vocab_is_eog(G.vocab, st.tok_last)) st.text += tok_str(st.tok_last);
+                if (!llama_vocab_is_eog(G.vocab, st.tok_last)) { st.text += tok_str(st.tok_last); st.gen_toks.push_back(st.tok_last); }
             }
             wall += now_sec() - t1;
         }
@@ -234,6 +237,7 @@ int main(int argc, char **argv) {
     cp.n_batch = PREFILL_CHUNK;
     cp.n_seq_max = N_STREAMS;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.kv_unified      = false;   // M7.2 exactness: unified KV flips fp near-ties by batch shape
     G.ctx = llama_init_from_model(G.model, cp);
     if (!G.ctx) { fprintf(stderr, "context failed\n"); return 1; }
     G.mem = llama_get_memory(G.ctx);
@@ -288,6 +292,36 @@ int main(int argc, char **argv) {
             seq_wall / par_wall);
     fprintf(stderr, "════════════════════════════════════════════════\n");
 
+    // ── byte-identity gate: each packed lane's tokens must equal its solo (sequential) run ──
+    // The cooperative design requires a stream's output to be invariant to co-residence in the
+    // batch. Exact config: f16 KV (default) + kv_unified=false + ε=0.05 tie-break argmax.
+    fprintf(stderr, "\n── byte-identity gate (packed lane == solo) ──\n");
+    int gate_fail = 0;
+    for (int s = 0; s < N_STREAMS; s++) {
+        const std::vector<llama_token> &solo = seq_streams[s].gen_toks;
+        const std::vector<llama_token> &pack = par_streams[s].gen_toks;
+        size_t n = solo.size() < pack.size() ? solo.size() : pack.size();
+        long diverge = -1;
+        for (size_t i = 0; i < n; i++) if (solo[i] != pack[i]) { diverge = (long)i; break; }
+        if (diverge < 0 && solo.size() == pack.size()) {
+            fprintf(stderr, "  stream %d: IDENTICAL (%zu tok)\n", s, solo.size());
+        } else {
+            gate_fail++;
+            long at = diverge >= 0 ? diverge : (long)n;
+            fprintf(stderr, "  stream %d: DIVERGED at tok %ld (solo %zu, packed %zu)\n",
+                    s, at, solo.size(), pack.size());
+            if (diverge >= 0)
+                fprintf(stderr, "            solo[%ld]=%d '%s'  vs  packed[%ld]=%d '%s'\n",
+                        at, solo[at], tok_str(solo[at]).c_str(),
+                        at, pack[at], tok_str(pack[at]).c_str());
+        }
+    }
+    if (gate_fail == 0)
+        fprintf(stderr, "  GATE PASS — packed output byte-identical to solo on all %d lanes\n", N_STREAMS);
+    else
+        fprintf(stderr, "  GATE FAIL — %d/%d lanes diverged (see above)\n", gate_fail, N_STREAMS);
+    fprintf(stderr, "════════════════════════════════════════════════\n");
+
     if (show_text) {
         for (int s = 0; s < N_STREAMS; s++) {
             printf("\n───── stream %d ─────\n%s\n", s, par_streams[s].text.c_str());
@@ -297,5 +331,5 @@ int main(int argc, char **argv) {
     llama_free(G.ctx);
     llama_model_free(G.model);
     llama_backend_free();
-    return 0;
+    return gate_fail ? 2 : 0;
 }
