@@ -213,26 +213,57 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
 // queue (seq_rm + prefill the next item), keeping the batch full while backlog
 // lasts. The pooled fix for the PA.1b straggler.
 static void run_pool(const std::vector<std::string> &items, int n_lanes, int max_new,
-                     std::vector<std::string> *out_opt = nullptr) {
+                     std::vector<std::string> *out_opt = nullptr, const std::string &prefix = "") {
     int M = (int)items.size();
     if (n_lanes > M) n_lanes = M;
-    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, n_lanes);
+    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, n_lanes + 1);
     std::vector<Stream> lanes(n_lanes);
     std::vector<int>    lane_item(n_lanes, -1);
     std::vector<std::string> out(M);
     int next = 0, total = 0, refills = 0;
 
+    // ── PA.2.1: cache the common prefix (preamble+shared) once in a base seq; each lane is a
+    //    seq_cp clone of it + a small delta-prefill of just the item (the M7.5b base cache).
+    const llama_seq_id BASE = n_lanes;                 // base seq (needs n_seq_max >= n_lanes+1)
+    std::vector<llama_token> prefix_toks; int prefix_len = 0;
+    bool use_cache = !prefix.empty();
+    if (use_cache) {
+        prefix_toks.assign(prefix.size() + 16, 0);
+        int pn = llama_tokenize(G.vocab, prefix.c_str(), (int32_t)prefix.size(),
+                                prefix_toks.data(), (int32_t)prefix_toks.size(), true, true);
+        if (pn <= 0) use_cache = false;
+        else {
+            prefix_toks.resize(pn); prefix_len = pn;
+            llama_memory_seq_rm(G.mem, BASE, 0, -1);
+            Stream base_st; base_st.prompt_toks = prefix_toks; int li = 0;
+            if (!prefill_stream(base_st, BASE, batch, &li)) use_cache = false;   // cache the starter once
+        }
+    }
+
     auto start_lane = [&](int L, int item) -> bool {
+        std::vector<llama_token> full(items[item].size() + 16, 0);
+        int fn = llama_tokenize(G.vocab, items[item].c_str(), (int32_t)items[item].size(),
+                                full.data(), (int32_t)full.size(), true, true);
+        if (fn <= 0) return false;
+        full.resize(fn);
+        bool cached = use_cache && fn > prefix_len && (fn - prefix_len) <= PREFILL_CHUNK;
+        for (int k = 0; cached && k < prefix_len; k++) if (full[k] != prefix_toks[k]) cached = false;
         llama_memory_seq_rm(G.mem, L, 0, -1);
-        const std::string &s = items[item];
-        lanes[L].prompt_toks.assign(s.size() + 16, 0);
-        int n = llama_tokenize(G.vocab, s.c_str(), (int32_t)s.size(),
-                               lanes[L].prompt_toks.data(), (int32_t)lanes[L].prompt_toks.size(), true, true);
-        lanes[L].prompt_toks.resize(n > 0 ? n : 0);
         int last_idx = 0;
-        if (!prefill_stream(lanes[L], L, batch, &last_idx)) return false;
+        if (cached) {
+            llama_memory_seq_cp(G.mem, BASE, L, 0, -1);        // clone the starter (= roll back to base)
+            batch_clear(&batch);
+            int dn = fn - prefix_len;                          // delta-prefill only the item part
+            for (int j = 0; j < dn; j++)
+                batch_add(&batch, full[prefix_len + j], (llama_pos)(prefix_len + j), L, j == dn - 1);
+            if (llama_decode(G.ctx, batch) != 0) return false;
+            last_idx = dn - 1;
+        } else {                                               // fallback: full prefill (no cache / unstable prefix)
+            lanes[L].prompt_toks = full;
+            if (!prefill_stream(lanes[L], L, batch, &last_idx)) return false;
+        }
         lanes[L].tok_last = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
-        lanes[L].pos      = (llama_pos)lanes[L].prompt_toks.size();
+        lanes[L].pos      = (llama_pos)fn;
         lanes[L].text     = tok_str(lanes[L].tok_last);
         lanes[L].n_gen    = 1;
         lanes[L].live     = !llama_vocab_is_eog(G.vocab, lanes[L].tok_last);
@@ -281,6 +312,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
     fprintf(stderr, "\n════════════════════════════════════════════════\n");
     fprintf(stderr, "  PA.2 work-pool result\n");
     fprintf(stderr, "  %d items, %d lanes, cap %d/item, %d refills\n", M, n_lanes, max_new, refills);
+    if (use_cache) fprintf(stderr, "  prefix cache: %d tok cloned per lane (delta-prefill only the item)\n", prefix_len);
     fprintf(stderr, "  %d tok in %.1fs decode (+%.1fs initial prefill)\n", total, wall, prefill0);
     fprintf(stderr, "  aggregate  : %.1f tok/s = %.2fx vs 19.3 baseline\n", agg, agg / 19.3);
     fprintf(stderr, "  sequential ≈ %.0fs for the same %d tok; pool did it in %.1fs\n",
@@ -492,13 +524,13 @@ static int parse_self_test() {
 // ── boss prompting (PA.1 PLAN phase) ─────────────────────────────────────────
 struct Msg { std::string role, content; };
 
-static std::string apply_chat_template(const std::vector<Msg> &msgs) {
+static std::string apply_chat_template(const std::vector<Msg> &msgs, bool add_ass = true) {
     std::vector<llama_chat_message> chat;
     for (auto &m : msgs) chat.push_back({ m.role.c_str(), m.content.c_str() });
-    int32_t need = llama_chat_apply_template(G.tmpl, chat.data(), chat.size(), true, nullptr, 0);
+    int32_t need = llama_chat_apply_template(G.tmpl, chat.data(), chat.size(), add_ass, nullptr, 0);
     if (need < 0) { std::string raw; for (auto &m : msgs) raw += m.content + "\n"; return raw; }
     std::vector<char> buf(need + 1);
-    llama_chat_apply_template(G.tmpl, chat.data(), chat.size(), true, buf.data(), (int32_t)buf.size());
+    llama_chat_apply_template(G.tmpl, chat.data(), chat.size(), add_ass, buf.data(), (int32_t)buf.size());
     return std::string(buf.data(), need);
 }
 
@@ -574,10 +606,18 @@ static const char *WORKER_PREAMBLE =
     "else — no prose, no other functions, no re-declaring the shared interface. Match the\n"
     "declared signatures exactly. Output only code.";
 
-// assemble a lane's prompt from the work order: preamble + shared + this piece's spec
+// the common system turn (preamble + shared interface) — identical for every item in a job,
+// so its rendered+tokenized form is the cacheable prefix (PA.2.1).
+static std::string build_worker_system(const WorkOrder &wo) {
+    return std::string(WORKER_PREAMBLE) + "\n\nShared interface (rely on these):\n" + wo.shared;
+}
+static std::string build_prefix(const WorkOrder &wo) {
+    return apply_chat_template({ {"system", build_worker_system(wo)} }, /*add_ass=*/false);
+}
+
+// a lane's full prompt: the common system turn + this item's user turn (the per-item delta)
 static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
-    std::string user = "Shared interface (the public params you may rely on):\n";
-    user += wo.shared + "\n\n";
+    std::string user;
     if (p.is_boss) {                       // boss SELF lane: knows the workers' declared exports
         user += "The workers are separately producing these exports: ";
         bool first = true;
@@ -590,7 +630,7 @@ static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
     user += "Your piece";
     if (!p.language.empty()) user += " (" + p.language + ")";
     user += ": " + p.instruction + "\n\nSpec:\n" + p.blueprint;
-    return apply_chat_template({ {"system", WORKER_PREAMBLE}, {"user", user} });
+    return apply_chat_template({ {"system", build_worker_system(wo)}, {"user", user} }, /*add_ass=*/true);
 }
 
 int main(int argc, char **argv) {
@@ -646,7 +686,7 @@ int main(int argc, char **argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t)n_ctx;
     cp.n_batch = PREFILL_CHUNK;
-    cp.n_seq_max = (uint32_t)n_streams;
+    cp.n_seq_max = (uint32_t)n_streams + (task[0] ? 1u : 0u);  // pipeline reserves a base seq for the prefix cache (PA.2.1)
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.kv_unified      = false;   // M7.2 exactness: unified KV flips fp near-ties by batch shape
     if (kv_q8) {                  // ~2x context; trades byte-determinism (M7.2: Q8 KV is batch-shape-dependent under FA)
@@ -664,7 +704,7 @@ int main(int argc, char **argv) {
         std::string prompt = apply_chat_template(msgs);
         fprintf(stderr, "\n══ PA.1 PLAN — boss decomposing ══\n  task: %s\n\n", task);
         double t0 = now_sec();
-        int plan_cap = n_ctx / n_streams - 768;    // the plan gets the FULL seq budget — it needs
+        int plan_cap = n_ctx / (n_streams + 1) - 768;  // full seq budget (n_seq_max=n_streams+1 w/ base) — it needs
         if (plan_cap < 1024) plan_cap = 1024;      // room to break down many items / work a blueprint
         std::string raw = boss_generate(prompt, plan_cap);
         double el = now_sec() - t0;
@@ -683,7 +723,7 @@ int main(int argc, char **argv) {
         for (auto &p : wo.pieces) items.push_back(build_lane_prompt(wo, p));
         fprintf(stderr, "\n══ PA.2 POOL — %d work items, %d lanes ══\n", (int)items.size(), n_streams);
         std::vector<std::string> outputs;
-        run_pool(items, n_streams, max_new, &outputs);
+        run_pool(items, n_streams, max_new, &outputs, build_prefix(wo));   // PA.2.1: cache preamble+shared
         for (size_t i = 0; i < wo.pieces.size() && i < outputs.size(); i++) {
             std::string body = outputs[i];
             size_t bth = body.find("</think>");
