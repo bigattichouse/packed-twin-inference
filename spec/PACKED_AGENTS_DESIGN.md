@@ -561,6 +561,13 @@ boss piece → 11 tok/s, *slower than sequential*): the boss's parallel-phase pi
   **boss queue** (decision requests; only slot 0 pops, *before* it falls back to work items).
   The boss produces items + drains its queue; the harness brokers at the batch boundary.
   Worker queue = PA.2; boss queue = PA.4/PA.5.
+- **Communication boundaries — the boss is the only voice to the user.** Three channels:
+  **user ↔ boss** (natural language; *only* the boss — task in, final answer out, via gather);
+  **lane ↔ boss** (the boss queue — `ASK`/`NEED`/`DONE`, internal, FIFO); **lane ↔ world**
+  (tool calls — `write_file`/`run`, sandboxed + allowlisted, any lane, §8.3). Workers *act* on
+  the world but never *address* the user; their token streams are internal (debug/verbose),
+  not the product. A worker needing user input escalates worker→boss→user — the boss decides
+  what to surface. Single accountable voice; workers touch the outside only through tools.
 - **Communication:** v1 is one-shot assign → implement → gather (no mid-flight talk — keeps
   lanes parallel). A **bounded** bidirectional channel (worker questions + boss guidance/
   kill, `q_budget`-capped) is **PA.4**, independent of speculation. Clear subtasks are the
