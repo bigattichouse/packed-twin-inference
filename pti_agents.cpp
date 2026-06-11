@@ -91,6 +91,7 @@ struct Globals {
     llama_context     *ctx   = nullptr;
     llama_memory_t     mem   = nullptr;
     int32_t            n_vocab = 0;
+    const char        *tmpl  = nullptr;   // chat template (PA.1 boss prompting)
 } G;
 
 static std::string tok_str(llama_token t) {
@@ -275,6 +276,8 @@ static bool parse_marker(const std::string &line, std::string &tag,
         size_t eq = kv.find('=');
         if (eq != std::string::npos)
             attrs.push_back({ trim(kv.substr(0, eq)), trim(kv.substr(eq + 1)) });
+        else if (!attrs.empty())
+            attrs.back().second += kv;   // value continued past a space, e.g. "exports=a, b"
         i = nsp + 1;
     }
     return true;
@@ -379,14 +382,12 @@ static const char *SAMPLE_ENVELOPE =
     "<<<PIECE id=w3 exports=checkCollision>>>\n"
     "instruction: implement this function given the public params of the current class, in js\n"
     "<blueprint> checkCollision(bird, pipes) -> bool { true if bird hits a pipe or ground } </blueprint>\n"
-    "<<<SELF id=boss exports=stepWorld,smokeTest>>>\n"
+    "<<<SELF id=boss exports=stepWorld, smokeTest>>>\n"
     "instruction: implement this object in js - wire the three functions and a smoke test\n"
     "<blueprint> Integration { stepWorld(world, dt) -> void, smokeTest() -> bool } </blueprint>\n"
     "<<<END>>>\n";
 
-static int parse_self_test() {
-    WorkOrder wo = parse_work_order(SAMPLE_ENVELOPE);
-    fprintf(stderr, "── PA.1a work-order envelope parse self-test ──\n");
+static void print_work_order(const WorkOrder &wo) {
     fprintf(stderr, "strategy : %s\n", wo.strategy.c_str());
     fprintf(stderr, "shared   : %zu chars — \"%.50s...\"\n", wo.shared.size(), trim(wo.shared).c_str());
     for (auto &p : wo.pieces) {
@@ -396,13 +397,96 @@ static int parse_self_test() {
         fprintf(stderr, "        instr: %.66s\n", p.instruction.c_str());
         fprintf(stderr, "        bp   : %.66s\n", p.blueprint.c_str());
     }
-    if (wo.ok) { fprintf(stderr, "PARSE OK — %zu pieces, no export collisions\n", wo.pieces.size()); return 0; }
-    fprintf(stderr, "PARSE FAIL — %s\n", wo.error.c_str());
-    return 2;
+    if (wo.ok) fprintf(stderr, "PARSE OK — %zu pieces, no export collisions\n", wo.pieces.size());
+    else       fprintf(stderr, "PARSE FAIL — %s\n", wo.error.c_str());
 }
+
+static int parse_self_test() {
+    fprintf(stderr, "── PA.1a work-order envelope parse self-test ──\n");
+    WorkOrder wo = parse_work_order(SAMPLE_ENVELOPE);
+    print_work_order(wo);
+    return wo.ok ? 0 : 2;
+}
+
+// ── boss prompting (PA.1 PLAN phase) ─────────────────────────────────────────
+struct Msg { std::string role, content; };
+
+static std::string apply_chat_template(const std::vector<Msg> &msgs) {
+    std::vector<llama_chat_message> chat;
+    for (auto &m : msgs) chat.push_back({ m.role.c_str(), m.content.c_str() });
+    int32_t need = llama_chat_apply_template(G.tmpl, chat.data(), chat.size(), true, nullptr, 0);
+    if (need < 0) { std::string raw; for (auto &m : msgs) raw += m.content + "\n"; return raw; }
+    std::vector<char> buf(need + 1);
+    llama_chat_apply_template(G.tmpl, chat.data(), chat.size(), true, buf.data(), (int32_t)buf.size());
+    return std::string(buf.data(), need);
+}
+
+// greedy single-stream decode in seq 0 from a formatted prompt; returns the text
+static std::string boss_generate(const std::string &prompt, int max_tok) {
+    std::vector<llama_token> toks(prompt.size() + 16);
+    int n = llama_tokenize(G.vocab, prompt.c_str(), (int32_t)prompt.size(),
+                           toks.data(), (int32_t)toks.size(), true, true);
+    if (n < 0) { toks.resize(-n);
+        n = llama_tokenize(G.vocab, prompt.c_str(), (int32_t)prompt.size(),
+                           toks.data(), (int32_t)toks.size(), true, true); }
+    toks.resize(n > 0 ? n : 0);
+    llama_memory_seq_rm(G.mem, 0, 0, -1);
+    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, 1);
+    int last_idx = 0;
+    for (int i0 = 0; i0 < n; i0 += PREFILL_CHUNK) {
+        int nb = n - i0 < PREFILL_CHUNK ? n - i0 : PREFILL_CHUNK;
+        batch_clear(&batch);
+        for (int j = 0; j < nb; j++)
+            batch_add(&batch, toks[i0 + j], (llama_pos)(i0 + j), 0, i0 + j == n - 1);
+        if (llama_decode(G.ctx, batch) != 0) { llama_batch_free(batch); return "[prefill failed]"; }
+        last_idx = nb - 1;
+    }
+    llama_token tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
+    llama_pos pos = n;
+    std::string out;
+    for (int gen = 0; gen < max_tok && !llama_vocab_is_eog(G.vocab, tok); gen++) {
+        out += tok_str(tok);
+        batch_clear(&batch);
+        batch_add(&batch, tok, pos, 0, true);
+        if (llama_decode(G.ctx, batch) != 0) break;
+        tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, 0), G.n_vocab);
+        pos++;
+    }
+    llama_batch_free(batch);
+    return out;
+}
+
+static const char *BOSS_PROMPT =
+    "You are the COORDINATOR of a packed-agent coding team: you plus up to 3 workers that run\n"
+    "in parallel and in ISOLATION — a worker sees only the shared interface, its own spec, and\n"
+    "its one-line instruction, never another worker or you.\n\n"
+    "Decompose the user's coding task into up to 3 worker pieces PLUS one piece you keep\n"
+    "(SELF: integration glue + a smoke test). Pick a split strategy: function (independent\n"
+    "functions over one shared interface), file (one module per lane), or role (impl/tests/docs).\n"
+    "Prefer function-level. Use only as many PIECE blocks as the task cleanly splits into (1-3).\n\n"
+    "Output EXACTLY this envelope and nothing after <<<END>>> (UPPERCASE words are placeholders):\n\n"
+    "<<<PLAN strategy=STRATEGY lang=LANG>>>\n"
+    "shared:\n"
+    "<blueprint>\n"
+    "  the frozen interface every lane relies on: types and signatures,\n"
+    "  and a line  deps: [ allowed libraries, or [] for none ]\n"
+    "</blueprint>\n"
+    "<<<PIECE id=w1 exports=SYMBOL1,SYMBOL2>>>\n"
+    "instruction: ONE LINE, e.g. implement this function given the public params of the current class, in LANG\n"
+    "<blueprint> the spec for this piece only </blueprint>\n"
+    "<<<PIECE id=w2 exports=SYMBOL>>>\n"
+    "instruction: ONE LINE\n"
+    "<blueprint> ... </blueprint>\n"
+    "<<<SELF id=boss exports=SYMBOL>>>\n"
+    "instruction: ONE LINE\n"
+    "<blueprint> integration + smoke test spec </blueprint>\n"
+    "<<<END>>>\n\n"
+    "Rules: pieces must be independent (no shared mutable state mid-flight); exported symbols\n"
+    "must not collide across pieces; keep pieces similar in size. Emit the envelope only.";
 
 int main(int argc, char **argv) {
     char  model_path[512] = {};
+    char  task[2048] = {};
     int   max_new   = 96;
     int   n_ctx     = 16384;
     int   n_streams = 4;
@@ -411,13 +495,14 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(model_path, argv[++i], sizeof(model_path)-1);
+        else if (!strcmp(argv[i], "-p")   && i+1 < argc) strncpy(task, argv[++i], sizeof(task)-1);
         else if (!strcmp(argv[i], "-n")   && i+1 < argc) max_new   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c")   && i+1 < argc) n_ctx     = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--streams")) && i+1 < argc) n_streams = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--parse-test")) parse_test = true;
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test) return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
@@ -448,6 +533,28 @@ int main(int argc, char **argv) {
     G.ctx = llama_init_from_model(G.model, cp);
     if (!G.ctx) { fprintf(stderr, "context failed\n"); return 1; }
     G.mem = llama_get_memory(G.ctx);
+
+    // ── PA.1 pipeline (PA.1a = PLAN phase): boss decomposes the task ──────────
+    if (task[0]) {
+        G.tmpl = llama_model_chat_template(G.model, nullptr);
+        std::vector<Msg> msgs = {{"system", BOSS_PROMPT}, {"user", task}};
+        std::string prompt = apply_chat_template(msgs);
+        fprintf(stderr, "\n══ PA.1 PLAN — boss decomposing ══\n  task: %s\n\n", task);
+        double t0 = now_sec();
+        std::string raw = boss_generate(prompt, 3000);
+        double el = now_sec() - t0;
+        std::string plan = raw;                         // drop <think> preamble if present
+        size_t th = plan.find("</think>");
+        if (th != std::string::npos) plan = plan.substr(th + 8);
+        fprintf(stderr, "── boss work-order (%.1fs, %zu chars) ──\n%s\n\n── parsed ──\n",
+                el, trim(plan).size(), trim(plan).c_str());
+        WorkOrder wo = parse_work_order(plan);
+        print_work_order(wo);
+        llama_free(G.ctx);
+        llama_model_free(G.model);
+        llama_backend_free();
+        return wo.ok ? 0 : 2;
+    }
 
     // independent worker-shaped prompts (PA.1 will generate these from a plan).
     // Pool of MAX_STREAMS; the first n_streams are used.
