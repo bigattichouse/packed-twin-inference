@@ -4,6 +4,8 @@
 Coordinator + 3 workers progress simultaneously; a 4-stream step costs **1.86×** one
 stream (measured, M5.1) — so four agents run at **2.15× aggregate efficiency**, and
 splittable tasks finish in roughly the time of their longest piece instead of the sum.
+**PA.0 demo measured 1.95× end-to-end (2026-06-10), all-in with CPU-side argmax overhead.**
+Detailed design: [`spec/PACKED_AGENTS_DESIGN.md`](spec/PACKED_AGENTS_DESIGN.md).
 
 ## Why this is feasible today (measured foundations)
 
@@ -98,8 +100,9 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
 
 ## Milestones
 
-- **PA.0** — plumbing demo: 4 independent prompts, one context, parallel decode, measure
-  aggregate tok/s vs 4 sequential runs (expect ≈2.15×). Mostly resurrects pti_4seq code.
+- **PA.0** ✓ *(2026-06-10)* — plumbing demo (`pti_agents.cpp`): 4 independent prompts, one
+  context, parallel decode. **Measured 1.95× aggregate** (19.3 → 37.7 tok/s); four
+  independent buffers. Remaining: byte-identity packed-vs-solo gate.
 - **PA.1** — phased pipeline: plan → fan-out → parallel → gather on a canned task
   ("write a class with 3 methods"); end-to-end artifact quality check.
 - **PA.2** — work-queue refill + straggler stats.

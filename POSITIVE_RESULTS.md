@@ -169,3 +169,25 @@ Two findings required to get cross-mode identity, both measured here:
 Reordering the inner loops so the weight-block address is loop-invariant across columns let
 LLVM hoist the block load: N=4 decode overhead 1.95× → 1.86×. Small, real, upstreamable —
 and the only positive result from the entire kernel investigation.
+
+## 12. Packed agents — four cooperating streams at ~2× aggregate (PA.0)
+
+The packed-batch economics that verify drafts also run *independent* agents. Four unrelated
+prompts decode in ONE `llama_context`, one batched `llama_decode` per step (one token per
+live stream); finished streams drop out and the survivors continue.
+
+```
+            tok/s   tokens   wall
+sequential  19.3    384      19.8s    ← 4 prompts one at a time (= baseline)
+packed      37.7    384      10.2s    ← 4 streams, one batched decode/step
+aggregate   1.95×            (predicted 2.15× from M5.1's 1.86× 4-seq step)
+```
+
+This is the **all-in** number: it includes the per-step 4× full-vocab argmax (~151k logits
+× 4) and string bookkeeping on the CPU side, so the effective 4-seq step came to ~2.05× one
+stream (vs the 1.86× microbench) — the gap is real per-step overhead, not the kernel. One
+model in VRAM (~24 GB, loaded once); the four lanes add only KV/SSM state, which at fixed
+`n_ctx` is a *subdivision* of an already-paid pool. Substrate for the cooperative roadmap
+(`PACKED_AGENTS.md` → `spec/PACKED_AGENTS_DESIGN.md`: boss decomposes → 3 workers → gather).
+Build/run: `make agents && make agents-run`. Remaining PA.0 gate: byte-identity packed-vs-solo
+per lane (`kv_unified=false`).

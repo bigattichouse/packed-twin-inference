@@ -150,6 +150,11 @@ table above. Open items, in value order:
    usable, MTP active) at the cost of cross-mode byte-identity
 4. ~~Sampled verification~~ — **done** (M7.4): speculation active at any temperature;
    τ=0.25 code edit keeps the full 2.0×, seeded runs reproduce byte-for-byte
+5. **Packed agents** *(new direction)* — the same packed-batch economics run *cooperating*
+   agents, not just drafts: a boss decomposes a coding task for three workers, all four
+   streams in one context, one batched decode per step. PA.0 substrate measured **1.95×
+   aggregate** (4 streams; one model in VRAM, lanes add only KV). Design:
+   `PACKED_AGENTS.md` → `spec/PACKED_AGENTS_DESIGN.md`.
 
 Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kernel
 (the only path past the current verify-cost curve; major project).
@@ -161,6 +166,7 @@ Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kern
 | `pti_lookup.cpp` | the algorithm — CLI with `--baseline/--mtp/--sabotage/-t` audit modes |
 | `pti_server.cpp` | OpenAI-compatible server, `--mode base/mtp/pti`, any temperature |
 | `pti_chat.cpp` | interactive chat (llama-cli equivalent): live `/mode`, `/temp`, per-turn stats |
+| `pti_agents.cpp` | packed-agents substrate (PA.0): 4 streams, one context, one batched decode/step |
 | `pti-cli.sh`, `llama-server-pti.sh` | launch scripts |
 | `llama.cpp-patch/`, `llama.cpp-files/` | the one (optional) llama.cpp patch + mirrored files |
 | `pti_kbatch_bench.cpp`, `pti_mtp_probe.cpp`, `pti_q6k_bench.hip` | the measurements behind the design |
