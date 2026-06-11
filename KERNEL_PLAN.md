@@ -505,3 +505,16 @@ GGML_ASSERT(n_tokens_all <= n_batch) on >1024-token prompts), max_tokens clamped
 usable ctx everywhere, pti_lookup gained -c (the ~1100-token death was its hardcoded
 4096 ctx), llama-server flag compatibility (--jinja/--ctx-size/--cache-type-k/v/etc.,
 unknown flags warn instead of die).
+
+### M7.5b — Prompt-base checkpoint cache (v2) — **DONE (2026-06-10)**
+
+v1 lived-stream extension was structurally defeated by the template (think-prefill in the
+generation prompt; tool history re-rendering). v2 checkpoints the state at "base" = the
+templated prompt minus chat_params.generation_prompt (seq 2; n_seq_max=3, usable = ctx/3).
+Everything volatile renders AFTER base, so agent loops extend the base every turn.
+Layered match: lived-extension → base-extension → miss; base re-published mid-prefill at
+the exact crossing; tokenization prefix-property verified before trusting the base split.
+
+Measured: agent-scale prompt (2063 tok) T1 prefill 13.5 s → T2 hit-base reused 2056,
+prefill 0.3 s (45×). Small-convo T2 correctly hit-base (reused 16/162).
+Also surfaced: prefill ≈ 150 tok/s on this config → -b/-ub tuning is a real lever.

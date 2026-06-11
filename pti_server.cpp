@@ -339,6 +339,13 @@ struct GenCache {
     int  clean_c = 0;                // seq0 state is clean through position clean_c;
                                      // toks[clean_c..) are correct but unconsumed
     bool valid   = false;
+    // v2 (M7.5b): prompt-base checkpoint. seq 2 holds the state at "base" =
+    // the templated prompt MINUS the volatile generation-prompt suffix. Agent
+    // loops extend the base every turn even when think-prefills/tool history
+    // re-render differently than the lived stream (measured: lived-extension
+    // diverges at the genprefill, token 19/23).
+    std::vector<llama_token> base_toks;
+    bool base_valid = false;
 } GC;
 
 static bool ensure_gen_ctx() {
@@ -352,7 +359,7 @@ static bool ensure_gen_ctx() {
     cparams.n_ctx        = (uint32_t)G.args.n_ctx;
     cparams.n_batch      = (uint32_t)G.args.n_batch;
     cparams.n_ubatch     = (uint32_t)G.args.n_ubatch;
-    cparams.n_seq_max    = 2;                            // working + checkpoint
+    cparams.n_seq_max    = 3;                            // working + spec ckpt + base ckpt
     cparams.kv_unified   = false;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     if (G.args.kv_q8) {
@@ -377,8 +384,8 @@ static bool ensure_gen_ctx() {
     return true;
 }
 
-static GenStats run_generate(const std::string &prompt, int max_new,
-                             float temperature, uint64_t seed, int mode,
+static GenStats run_generate(const std::string &prompt, const std::string &gen_prompt,
+                             int max_new, float temperature, uint64_t seed, int mode,
                              const TokenSink &sink) {
     GenStats stats;
     stats.mode = mode_name(mode);
@@ -397,9 +404,9 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         return stats;
     }
     // ── budget: clamp generation to the per-stream context ───────────────────
-    int usable = G.args.n_ctx / 2;                // non-unified: 2 streams
+    int usable = G.args.n_ctx / 3;                // non-unified: 3 streams
     if (n_hist + MAX_DRAFT + 8 >= usable) {
-        fprintf(stderr, "  [error] prompt (%d tok) exceeds usable context (%d = n_ctx/2)\n",
+        fprintf(stderr, "  [error] prompt (%d tok) exceeds usable context (%d = n_ctx/3)\n",
                 n_hist, usable);
         return stats;
     }
@@ -413,46 +420,90 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     stats.n_prompt = n_hist;
     fprintf(stderr, "  prompt: %d tokens  mode: %s\n", n_hist, stats.mode);
 
-    // ── prompt cache: extension → delta prefill; divergence → full ──────────
+    // ── new base = templated prompt minus the generation-prompt suffix ──────
+    int nb_new = n_hist;                        // base end (token index)
+    if (!gen_prompt.empty() && prompt.size() >= gen_prompt.size()
+        && prompt.compare(prompt.size() - gen_prompt.size(), gen_prompt.size(), gen_prompt) == 0) {
+        std::string base_str = prompt.substr(0, prompt.size() - gen_prompt.size());
+        std::vector<llama_token> bt(MAX_PROMPT_TOKENS);
+        int n = llama_tokenize(G.vocab, base_str.c_str(), (int32_t)base_str.size(),
+                               bt.data(), MAX_PROMPT_TOKENS, true, true);
+        // tokenization prefix property must hold or the base is unusable
+        if (n > 0 && n <= n_hist && std::equal(bt.begin(), bt.begin() + n, hist.begin()))
+            nb_new = n;
+    }
+
+    // ── layered cache match: lived-stream extension → base extension → miss ─
     int start = 0;
-    bool extend = GC.valid
+    const char *how = "cold";
+    if (GC.valid
         && n_hist >= (int)GC.toks.size()
         && GC.clean_c < (int)GC.toks.size()
-        && std::equal(GC.toks.begin(), GC.toks.end(), hist.begin());
-    if (extend) {
+        && std::equal(GC.toks.begin(), GC.toks.end(), hist.begin())) {
         start = GC.clean_c;
-        fprintf(stderr, "  [cache] hit: reused %d, prefilling %d\n", start, n_hist - start);
+        how   = "hit-lived";
+    } else if (GC.base_valid
+        && !GC.base_toks.empty()
+        && n_hist >= (int)GC.base_toks.size()
+        && (int)GC.base_toks.size() <= nb_new
+        && std::equal(GC.base_toks.begin(), GC.base_toks.end(), hist.begin())) {
+        llama_memory_seq_rm(mem, 0, 0, -1);
+        llama_memory_seq_cp(mem, 2, 0, 0, -1);   // restore base state
+        llama_memory_seq_rm(mem, 1, 0, -1);
+        if (GC.ctx_mtp) llama_memory_seq_rm(llama_get_memory(GC.ctx_mtp), 0, 0, -1);
+        start = (int)GC.base_toks.size();
+        how   = "hit-base";
     } else {
         llama_memory_seq_rm(mem, 0, 0, -1);
         llama_memory_seq_rm(mem, 1, 0, -1);
+        llama_memory_seq_rm(mem, 2, 0, -1);
         if (GC.ctx_mtp) llama_memory_seq_rm(llama_get_memory(GC.ctx_mtp), 0, 0, -1);
-        if (GC.valid) {
-            size_t lim = std::min((size_t)n_hist, GC.toks.size());
-            size_t common = 0;
-            while (common < lim && GC.toks[common] == hist[common]) common++;
-            fprintf(stderr, "  [cache] miss: full prefill %d (prefix match %zu of prev %zu)\n",
-                    n_hist, common, GC.toks.size());
-        }
+        if (GC.valid || GC.base_valid) how = "miss";
     }
-    GC.valid = false;   // invalidated until a successful finalize below
+    fprintf(stderr, "  [cache] %s: reused %d, prefilling %d (base at %d)\n",
+            how, start, n_hist - start, nb_new);
+    GC.valid = false;        // re-published at finalize
+    GC.base_valid = false;   // re-published at the nb_new crossing below
 
-    // ── prefill, chunked to n_batch (llama_decode asserts on larger) ─────────
+    // ── prefill [start, n_hist), chunked; checkpoint the base at nb_new ─────
     int chunk = G.args.n_batch;
-    llama_batch batch = llama_batch_init(chunk + 160, 0, 2);
+    llama_batch batch = llama_batch_init(chunk + 160, 0, 3);
     int last_idx = 0;
     bool prefill_ok = true;
     double t_pf0 = now_sec();
-    for (int i0 = start; i0 < n_hist && prefill_ok; i0 += chunk) {
-        int nb = n_hist - i0 < chunk ? n_hist - i0 : chunk;
-        batch_clear(&batch);
-        for (int j = 0; j < nb; j++)
-            batch_add(&batch, hist[i0 + j], (llama_pos)(i0 + j), 0, i0 + j == n_hist - 1);
-        if (llama_decode(ctx, batch) != 0) prefill_ok = false;
-        last_idx = nb - 1;
+    {
+        int i0 = start;
+        if (i0 >= nb_new && nb_new >= 0) {
+            // base already covered by reuse: state at start ≥ nb... only safe
+            // to (re)publish when start == nb_new exactly (state == S(nb_new))
+            if (i0 == nb_new) {
+                llama_memory_seq_rm(mem, 2, 0, -1);
+                llama_memory_seq_cp(mem, 0, 2, 0, -1);
+                GC.base_toks.assign(hist.begin(), hist.begin() + nb_new);
+                GC.base_valid = true;
+            }
+        }
+        while (i0 < n_hist && prefill_ok) {
+            int lim = (i0 < nb_new && nb_new < n_hist) ? nb_new : n_hist;  // break at base
+            int nbt = std::min(chunk, lim - i0);
+            batch_clear(&batch);
+            for (int j = 0; j < nbt; j++)
+                batch_add(&batch, hist[i0 + j], (llama_pos)(i0 + j), 0, i0 + j == n_hist - 1);
+            if (llama_decode(ctx, batch) != 0) { prefill_ok = false; break; }
+            last_idx = nbt - 1;
+            i0 += nbt;
+            if (i0 == nb_new) {                  // crossing: seq0 == S(nb_new)
+                llama_memory_seq_rm(mem, 2, 0, -1);
+                llama_memory_seq_cp(mem, 0, 2, 0, -1);
+                GC.base_toks.assign(hist.begin(), hist.begin() + nb_new);
+                GC.base_valid = true;
+            }
+        }
     }
     stats.prefill_s = now_sec() - t_pf0;
     if (!prefill_ok) {
         fprintf(stderr, "Prefill failed\n");
+        GC.base_valid = false;
         llama_batch_free(batch);
         return stats;
     }
@@ -769,6 +820,7 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
         }
     }
     if (!use_common) prompt = messages_to_prompt(j["messages"]);
+    std::string gen_prompt = use_common ? chat_params.generation_prompt : std::string{};
 
     fprintf(stderr, "[%s] mode=%s temp=%.2f seed=%llu max_tokens=%d stream=%d tools=%d\n",
             id.c_str(), mode_name(mode), temperature,
@@ -843,11 +895,11 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
         // generation: leading whitespace is valid JSON, and it keeps client
         // fetch timeouts (nanocoder default: 120 s) from killing long turns.
         res.set_chunked_content_provider("application/json",
-            [prompt, temperature, seed, max_tokens, mode, id, parse_final](
+            [prompt, gen_prompt, temperature, seed, max_tokens, mode, id, parse_final](
                     size_t /*offset*/, httplib::DataSink &sink) -> bool {
                 std::string full;
                 double last_beat = now_sec();
-                GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
+                GenStats stats = run_generate(prompt, gen_prompt, max_tokens, temperature, seed, mode,
                     [&](const std::string &text) -> bool {
                         full += text;
                         double now = now_sec();
@@ -883,7 +935,7 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
     // arrive as a structured delta at the end. Nothing buffers needlessly —
     // long turns show progress immediately (no client timeouts).
     res.set_chunked_content_provider("text/event-stream",
-        [prompt, temperature, seed, max_tokens, mode, id, parse_final](
+        [prompt, gen_prompt, temperature, seed, max_tokens, mode, id, parse_final](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
             std::string full;          // everything generated (for final parse)
             std::string pend;          // gate holdback
@@ -933,7 +985,7 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
                 return true;
             };
 
-            GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode, feed);
+            GenStats stats = run_generate(prompt, gen_prompt, max_tokens, temperature, seed, mode, feed);
 
             json message; std::string finish;
             parse_final(full, message, finish);
@@ -975,7 +1027,7 @@ static void usage(const char *prog) {
         "Usage: %s -m <model.gguf> [options]\n\n"
         "  -m <path>      Model path (required; needs nextn head for MTP modes)\n"
         "  -p <port>      HTTP port (default: 8080)\n"
-        "  -c <int>       Context size (default: 98304 = 49k usable; f16 KV)\n"
+        "  -c <int>       Context size (default: 98304 = 32k usable; f16 KV)\n"
         "  -ngl <int>     GPU layers (default: 99)\n"
         "  --kv-q8        Q8_0 KV cache: ~2x context headroom, but output may\n"
         "                 differ between modes (batch-size-dependent numerics)\n"
@@ -1085,7 +1137,7 @@ int main(int argc, char **argv) {
         "  Mode        : %s   (per-request override: \"pti_mode\")\n"
         "  Temperature : %.2f (sampled verification: speculation active at any temp)\n"
         "  Context     : %d tokens\n"
-        "  KV cache    : %s (usable ctx = n_ctx/2 — checkpoint stream)\n\n",
+        "  KV cache    : %s (usable ctx = n_ctx/3 — spec + base checkpoint streams)\n\n",
         args.port, mode_name(args.mode), args.temperature, args.n_ctx,
         args.kv_q8 ? "Q8_0 — NOTE: output may differ between modes" : "f16 (exact across modes)");
 
