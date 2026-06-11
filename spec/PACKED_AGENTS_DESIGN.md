@@ -491,6 +491,21 @@ coordination (answers, grants, gather) outranks grunt work, but slot 0 never idl
 boss queue empty it pops work items like any worker. Workers (seqs 1+) pop the worker queue
 only. The boss's `REPLY`/`GRANT`/`GUIDE` is injected back into the target lane.
 
+**Boss state is a movable, locked singleton.** The boss's coordination context (its KV + SSM
+state) can be parked and reloaded — via `llama_memory_seq_cp` (in-VRAM; the same SSM-safe
+checkpoint `pti_lookup` already uses for rollback, proven byte-identical) or
+`llama_state_seq_get_data`/`set_data` (serialize to a host buffer/file, freeing the slot).
+So "slot 0 = boss" is not fundamental: **any free lane may acquire the boss** — load its state,
+drain boss-queue messages **in FIFO order** (order matters), save the updated state, release —
+then return to work items. Invariant: **exactly one lane holds the boss at a time** (a single
+mutable context; concurrent boss turns would fork the state and reorder messages — a lock).
+This generalizes the slot-0 rule: better balancing (a free lane handles a pending decision
+while slot 0 is mid-work-item) at the cost of a save/restore per acquire. Tradeoffs: a parked
+boss *seq* (seq_cp) still costs an `n_seq_max` slot + its idle-seq tax (§2); the serialize-to-
+host path (`state_seq`) avoids the slot but pays a memcpy per swap. **Default (v1/v2): pin the
+boss to slot 0** (already drains its queue first); promote to the movable lock when balancing
+demands it.
+
 The lane↔queue interface is the same marker parsing already done on the token stream; the
 broker runs at the **batch boundary** (every step is a natural sync point — §8.2). Mental
 model: a tiny **blackboard** — workers (seqs 1+) pop the worker queue; **slot 0** produces
