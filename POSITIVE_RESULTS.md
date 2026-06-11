@@ -224,3 +224,15 @@ More lanes do **not** win, for two measured reasons:
 Conclusion: keep `-s` for experiments, but **4 is the operating point** — it maximizes packed
 throughput *and* is the largest gate-clean (byte-identical) lane count. This matches the
 coordinator + 3-workers design; now measured, not assumed.
+
+### PA.1a — the boss decomposes a task into a parseable work-order (2026-06-11)
+
+The orchestration layer's riskiest unknown — *will the model emit a machine-parseable plan?*
+— is answered yes. `pti_agents -p "task"` chat-formats a decomposition system prompt + the
+task, decodes the boss alone, strips `<think>`, and parses the `<<<PLAN/PIECE/SELF/END>>>`
+envelope into a `WorkOrder`. On a flappy-bird task the boss produced a clean function-level
+split: 3 isolated workers (`updateBirdPhysics` / `updatePipes` / `checkCollisions`) over a
+shared `state`/`config` interface, plus a boss SELF piece (`initGame` / `gameLoop` + smoke
+test) — PARSE OK, no export collisions. A GPU-free `--parse-test` self-checks the parser.
+(Real model output also caught a bug a clean sample missed: `exports=a, b` with a space
+dropped `b` — fixed.) Next: PA.1b fan-out + parallel decode on the gate'd substrate.

@@ -436,7 +436,7 @@ quality matters more than the extra ~0.25×, do PA.4 first.
 | id | deliverable | acceptance gate |
 |---|---|---|
 | **PA.0** | plumbing demo (`pti_agents.cpp`): 4 prompts, one context, packed vs sequential | **DONE: ~1.9× aggregate** (1.87–1.95× run-to-run; 19.3 → ~37 tok/s, 4 independent buffers) and **byte-identity gate PASS (2026-06-11)** — all 4 lanes byte-identical packed-vs-solo, asserted in-binary (`kv_unified=false`, exits non-zero on divergence). Survivors-continue-after-EOG path coded, not yet exercised (equal-cap run). |
-| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task ("class with 3 methods"); boss authors BluePrint, harness routes | end-to-end artifact compiles & passes the boss's smoke test; envelope parses reliably over ≥20 plans; measure plan-tax crossover (risk #3) |
+| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a DONE (2026-06-11):** boss PLAN → parseable work-order, verified on the real model (flappy-bird → 3 isolated workers + boss SELF, PARSE OK, no collisions); `-p "task"` mode + GPU-free `--parse-test`. **PA.1b** (fan-out + parallel) / **PA.1c** (gather) pending. Full gate: artifact compiles & passes the boss's smoke test; envelope parses reliably over ≥20 plans; plan-tax crossover (risk #3) measured. |
 | **PA.2** | work-queue refill + straggler stats | batch stays full with a >3-piece backlog; report idle-lane-fraction |
 | **PA.3** | speculation stacking (MTP/lookup per stream, `n_seq_max=8`) | ~2.4× aggregate; per-lane output still reproducible |
 | **PA.4** | bidirectional coordination: worker `ASK`→boss `REPLY`, plus boss GUIDE/KILL (independent of PA.3) | a worker blocked on an ambiguous spec gets an answer and finishes; boss kills+retries a sabotaged runaway within N tokens; Q&A stays within `q_budget` |
@@ -445,7 +445,9 @@ quality matters more than the extra ~0.25×, do PA.4 first.
 37.4 tok/s packed), the **byte-identity gate PASSES at N=4**, and the lane count is now
 **configurable (`-s 1..16`)**. An N-sweep settled the "more lanes?" question: **4 is the
 sweet spot** — higher N loses on speed (idle-seq SSM tax, §2) *and* byte-identity (near-ties,
-§2.1). Default stays 4. Next: **PA.1** (boss → workers → gather pipeline).
+§2.1). Default stays 4. **PA.1a DONE** (2026-06-11): the boss decomposes a task into a
+parseable work-order (`-p "task"`), verified on the real model. Next: **PA.1b** — fan-out the
+parsed pieces into worker seqs + parallel decode on the gate'd substrate, then **PA.1c** gather.
 
 ---
 
