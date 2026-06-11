@@ -252,3 +252,21 @@ refill-on-`DONE` (a finished lane is `seq_rm`'d and prefilled with the next queu
 sequential, and 3× the PA.1b straggler (11 tok/s). Refill keeps the batch full across waves.
 Next: feed the pool from the boss's task list (the boss queue produces items; all lanes,
 slot 0 included, pop them).
+
+**PA.2 end-to-end + Q8/128k + the prefix cache (PA.2.1).** Wired the boss plan → pool: the boss
+decomposes into N small items (no fixed cap), the pool runs them with refill, per-item outputs
+collected. Verified on a vector-math task — boss emitted **8 clean items** over a shared `Vec2`
+interface; the pool produced **8 correct functions**. Two defaults changed along the way:
+**Q8_0 KV is now the default** (byte-exactness was a spec-dec artifact, not an agent need —
+§2.1 of the design doc), which fits **128k context on the 32 GB MI50** (verified, 1.98× 4-wide,
+no penalty); f16 is opt-in (`--kv-f16`). **PA.2.1 prefix cache:** the worker preamble + shared
+interface (the system turn) is prefilled once into a base seq and `seq_cp`-cloned into each lane
+(initial + refill), so only the per-item delta is prefilled — initial prefill 13.6s → 6.2s,
+aggregate 9.7 → 12.4 tok/s, outputs unchanged.
+
+Two honest findings from these runs: (1) **plan tax** — the reasoning boss thinks ~5400 tok
+(~400 s) to decompose 8 trivial functions; `--no-think` for the boss is the lever. (2)
+**tiny-item floor** — one-line functions (~40 gen tok) are overhead-bound (clone + delta +
+`n_seq_max` tax > the generation), so the pool/cache win is modest on them; both shine when
+items carry real generation and share a large context. The mechanisms are right; the
+vector-math task is a poor showcase for their throughput.
