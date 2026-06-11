@@ -229,6 +229,7 @@ struct GenStats {
     int    n_steps    = 0;
     int    ng_fire    = 0, ng_acc  = 0;   // lookup drafts proposed/accepted
     int    mtp_fire   = 0, mtp_acc = 0;   // MTP drafts fired/accepted
+    int    n_veto     = 0;                // n-gram fires vetoed by MTP disagreement
     double tok_s      = 0.0;
     const char *mode  = "base";
 };
@@ -299,15 +300,38 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         llama_free(ctx);
         return stats;
     }
+    // ── budget: clamp generation to the per-stream context ───────────────────
+    int usable = G.args.n_ctx / 2;                // non-unified: 2 streams
+    if (n_hist + MAX_DRAFT + 8 >= usable) {
+        fprintf(stderr, "  [error] prompt (%d tok) exceeds usable context (%d = n_ctx/2)\n",
+                n_hist, usable);
+        if (ctx_mtp) llama_free(ctx_mtp);
+        llama_free(ctx);
+        return stats;
+    }
+    if (n_hist + max_new + MAX_DRAFT + 8 > usable) {
+        int clamped = usable - n_hist - MAX_DRAFT - 8;
+        fprintf(stderr, "  [note] max_tokens %d clamped to %d (usable ctx %d - prompt %d)\n",
+                max_new, clamped, usable, n_hist);
+        max_new = clamped;
+    }
     hist.resize((size_t)n_hist + max_new + 8);
     fprintf(stderr, "  prompt: %d tokens  mode: %s\n", n_hist, stats.mode);
 
-    int batch_cap = (n_hist > 200 ? n_hist : 200) + 4;
-    llama_batch batch = llama_batch_init(batch_cap, 0, 2);
-    batch_clear(&batch);
-    for (int i = 0; i < n_hist; i++)
-        batch_add(&batch, hist[i], (llama_pos)i, 0, i == n_hist - 1);
-    if (llama_decode(ctx, batch) != 0) {
+    // ── prefill, chunked to n_batch (llama_decode asserts on larger) ─────────
+    int chunk = G.args.n_batch;
+    llama_batch batch = llama_batch_init(chunk + 160, 0, 2);
+    int last_idx = 0;
+    bool prefill_ok = true;
+    for (int i0 = 0; i0 < n_hist && prefill_ok; i0 += chunk) {
+        int nb = n_hist - i0 < chunk ? n_hist - i0 : chunk;
+        batch_clear(&batch);
+        for (int j = 0; j < nb; j++)
+            batch_add(&batch, hist[i0 + j], (llama_pos)(i0 + j), 0, i0 + j == n_hist - 1);
+        if (llama_decode(ctx, batch) != 0) prefill_ok = false;
+        last_idx = nb - 1;
+    }
+    if (!prefill_ok) {
         fprintf(stderr, "Prefill failed\n");
         llama_batch_free(batch);
         if (ctx_mtp) llama_free(ctx_mtp);
@@ -316,7 +340,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     }
 
     llama_pos   p        = (llama_pos)n_hist;
-    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, batch.n_tokens - 1),
+    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, last_idx),
                                                    G.n_vocab, temperature, seed, p);
     hist[n_hist++] = tok_last;
     if (!sink(token_to_str(tok_last))) goto done_early;
@@ -330,7 +354,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
             mtp_batch = llama_batch_init(8, G.n_embd, 1);
             mtp_batch.token = (llama_token *)malloc(8 * sizeof(llama_token));
             mtp_cand = mtp_feed1(ctx_mtp, ctx, &mtp_batch, tok_last,
-                                 batch.n_tokens - 1, p, G.n_embd, G.n_vocab);
+                                 last_idx, p, G.n_embd, G.n_vocab);
         }
 
         // ── speculative loop state (pti_lookup.cpp, M6.4c) ──────────────────
@@ -358,8 +382,10 @@ static GenStats run_generate(const std::string &prompt, int max_new,
             // with draft[0] marks the n-gram fire as coincidental — veto it.
             // Makes mtp mode the floor of pti mode (measured: best-or-tied
             // on every text class). Escalated rungs skip the veto.
-            if (k > 0 && mtp_alive && k_cur <= G.args.draft_k && mtp_cand != draft[0])
+            if (k > 0 && mtp_alive && k_cur <= G.args.draft_k && mtp_cand != draft[0]) {
                 k = 0;
+                stats.n_veto++;
+            }
 
             if (k == 0 && mtp_alive) {
                 draft[0] = mtp_cand;
@@ -465,6 +491,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     if (stats.mtp_fire) fprintf(stderr, "  mtp %d/%d (%.0f%%)",
                                 stats.mtp_acc, stats.mtp_fire,
                                 100.0 * stats.mtp_acc / stats.mtp_fire);
+    if (stats.n_veto)   fprintf(stderr, "  vetoed %d", stats.n_veto);
     fprintf(stderr, "\n");
 
 done_early:
@@ -615,21 +642,51 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     ServerArgs &args = G.args;
 
+    // llama-server-compatible flag handling: accept the common llama-server
+    // spellings, map what applies, warn-and-ignore what doesn't, and never
+    // die on an unknown flag (editor launchers pass their own sets).
+    int kv_q8_votes = 0;
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-m")     && i+1 < argc) strncpy(args.model_path, argv[++i], sizeof(args.model_path)-1);
-        else if (!strcmp(argv[i], "-p")     && i+1 < argc) args.port         = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-c")     && i+1 < argc) args.n_ctx        = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-ngl")   && i+1 < argc) args.n_gpu_layers = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--temp") && i+1 < argc) args.temperature  = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-n")     && i+1 < argc) args.max_tokens   = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--kv-q8")) args.kv_q8 = true;
-        else if (!strcmp(argv[i], "--verbose")) g_verbose_logs = true;
-        else if (!strcmp(argv[i], "--mode") && i+1 < argc) {
+        const char *a = argv[i];
+        if      ((!strcmp(a, "-m") || !strcmp(a, "--model")) && i+1 < argc) strncpy(args.model_path, argv[++i], sizeof(args.model_path)-1);
+        else if ((!strcmp(a, "-p") || !strcmp(a, "--port"))  && i+1 < argc) args.port  = atoi(argv[++i]);
+        else if ((!strcmp(a, "-c") || !strcmp(a, "--ctx-size")) && i+1 < argc) args.n_ctx = atoi(argv[++i]);
+        else if ((!strcmp(a, "-ngl") || !strcmp(a, "--n-gpu-layers") || !strcmp(a, "--gpu-layers")) && i+1 < argc) args.n_gpu_layers = atoi(argv[++i]);
+        else if ((!strcmp(a, "-b") || !strcmp(a, "--batch-size"))  && i+1 < argc) args.n_batch  = atoi(argv[++i]);
+        else if ((!strcmp(a, "-ub") || !strcmp(a, "--ubatch-size")) && i+1 < argc) args.n_ubatch = atoi(argv[++i]);
+        else if (!strcmp(a, "--temp") && i+1 < argc) args.temperature = atof(argv[++i]);
+        else if ((!strcmp(a, "-n") || !strcmp(a, "--predict") || !strcmp(a, "--n-predict")) && i+1 < argc) args.max_tokens = atoi(argv[++i]);
+        else if (!strcmp(a, "--kv-q8")) args.kv_q8 = true;
+        else if ((!strcmp(a, "--cache-type-k") || !strcmp(a, "--cache-type-v")) && i+1 < argc) {
+            if (!strcmp(argv[++i], "q8_0")) kv_q8_votes++;
+        }
+        else if (!strcmp(a, "--jinja")) {
+            fprintf(stderr, "[note] --jinja accepted: using the model's built-in chat template via\n"
+                            "       llama_chat_apply_template (covers Qwen-family templates; full\n"
+                            "       Jinja incl. tool-call schemas is not implemented)\n");
+        }
+        else if ((!strcmp(a, "-t") || !strcmp(a, "--threads")) && i+1 < argc) { ++i; /* full GPU offload: ignored */ }
+        else if (!strcmp(a, "--timeout")   && i+1 < argc) ++i;   // accepted, no-op
+        else if (!strcmp(a, "--parallel")  && i+1 < argc) {
+            if (atoi(argv[++i]) > 1) fprintf(stderr, "[note] --parallel > 1 ignored: single-slot server\n");
+        }
+        else if (!strcmp(a, "--cache-ram") && i+1 < argc) ++i;   // accepted, no-op
+        else if (!strcmp(a, "--no-warmup"))               ;      // accepted, no-op
+        else if (!strcmp(a, "--host")      && i+1 < argc) ++i;   // accepted, no-op (binds 0.0.0.0)
+        else if (!strcmp(a, "--verbose")) g_verbose_logs = true;
+        else if (!strcmp(a, "--mode") && i+1 < argc) {
             const char *m = argv[++i];
             args.mode = !strcmp(m, "base") ? MODE_BASE : !strcmp(m, "mtp") ? MODE_MTP : MODE_PTI;
         }
-        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
+        else {
+            fprintf(stderr, "[warn] unknown arg ignored: %s\n", a);
+            if (i+1 < argc && argv[i+1][0] != '-') ++i;   // skip its value too
+        }
+    }
+    if (kv_q8_votes >= 2) {
+        args.kv_q8 = true;
+        fprintf(stderr, "[note] --cache-type-k/v q8_0 → KV Q8_0 (output may differ between modes)\n");
     }
 
     if (args.model_path[0] == '\0') {

@@ -168,6 +168,7 @@ struct G {
     int32_t n_vocab = 0, n_embd = 0;
     int     mode    = MODE_PTI;
     int     max_new = 1024;
+    int     n_ctx_cfg = 98304;
     int     draft_k = 7, ngram_g = 3, ngram_L = 5;
     float    temperature = 0.0f;
     uint64_t seed        = 42;
@@ -201,24 +202,36 @@ static std::string generate_turn(const std::string &prompt) {
                                 hist.data(), MAX_TOKENS, true, true);
     if (n_hist <= 0) { fprintf(stderr, "[tokenize failed]\n"); return reply; }
 
-    static llama_batch batch = {};
-    static int batch_cap = 0;
-    int need = (n_hist > 200 ? n_hist : 200) + 4;
-    if (need > batch_cap) {
-        if (batch_cap) llama_batch_free(batch);
-        batch = llama_batch_init(need, 0, 2);
-        batch_cap = need;
+    // clamp this turn's budget to the per-stream context
+    int usable  = g.n_ctx_cfg / 2;
+    if (n_hist + MAX_DRAFT + 8 >= usable) {
+        fprintf(stderr, "[error] conversation (%d tok) exceeds usable context (%d = c/2); /clear or raise -c\n",
+                n_hist, usable);
+        return reply;
     }
+    int max_new = g.max_new;
+    if (n_hist + max_new + MAX_DRAFT + 8 > usable)
+        max_new = usable - n_hist - MAX_DRAFT - 8;
 
-    batch_clear(&batch);
-    for (int i = 0; i < n_hist; i++)
-        batch_add(&batch, hist[i], (llama_pos)i, 0, i == n_hist - 1);
+    static llama_batch batch = {};
+    static bool batch_done = false;
+    const int chunk = 1024;
+    if (!batch_done) { batch = llama_batch_init(chunk + 160, 0, 2); batch_done = true; }
+
     double t_pre0 = now_sec();
-    if (llama_decode(g.ctx, batch) != 0) { fprintf(stderr, "[prefill failed]\n"); return reply; }
+    int last_idx = 0;
+    for (int i0 = 0; i0 < n_hist; i0 += chunk) {
+        int nb = n_hist - i0 < chunk ? n_hist - i0 : chunk;
+        batch_clear(&batch);
+        for (int j = 0; j < nb; j++)
+            batch_add(&batch, hist[i0 + j], (llama_pos)(i0 + j), 0, i0 + j == n_hist - 1);
+        if (llama_decode(g.ctx, batch) != 0) { fprintf(stderr, "[prefill failed]\n"); return reply; }
+        last_idx = nb - 1;
+    }
     double t_prefill = now_sec() - t_pre0;
 
     llama_pos   p        = (llama_pos)n_hist;
-    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(g.ctx, batch.n_tokens - 1),
+    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(g.ctx, last_idx),
                                                    g.n_vocab, g.temperature, g.seed, p);
     hist[n_hist++] = tok_last;
     int n_gen = 1, n_steps = 0;
@@ -243,7 +256,7 @@ static std::string generate_turn(const std::string &prompt) {
     llama_token pend_tok[128]; llama_pos pend_pos[128]; int n_pend = 0;
 
     double t0 = now_sec();
-    while (n_gen < g.max_new && !llama_vocab_is_eog(g.vocab, tok_last)) {
+    while (n_gen < max_new && !llama_vocab_is_eog(g.vocab, tok_last)) {
         llama_token draft[MAX_DRAFT];
         int k = 0;
         bool mtp_fired = false;
@@ -261,7 +274,7 @@ static std::string generate_turn(const std::string &prompt) {
         if (k == 0 && mtp_alive) {
             draft[0] = mtp_cand; k = 1; mtp_fired = true;
         }
-        if (k + 1 > g.max_new - n_gen) k = g.max_new - n_gen - 1;
+        if (k + 1 > max_new - n_gen) k = max_new - n_gen - 1;
         if (k < 0) { k = 0; mtp_fired = false; }
 
         if (n_pend + 1 + k > 120) {                       // flush pending
@@ -293,7 +306,7 @@ static std::string generate_turn(const std::string &prompt) {
             if (!llama_vocab_is_eog(g.vocab, a)) print_token(a, &reply);
             hist[n_hist++] = a;
             n_gen++; e++; tok_last = a;
-            if (llama_vocab_is_eog(g.vocab, a) || n_gen >= g.max_new) { stop = true; break; }
+            if (llama_vocab_is_eog(g.vocab, a) || n_gen >= max_new) { stop = true; break; }
             if (i < k && draft[i] != a) break;
         }
         int acc = e - 1;
@@ -378,6 +391,7 @@ int main(int argc, char **argv) {
     g.tmpl    = llama_model_chat_template(g.model, nullptr);
 
     llama_context_params cp = llama_context_default_params();
+    g.n_ctx_cfg = n_ctx;
     cp.n_ctx = (uint32_t)n_ctx; cp.n_batch = 2048; cp.n_seq_max = 2;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;   // f16 KV, non-unified: exact
     g.ctx = llama_init_from_model(g.model, cp);

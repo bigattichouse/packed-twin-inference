@@ -22,7 +22,7 @@ PORT=${2:-8080}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 MODEL="${MODEL:-$DIR/../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf}"
-CTX="${CTX:-16384}"
+CTX="${CTX:-32000}"
 
 exec "$DIR/bin/pti_server" \
   -m "$MODEL" \
@@ -30,4 +30,6 @@ exec "$DIR/bin/pti_server" \
   -c "$CTX" \
   -p "$PORT" \
   --mode "$MODE" \
-  --temp 0.0
+  --temp 0.0 \
+  -n 65000 \
+  --kv-q8 

@@ -49,8 +49,9 @@
 #include <cstring>
 #include <ctime>
 
-#define MAX_TOKENS   8192
+#define MAX_TOKENS   131072
 #define DEFAULT_CTX  2048
+#define PREFILL_CHUNK 1024   // llama_decode caps batches at n_batch; chunk prefill
 #define MAX_DRAFT    31     // batch 32 = 6.93× cost, 12.1 ms/token, chain-exact (M6.0)
 
 static double now_sec() {
@@ -221,6 +222,7 @@ static llama_token mtp_feed(
 
 struct LookupArgs {
     int  max_new      = 120;
+    int  n_ctx        = 16384;  // usable = n_ctx/2 (checkpoint stream)
     int  n_gpu_layers = 99;
     int  draft_k      = 7;   // long drafts: only confident fires happen, and
                              // batch-8 hit-runs amortize best (3.11× for 8 tok)
@@ -249,8 +251,8 @@ static int run_lookup(const LookupArgs *args) {
     int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
     struct llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx      = DEFAULT_CTX * 2;
-    cparams.n_batch    = DEFAULT_CTX;
+    cparams.n_ctx      = (uint32_t)args->n_ctx;
+    cparams.n_batch    = PREFILL_CHUNK;
     cparams.n_seq_max  = 2;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
@@ -266,8 +268,8 @@ static int run_lookup(const LookupArgs *args) {
     if (args->use_mtp && !args->baseline) {
         llama_set_embeddings_pre_norm(ctx, true, false);
         struct llama_context_params mp = llama_context_default_params();
-        mp.n_ctx     = DEFAULT_CTX * 2;
-        mp.n_batch   = DEFAULT_CTX;
+        mp.n_ctx     = (uint32_t)args->n_ctx;
+        mp.n_batch   = PREFILL_CHUNK;
         mp.n_seq_max = 1;
         mp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
         mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -288,17 +290,34 @@ static int run_lookup(const LookupArgs *args) {
             n_hist, args->baseline ? "BASELINE" : "LOOKUP",
             args->sabotage ? "+SABOTAGE" : "", args->draft_k, args->ngram_g, args->ngram_L);
 
-    // ── Prefill seq 0 ────────────────────────────────────────────────────────
-    // capacity: prefill needs n_hist; merged step batches need pending(≤120)+1+MAX_DRAFT
-    int batch_cap = n_hist > 160 ? n_hist : 160;
-    struct llama_batch batch = llama_batch_init(batch_cap + 4, 0, 2);
-    batch_clear(&batch);
-    for (int i = 0; i < n_hist; i++)
-        batch_add(&batch, hist[i], (llama_pos)i, 0, i == n_hist - 1);
-    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "Prefill failed\n"); return 1; }
+    // ── Budget: clamp generation to the per-stream context ──────────────────
+    int usable = args->n_ctx / 2;                 // non-unified: 2 streams
+    if (n_hist + MAX_DRAFT + 8 >= usable) {
+        fprintf(stderr, "Prompt (%d tokens) does not fit usable context (%d = n_ctx/2). Raise -c.\n",
+                n_hist, usable);
+        return 1;
+    }
+    int max_new = args->max_new;
+    if (n_hist + max_new + MAX_DRAFT + 8 > usable) {
+        max_new = usable - n_hist - MAX_DRAFT - 8;
+        fprintf(stderr, "[note] max tokens clamped to %d (usable ctx %d - prompt %d)\n",
+                max_new, usable, n_hist);
+    }
+
+    // ── Prefill seq 0, chunked to n_batch ───────────────────────────────────
+    struct llama_batch batch = llama_batch_init(PREFILL_CHUNK + 160, 0, 2);
+    int last_idx = 0;                              // batch index of final prompt token
+    for (int i0 = 0; i0 < n_hist; i0 += PREFILL_CHUNK) {
+        int nb = n_hist - i0 < PREFILL_CHUNK ? n_hist - i0 : PREFILL_CHUNK;
+        batch_clear(&batch);
+        for (int j = 0; j < nb; j++)
+            batch_add(&batch, hist[i0 + j], (llama_pos)(i0 + j), 0, i0 + j == n_hist - 1);
+        if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "Prefill failed\n"); return 1; }
+        last_idx = nb - 1;
+    }
 
     llama_pos   p        = (llama_pos)n_hist;
-    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, batch.n_tokens - 1),
+    llama_token tok_last = (llama_token)sample_pos(llama_get_logits_ith(ctx, last_idx),
                                                    n_vocab, args->temperature, args->seed, p);
     hist[n_hist++] = tok_last;
 
@@ -310,7 +329,7 @@ static int run_lookup(const LookupArgs *args) {
     int n_steps = 0, n_drafted_steps = 0, n_rebuilds = 0;
     int n_accept_hist[MAX_DRAFT + 2] = {};   // index = accepted drafts in a drafted step
     int n_draft_tok = 0, n_draft_acc = 0;
-    int n_mtp_fire = 0, n_mtp_acc = 0;
+    int n_mtp_fire = 0, n_mtp_acc = 0, n_veto = 0;
 
     // MTP state: candidate predicting the token after tok_last (M7.1)
     struct llama_batch mtp_batch = {};
@@ -319,7 +338,7 @@ static int run_lookup(const LookupArgs *args) {
         mtp_batch = llama_batch_init(MAX_DRAFT + 40, n_embd, 1);
         mtp_batch.token = (llama_token *)malloc((MAX_DRAFT + 40) * sizeof(llama_token));
         // seed: (tok_last @ p, h of prefill's last token) → candidate for p+1
-        int h0 = batch.n_tokens - 1;
+        int h0 = last_idx;
         mtp_cand = mtp_feed(ctx_mtp, ctx, &mtp_batch, &tok_last, &h0, p, 1, n_embd, n_vocab);
     }
 
@@ -327,7 +346,7 @@ static int run_lookup(const LookupArgs *args) {
 
     if (args->baseline) {
         // ── plain greedy loop ────────────────────────────────────────────────
-        while (n_gen < args->max_new && !llama_vocab_is_eog(vocab, tok_last)) {
+        while (n_gen < max_new && !llama_vocab_is_eog(vocab, tok_last)) {
             batch_clear(&batch);
             batch_add(&batch, tok_last, p, 0, true);
             if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "\nDecode failed\n"); break; }
@@ -366,7 +385,7 @@ static int run_lookup(const LookupArgs *args) {
         llama_token pend_tok[128];
         llama_pos   pend_pos[128];
         int n_pend  = 0;
-        while (n_gen < args->max_new && !llama_vocab_is_eog(vocab, tok_last)) {
+        while (n_gen < max_new && !llama_vocab_is_eog(vocab, tok_last)) {
             llama_token draft[MAX_DRAFT];
             int k = (args->no_ngram || n_zero >= 3) ? 0
                   : ngram_draft(hist, n_hist, args->ngram_g, L_dyn, k_cur, draft);
@@ -383,6 +402,7 @@ static int run_lookup(const LookupArgs *args) {
             // previous rung are stronger evidence than one MTP vote.
             if (k > 0 && mtp_alive && k_cur <= args->draft_k && mtp_cand != draft[0]) {
                 k = 0;                                     // veto the fire
+                n_veto++;
             }
 
             // MTP fallback (M7.1): no (surviving) n-gram fire → 1-token
@@ -394,7 +414,7 @@ static int run_lookup(const LookupArgs *args) {
                 mtp_fired = true;
             }
 
-            if (k + 1 > args->max_new - n_gen) k = args->max_new - n_gen - 1;
+            if (k + 1 > max_new - n_gen) k = max_new - n_gen - 1;
             if (k < 0) { k = 0; mtp_fired = false; }
             if (args->sabotage) {
                 for (int i = 0; i < k; i++) draft[i] = (draft[i] + 1) % n_vocab;
@@ -439,7 +459,7 @@ static int run_lookup(const LookupArgs *args) {
                 hist[n_hist++] = a;
                 n_gen++; e++;
                 tok_last = a;
-                if (llama_vocab_is_eog(vocab, a) || n_gen >= args->max_new) { stop = true; break; }
+                if (llama_vocab_is_eog(vocab, a) || n_gen >= max_new) { stop = true; break; }
                 if (i < k && draft[i] != a) break;   // a is the correction; rest invalid
             }
             int acc = e - 1;                          // accepted drafts this step
@@ -517,8 +537,8 @@ static int run_lookup(const LookupArgs *args) {
         fprintf(stderr, "  Draft tokens:       %d proposed, %d accepted (%.0f%%)\n",
                 n_draft_tok, n_draft_acc, n_draft_tok ? 100.0 * n_draft_acc / n_draft_tok : 0.0);
         if (ctx_mtp)
-            fprintf(stderr, "  MTP fires:          %d, accepted %d (%.0f%%)\n",
-                    n_mtp_fire, n_mtp_acc, n_mtp_fire ? 100.0 * n_mtp_acc / n_mtp_fire : 0.0);
+            fprintf(stderr, "  MTP fires:          %d, accepted %d (%.0f%%)   vetoed n-gram fires: %d\n",
+                    n_mtp_fire, n_mtp_acc, n_mtp_fire ? 100.0 * n_mtp_acc / n_mtp_fire : 0.0, n_veto);
         fprintf(stderr, "  Rebuilds (miss):    %d\n", n_rebuilds);
         fprintf(stderr, "  Accept histogram:   ");
         for (int i = 0; i <= MAX_DRAFT; i++)
@@ -545,7 +565,8 @@ static void usage(const char *prog) {
         "Usage: %s [options]\n"
         "  -m <path>    GGUF model path  (required)\n"
         "  -p <text>    Prompt\n"
-        "  -n <int>     Max new tokens   (default: 120)\n"
+        "  -n <int>     Max new tokens   (default: 120; clamped to fit context)\n"
+        "  -c <int>     Context size     (default: 16384; usable = c/2)\n"
         "  -k <int>     Max draft tokens   (default: 7, batch = k+1)\n"
         "  -g <int>     N-gram probe len   (default: 3)\n"
         "  -L <int>     Min suffix match to fire (default: 5)\n"
@@ -568,6 +589,7 @@ int main(int argc, char **argv) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(args.model_path, argv[++i], sizeof(args.model_path)-1);
         else if (!strcmp(argv[i], "-p")   && i+1 < argc) strncpy(args.prompt,     argv[++i], sizeof(args.prompt)-1);
         else if (!strcmp(argv[i], "-n")   && i+1 < argc) args.max_new      = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-c")   && i+1 < argc) args.n_ctx        = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-k")   && i+1 < argc) args.draft_k      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-g")   && i+1 < argc) args.ngram_g      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-L")   && i+1 < argc) args.ngram_L      = atoi(argv[++i]);

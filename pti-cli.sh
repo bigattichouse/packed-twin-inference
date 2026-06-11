@@ -13,11 +13,12 @@
 #   ./pti-cli.sh compare "$(cat demo_edit_prompt.txt)" 300
 
 MODE=${1:-pti}
-PROMPT=${2:-"Write a Python function that parses a CSV file and prints each row."}
-NTOK=${3:-300}
+PROMPT=${2:-"Write a javascript class to manage the world/game state of flappy bird."}
+NTOK=${3:-65000}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 MODEL="${MODEL:-$DIR/../gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf}"
+CTX="${CTX:-16384}"      # usable = CTX/2; raise for long generations
 BIN="$DIR/bin/pti_lookup"
 
 run_one() {
@@ -26,7 +27,7 @@ run_one() {
     echo "════════════════════════════════════════════════════════════"
     echo "  $label"
     echo "════════════════════════════════════════════════════════════"
-    "$BIN" -m "$MODEL" -p "$PROMPT" -n "$NTOK" "$@"
+    "$BIN" -m "$MODEL" -p "$PROMPT" -n "$NTOK" -c "$CTX" "$@"
     echo
 }
 
