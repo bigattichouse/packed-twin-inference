@@ -39,6 +39,8 @@ static double now_sec() {
 
 // quiet llama/ggml logging: only WARN+ passes (--verbose restores)
 static bool g_verbose_logs = false;
+static bool g_no_think     = false;   // --no-think: force a closed empty <think></think> after the
+                                      // generation prompt so boss+workers skip reasoning (faster, esp. the plan)
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
     if (g_verbose_logs) { fputs(text, stderr); return; }
@@ -269,6 +271,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
         lanes[L].live     = !llama_vocab_is_eog(G.vocab, lanes[L].tok_last);
         lane_item[L]      = item;
         total++;
+        fprintf(stderr, "  → item %d → lane %d (%s)\n", item, L, cached ? "cloned+delta" : "full prefill");
         return true;
     };
 
@@ -294,6 +297,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
             lanes[L].pos++; lanes[L].tok_last = nxt; lanes[L].n_gen++; total++;
             if (llama_vocab_is_eog(G.vocab, nxt) || lanes[L].n_gen >= max_new) {
                 out[lane_item[L]] = lanes[L].text;
+                fprintf(stderr, "  ✓ item %d done (%d tok)\n", lane_item[L], lanes[L].n_gen);
                 lanes[L].live = false;
                 finished.push_back(L);
             } else {
@@ -454,6 +458,9 @@ static WorkOrder parse_work_order(const std::string &text) {
                 cur.language = attr_get(at, "lang", default_lang);
                 cur.is_boss  = (tag == "SELF");
                 have_cur = true; sect = INPIECE; buf.clear();
+            } else if (tag == "/PIECE" || tag == "/SELF") {   // explicit piece close (clean delineation)
+                flush_piece();
+                sect = NONE; buf.clear();
             } else if (tag == "END") {
                 if (sect == SHARED) wo.shared = extract_blueprint(buf);
                 flush_piece();
@@ -489,15 +496,19 @@ static const char *SAMPLE_ENVELOPE =
     "<<<PIECE id=w1 exports=gravityStep>>>\n"
     "instruction: implement this function given the public params of the current class, in js\n"
     "<blueprint> gravityStep(bird, dt) -> void { apply gravity then velocity to bird } </blueprint>\n"
+    "<<</PIECE>>>\n"
     "<<<PIECE id=w2 exports=spawnPipe>>>\n"
     "instruction: implement this function given the public params of the current class, in js\n"
     "<blueprint> spawnPipe(world) -> void { append a Pipe with a random gap to world.pipes } </blueprint>\n"
+    "<<</PIECE>>>\n"
     "<<<PIECE id=w3 exports=checkCollision>>>\n"
     "instruction: implement this function given the public params of the current class, in js\n"
     "<blueprint> checkCollision(bird, pipes) -> bool { true if bird hits a pipe or ground } </blueprint>\n"
+    "<<</PIECE>>>\n"
     "<<<SELF id=boss exports=stepWorld, smokeTest>>>\n"
     "instruction: implement this object in js - wire the three functions and a smoke test\n"
     "<blueprint> Integration { stepWorld(world, dt) -> void, smokeTest() -> bool } </blueprint>\n"
+    "<<</SELF>>>\n"
     "<<<END>>>\n";
 
 static void print_work_order(const WorkOrder &wo) {
@@ -558,7 +569,7 @@ static std::string boss_generate(const std::string &prompt, int max_tok) {
     llama_pos pos = n;
     std::string out;
     for (int gen = 0; gen < max_tok && !llama_vocab_is_eog(G.vocab, tok); gen++) {
-        out += tok_str(tok);
+        { std::string piece = tok_str(tok); out += piece; fputs(piece.c_str(), stderr); }   // stream live
         batch_clear(&batch);
         batch_add(&batch, tok, pos, 0, true);
         if (llama_decode(G.ctx, batch) != 0) break;
@@ -571,14 +582,15 @@ static std::string boss_generate(const std::string &prompt, int max_tok) {
 
 static const char *BOSS_PROMPT =
     "You are the COORDINATOR of a packed-agent coding team. Workers run in parallel and in\n"
-    "ISOLATION — a worker sees only the shared interface, its own spec, and its one-line\n"
-    "instruction, never another worker or you.\n\n"
-    "Decompose the user's coding task into AS MANY small, independent, similar-sized work items\n"
-    "as it naturally has — there is no fixed count. Each item is one <<<PIECE>>>. The team pops\n"
-    "items from a shared queue with refill, so MANY SMALL BALANCED items beat a few large ones\n"
-    "(a big item becomes a straggler that stalls the batch). Pick a split strategy: function\n"
-    "(independent functions over one shared interface), file (one module per item), or role\n"
-    "(impl/tests/docs). Prefer function-level.\n\n"
+    "ISOLATION — a worker sees only the shared interface, its own instruction, and its spec,\n"
+    "never another worker or you. Workers are FULL, CAPABLE models: give each a meaty,\n"
+    "clearly-specified chunk and it will handle it.\n\n"
+    "Decompose the user's coding task into a HANDFUL of SUBSTANTIAL, independent, balanced\n"
+    "items — each one a <<<PIECE>>>. Right-size them: NOT trivial one-liners (tiny items waste\n"
+    "time on per-item overhead) and NOT one giant item (it stragglers the batch). Group related\n"
+    "functions into a single item, or give an involved component per item; aim for a few\n"
+    "similar-sized pieces. Pick a split strategy: function (related functions grouped per item\n"
+    "over one shared interface), file (one module per item), or role (impl/tests/docs).\n\n"
     "Output EXACTLY this envelope, one <<<PIECE>>> per work item, nothing after <<<END>>>\n"
     "(UPPERCASE = placeholders):\n\n"
     "<<<PLAN strategy=STRATEGY lang=LANG>>>\n"
@@ -587,16 +599,23 @@ static const char *BOSS_PROMPT =
     "  the frozen interface every item relies on: types and signatures,\n"
     "  and a line  deps: [ allowed libraries, or [] for none ]\n"
     "</blueprint>\n"
-    "<<<PIECE id=w1 exports=SYMBOL>>>\n"
-    "instruction: ONE LINE, e.g. implement this function given the shared interface, in LANG\n"
-    "<blueprint> the spec for this item only </blueprint>\n"
-    "<<<PIECE id=w2 exports=SYMBOL>>>\n"
-    "instruction: ONE LINE\n"
+    "<<<PIECE id=w1 exports=SYM1,SYM2>>>\n"
+    "instruction: what this item must build (a sentence)\n"
+    "<blueprint>\n"
+    "  a COMPLETE spec for this item — as many lines as needed: signatures, behavior,\n"
+    "  edge cases, and tests. Be thorough; the worker sees only this.\n"
+    "</blueprint>\n"
+    "<<</PIECE>>>\n"
+    "<<<PIECE id=w2 exports=SYM>>>\n"
+    "instruction: ...\n"
     "<blueprint> ... </blueprint>\n"
-    "(... one PIECE per item, as many as the task needs ...)\n"
+    "<<</PIECE>>>\n"
+    "(... a few substantial PIECEs, each closed with <<</PIECE>>> so it can dispatch immediately ...)\n"
     "<<<END>>>\n\n"
     "Rules: items must be independent (no shared mutable state mid-flight); exported symbols\n"
-    "must not collide; keep each item SMALL and similar-sized. Emit the envelope only.";
+    "must not collide; keep items SUBSTANTIAL and similar-sized. ORDER THEM LARGEST-FIRST — put\n"
+    "the piece you expect to be the most code (the most involved component) first, so the longest\n"
+    "job starts earliest and the lanes finish together (less idle tail). Emit the envelope only.";
 
 // lean worker preamble — the framework lives in the boss, NOT here (design §3/§5.2)
 static const char *WORKER_PREAMBLE =
@@ -630,7 +649,9 @@ static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
     user += "Your piece";
     if (!p.language.empty()) user += " (" + p.language + ")";
     user += ": " + p.instruction + "\n\nSpec:\n" + p.blueprint;
-    return apply_chat_template({ {"system", build_worker_system(wo)}, {"user", user} }, /*add_ass=*/true);
+    std::string s = apply_chat_template({ {"system", build_worker_system(wo)}, {"user", user} }, /*add_ass=*/true);
+    if (g_no_think) s += "<think>\n\n</think>\n\n";   // skip worker reasoning
+    return s;
 }
 
 int main(int argc, char **argv) {
@@ -656,9 +677,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--plan-only")) plan_only = true;
         else if (!strcmp(argv[i], "--kv-q8"))    kv_q8 = true;
         else if (!strcmp(argv[i], "--kv-f16"))   kv_q8 = false;   // opt into f16: reproducible (byte-identical) runs
+        else if (!strcmp(argv[i], "--no-think")) g_no_think = true;
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test) return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
@@ -702,6 +724,7 @@ int main(int argc, char **argv) {
         G.tmpl = llama_model_chat_template(G.model, nullptr);
         std::vector<Msg> msgs = {{"system", BOSS_PROMPT}, {"user", task}};
         std::string prompt = apply_chat_template(msgs);
+        if (g_no_think) prompt += "<think>\n\n</think>\n\n";   // skip the boss's plan reasoning (kills the plan tax)
         fprintf(stderr, "\n══ PA.1 PLAN — boss decomposing ══\n  task: %s\n\n", task);
         double t0 = now_sec();
         int plan_cap = n_ctx / (n_streams + 1) - 768;  // full seq budget (n_seq_max=n_streams+1 w/ base) — it needs
@@ -711,8 +734,8 @@ int main(int argc, char **argv) {
         std::string plan = raw;                         // drop <think> preamble if present
         size_t th = plan.find("</think>");
         if (th != std::string::npos) plan = plan.substr(th + 8);
-        fprintf(stderr, "── boss work-order (%.1fs, %zu chars) ──\n%s\n\n── parsed ──\n",
-                el, trim(plan).size(), trim(plan).c_str());
+        fprintf(stderr, "\n── boss plan done (%.1fs, %zu chars; streamed above) ──\n── parsed ──\n",
+                el, trim(plan).size());
         WorkOrder wo = parse_work_order(plan);
         print_work_order(wo);
         if (!wo.ok) { llama_free(G.ctx); llama_model_free(G.model); llama_backend_free(); return 2; }
