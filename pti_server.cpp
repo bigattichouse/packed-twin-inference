@@ -25,6 +25,7 @@
 
 #include "../llama.cpp/include/llama.h"
 #include "../llama.cpp/src/llama-ext.h"   // pre-norm hidden access for MTP
+#include "chat.h"                          // llama.cpp common: jinja templates + tool-call parsing (M7.7)
 
 #include <atomic>
 #include <cfloat>
@@ -36,7 +37,7 @@
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+// json alias comes from llama.cpp common (chat.h): nlohmann::ordered_json
 
 // ── compile-time limits ───────────────────────────────────────────────────────
 
@@ -80,6 +81,11 @@ struct PTIGlobal {
     const char        *tmpl    = nullptr;
     ServerArgs         args;
 } G;
+
+// jinja chat templates + tool-call parser (llama.cpp common). Falls back to
+// the builtin llama_chat_apply_template path when init/apply fails.
+static common_chat_templates_ptr G_chat_tmpls;
+static bool G_common_chat_ok = false;
 
 static std::atomic<bool> G_busy{false};
 
@@ -175,7 +181,7 @@ static std::string token_to_str(llama_token tok) {
 // ── n-gram lookup draft (same as pti_lookup.cpp) ─────────────────────────────
 
 static int ngram_draft(const llama_token *hist, int n_hist,
-                       int g, int L_min, int k, llama_token *out) {
+                       int g, int L_min, int k, llama_token *out, int *L_out = nullptr) {
     if (n_hist < g + 1) return 0;
     const llama_token *tail = hist + n_hist - g;
     for (int m = n_hist - 2; m >= g - 1; m--) {
@@ -191,6 +197,7 @@ static int ngram_draft(const llama_token *hist, int n_hist,
         int n_draft = avail < k ? avail : k;
         if (n_draft < 1) continue;
         for (int t = 0; t < n_draft; t++) out[t] = hist[m + 1 + t];
+        if (L_out) *L_out = L;
         return n_draft;
     }
     return 0;
@@ -226,6 +233,7 @@ static llama_token mtp_feed1(
 
 struct GenStats {
     int    n_gen      = 0;
+    int    n_prompt   = 0;
     int    n_steps    = 0;
     int    ng_fire    = 0, ng_acc  = 0;   // lookup drafts proposed/accepted
     int    mtp_fire   = 0, mtp_acc = 0;   // MTP drafts fired/accepted
@@ -316,6 +324,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         max_new = clamped;
     }
     hist.resize((size_t)n_hist + max_new + 8);
+    stats.n_prompt = n_hist;
     fprintf(stderr, "  prompt: %d tokens  mode: %s\n", n_hist, stats.mode);
 
     // ── prefill, chunked to n_batch (llama_decode asserts on larger) ─────────
@@ -370,19 +379,22 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         while (stats.n_gen < max_new && !llama_vocab_is_eog(G.vocab, tok_last)) {
             llama_token draft[MAX_DRAFT];
             int k = 0;
+            int fire_L = 0;
             bool mtp_fired = false;
 
             if (mode == MODE_PTI && n_zero < 3)
-                k = ngram_draft(hist.data(), n_hist, G.args.ngram_g, L_dyn, k_cur, draft);
+                k = ngram_draft(hist.data(), n_hist, G.args.ngram_g, L_dyn, k_cur, draft, &fire_L);
 
             bool mtp_alive = ctx_mtp && mtp_cand != -1 && mode >= MODE_MTP
                           && !(stats.mtp_fire >= 10 && stats.mtp_acc * 10 < stats.mtp_fire * 3);
 
-            // MTP arbitration (M7.3): at the probe rung, an MTP disagreement
-            // with draft[0] marks the n-gram fire as coincidental — veto it.
-            // Makes mtp mode the floor of pti mode (measured: best-or-tied
-            // on every text class). Escalated rungs skip the veto.
-            if (k > 0 && mtp_alive && k_cur <= G.args.draft_k && mtp_cand != draft[0]) {
+            // MTP arbitration (M7.3, L-aware M7.6): MTP is ~89% right, so an
+            // unconditional veto discards ~11% of GOOD fires — costly when
+            // fires are rare and land 7-31 tokens. Veto only MARGINAL fires
+            // (suffix match < L_TRUST); long matches override the MTP vote.
+            constexpr int L_TRUST = 10;
+            if (k > 0 && mtp_alive && k_cur <= G.args.draft_k
+                && fire_L < L_TRUST && mtp_cand != draft[0]) {
                 k = 0;
                 stats.n_veto++;
             }
@@ -538,8 +550,9 @@ static std::string sse_chunk(const std::string &text, const std::string &id) {
     return "data: " + chunk.dump() + "\n\n";
 }
 
-static std::string sse_done(const GenStats &s, const std::string &id) {
-    json choice = {{"delta", json::object()}, {"index", 0}, {"finish_reason", "stop"}};
+static std::string sse_done(const GenStats &s, const std::string &id,
+                            const std::string &finish = "stop") {
+    json choice = {{"delta", json::object()}, {"index", 0}, {"finish_reason", finish}};
     json chunk  = {{"id", id}, {"object", "chat.completion.chunk"},
                    {"model", "pti-server"},
                    {"choices", json::array({choice})},
@@ -577,9 +590,10 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
         return;
     }
 
-    std::string prompt      = messages_to_prompt(j["messages"]);
     float       temperature = j.value("temperature", G.args.temperature);
     int         max_tokens  = j.value("max_tokens",  G.args.max_tokens);
+    bool        stream      = j.value("stream", false);     // OpenAI default: NOT streamed
+    bool        has_tools   = j.contains("tools") && j["tools"].is_array() && !j["tools"].empty();
     // seed: honor the OpenAI-style request field; absent → time-derived
     uint64_t    seed        = j.contains("seed") ? (uint64_t)j["seed"].get<int64_t>()
                                                  : (uint64_t)now_sec() * 1000003ull;
@@ -594,19 +608,113 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
         else if (m == "pti")  mode = MODE_PTI;
     }
 
-    fprintf(stderr, "[%s] mode=%s temp=%.2f seed=%llu max_tokens=%d\n",
-            id.c_str(), mode_name(mode), temperature,
-            (unsigned long long)seed, max_tokens);
+    // ── templating (M7.7): jinja with tools when available ──────────────────
+    std::string prompt;
+    common_chat_params chat_params;
+    bool use_common = false;
+    if (G_common_chat_ok) {
+        try {
+            common_chat_templates_inputs in;
+            auto omsgs  = nlohmann::ordered_json::parse(j.at("messages").dump());
+            in.messages = common_chat_msgs_parse_oaicompat(omsgs);
+            if (has_tools) {
+                auto otools = nlohmann::ordered_json::parse(j["tools"].dump());
+                in.tools    = common_chat_tools_parse_oaicompat(otools);
+            }
+            in.add_generation_prompt = true;
+            in.use_jinja             = true;
+            in.parallel_tool_calls   = j.value("parallel_tool_calls", false);
+            chat_params = common_chat_templates_apply(G_chat_tmpls.get(), in);
+            prompt      = chat_params.prompt;
+            use_common  = true;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "  [warn] jinja apply failed (%s) — builtin template, tools unparsed\n", e.what());
+        }
+    }
+    if (!use_common) prompt = messages_to_prompt(j["messages"]);
 
+    fprintf(stderr, "[%s] mode=%s temp=%.2f seed=%llu max_tokens=%d stream=%d tools=%d\n",
+            id.c_str(), mode_name(mode), temperature,
+            (unsigned long long)seed, max_tokens, (int)stream, (int)has_tools);
+
+    // parse the finished text into content + tool_calls (jinja path only)
+    auto parse_final = [chat_params, use_common](const std::string &full,
+                                                 json &message, std::string &finish) {
+        message = json{{"role", "assistant"}, {"content", full}};
+        finish  = "stop";
+        if (!use_common) return;
+        try {
+            common_chat_parser_params pp(chat_params);
+            try { pp.parser.load(chat_params.parser); } catch (...) {}
+            common_chat_msg msg = common_chat_parse(full, /*is_partial=*/false, pp);
+            std::vector<std::string> ids;
+            int ctr = 0;
+            msg.set_tool_call_ids(ids, [&]() { return "call_" + std::to_string(++ctr) + "_" + std::to_string((uint32_t)time(nullptr)); });
+            message = json::parse(msg.to_json_oaicompat().dump());
+            if (!msg.tool_calls.empty()) finish = "tool_calls";
+        } catch (const std::exception &e) {
+            fprintf(stderr, "  [warn] output parse failed (%s) — returning raw content\n", e.what());
+        }
+    };
+
+    if (!stream) {
+        // ── non-streamed completion (LangChain/agent clients) ───────────────
+        std::string full;
+        GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
+            [&full](const std::string &text) -> bool { full += text; return true; });
+
+        json message; std::string finish;
+        parse_final(full, message, finish);
+
+        json resp = {
+            {"id", id}, {"object", "chat.completion"}, {"created", (int64_t)time(nullptr)},
+            {"model", "pti-server"},
+            {"choices", json::array({ json{{"index", 0}, {"message", message}, {"finish_reason", finish}} })},
+            {"usage", {{"prompt_tokens", stats.n_prompt}, {"completion_tokens", stats.n_gen},
+                       {"total_tokens", stats.n_prompt + stats.n_gen}}},
+            {"pti", {{"mode", stats.mode}, {"tok_s", stats.tok_s}, {"steps", stats.n_steps}}}
+        };
+        res.set_content(resp.dump(), "application/json");
+        G_busy.store(false);
+        return;
+    }
+
+    // ── streamed (SSE). With tools we buffer and emit parsed deltas at the
+    // end (tool-call markup must not leak as raw text); without tools we
+    // stream live as before.
+    bool buffered = use_common && has_tools;
     res.set_chunked_content_provider("text/event-stream",
-        [prompt, temperature, seed, max_tokens, mode, id](size_t /*offset*/,
-                                                           httplib::DataSink &sink) -> bool {
+        [prompt, temperature, seed, max_tokens, mode, id, buffered, parse_final](
+                size_t /*offset*/, httplib::DataSink &sink) -> bool {
+            std::string full;
             GenStats stats = run_generate(prompt, max_tokens, temperature, seed, mode,
-                [&sink, &id](const std::string &text) -> bool {
+                [&sink, &id, &full, buffered](const std::string &text) -> bool {
+                    full += text;
+                    if (buffered) return true;
                     auto chunk = sse_chunk(text, id);
                     return sink.write(chunk.c_str(), chunk.size());
                 });
-            auto done = sse_done(stats, id);
+
+            std::string finish = "stop";
+            if (buffered) {
+                json message;
+                parse_final(full, message, finish);
+                json delta = json::object();
+                if (message.contains("content") && !message["content"].is_null()
+                    && !message["content"].get<std::string>().empty())
+                    delta["content"] = message["content"];
+                if (message.contains("tool_calls")) {
+                    delta["tool_calls"] = message["tool_calls"];
+                    int idx = 0;
+                    for (auto &tc : delta["tool_calls"]) tc["index"] = idx++;
+                }
+                json choice = {{"delta", delta}, {"index", 0}, {"finish_reason", nullptr}};
+                json chunk  = {{"id", id}, {"object", "chat.completion.chunk"},
+                               {"model", "pti-server"}, {"choices", json::array({choice})}};
+                std::string out = "data: " + chunk.dump() + "\n\n";
+                sink.write(out.c_str(), out.size());
+            }
+            auto done = sse_done(stats, id, finish);
             sink.write(done.c_str(), done.size());
             sink.done();
             G_busy.store(false);
@@ -707,6 +815,13 @@ int main(int argc, char **argv) {
     G.n_vocab = llama_vocab_n_tokens(G.vocab);
     G.n_embd  = llama_model_n_embd(G.model);
     G.tmpl    = llama_model_chat_template(G.model, /*name=*/nullptr);
+    try {
+        G_chat_tmpls = common_chat_templates_init(G.model, "");
+        G_common_chat_ok = true;
+        fprintf(stderr, "Chat templates: jinja (tools supported)\n");
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[warn] jinja templates unavailable (%s) — builtin engine, no tools\n", e.what());
+    }
 
     fprintf(stderr, "Model ready. vocab=%d n_embd=%d template=%s\n",
             G.n_vocab, G.n_embd, G.tmpl ? "(from model)" : "(none — raw prompt)");

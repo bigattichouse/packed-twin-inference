@@ -161,7 +161,7 @@ static void batch_clear(struct llama_batch *b) { b->n_tokens = 0; }
 // Short matches (L≈g) are coincidence: measured 33% token-accept on code
 // text, and partial accepts cost more than they save (rebuild penalty).
 static int ngram_draft(const llama_token *hist, int n_hist,
-                       int g, int L_min, int k, llama_token *out) {
+                       int g, int L_min, int k, llama_token *out, int *L_out) {
     if (n_hist < g + 1) return 0;
     const llama_token *tail = hist + n_hist - g;
     for (int m = n_hist - 2; m >= g - 1; m--) {         // m = end index of candidate match
@@ -180,6 +180,7 @@ static int ngram_draft(const llama_token *hist, int n_hist,
         int n_draft = avail < k ? avail : k;
         if (n_draft < 1) continue;
         for (int t = 0; t < n_draft; t++) out[t] = hist[m + 1 + t];
+        if (L_out) *L_out = L;
         return n_draft;
     }
     return 0;
@@ -387,21 +388,25 @@ static int run_lookup(const LookupArgs *args) {
         int n_pend  = 0;
         while (n_gen < max_new && !llama_vocab_is_eog(vocab, tok_last)) {
             llama_token draft[MAX_DRAFT];
+            int fire_L = 0;
             int k = (args->no_ngram || n_zero >= 3) ? 0
-                  : ngram_draft(hist, n_hist, args->ngram_g, L_dyn, k_cur, draft);
+                  : ngram_draft(hist, n_hist, args->ngram_g, L_dyn, k_cur, draft, &fire_L);
 
             bool mtp_alive = ctx_mtp && mtp_cand != -1
                           && !(n_mtp_fire >= 10 && n_mtp_acc * 10 < n_mtp_fire * 3);
 
-            // MTP arbitration (M7.3): the MTP candidate predicts the SAME
-            // position as draft[0]. At the probe rung (k_cur == draft_k —
-            // the ladder hasn't earned trust yet), a disagreement marks the
-            // n-gram fire as coincidental: veto it and fire the MTP draft
-            // instead (85-90% right). Makes mtp-only the floor of pti mode.
-            // Escalated rungs (15/31) skip the veto — full accepts at the
-            // previous rung are stronger evidence than one MTP vote.
-            if (k > 0 && mtp_alive && k_cur <= args->draft_k && mtp_cand != draft[0]) {
-                k = 0;                                     // veto the fire
+            // MTP arbitration (M7.3, refined M7.6): the MTP candidate predicts
+            // the SAME position as draft[0]; a disagreement marks a fire as
+            // suspect. But MTP is only ~89% right, so an unconditional veto
+            // discards ~11% of GOOD fires — expensive when fires are rare and
+            // land 7-31 tokens (php run: 6 fires ≈ +3 tok/s). L-aware rule:
+            // veto only MARGINAL fires (suffix match below L_TRUST); long
+            // matches are near-certain copy-runs and override the MTP vote.
+            // Escalated rungs (15/31) skip the veto as before (earned trust).
+            constexpr int L_TRUST = 10;
+            if (k > 0 && mtp_alive && k_cur <= args->draft_k
+                && fire_L < L_TRUST && mtp_cand != draft[0]) {
+                k = 0;                                     // veto the marginal fire
                 n_veto++;
             }
 

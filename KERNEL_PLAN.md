@@ -473,3 +473,35 @@ is a force multiplier, not a prerequisite.
 | n-gram hit rate poor on real model outputs | M6.4 measures 3 text classes; adaptive k bounds downside to ~1.0× |
 | ggml upstream drift (we patch shared mmvq.cuh) | Guard with `__gfx906__` + ncols_dst branch; document diff in repo |
 | LDS tiling for K=17408 adds sync overhead | Tile-size sweep in M6.2; gate decides |
+
+### M7.6 — L-aware MTP arbitration — **DONE (2026-06-10)**
+
+User field report (php generation): pti beat mtp-only by ~3 tok/s with only 6 lookup fires
+in 1100 tokens — rare fires land big. MTP is ~89% right, so the unconditional probe-rung
+veto discards ~11% of GOOD fires. Refinement: veto only marginal fires (suffix match
+L < L_TRUST=10); long matches override the MTP vote. Veto counter added to stats
+("vetoed N") for field tuning. All three binaries.
+
+### M7.7 — Tool calls + non-streamed completions (nanocoder works) — **DONE (2026-06-10)**
+
+Field failure: coder app's tool calls arrived as malformed plain text. Two root causes:
+(1) tools schemas were never templated into the prompt (builtin llama_chat_apply_template
+has no tools support) so the model emitted degraded markup; (2) the server ALWAYS streamed
+SSE, but LangChain .invoke() sends stream:false and expects one JSON body with native
+message.tool_calls.
+
+Fix: linked llama.cpp common (libllama-common) — common_chat_templates_init/apply renders
+jinja WITH tools; common_chat_parse turns output into content + tool_calls;
+"stream" honored (OpenAI default false → single chat.completion JSON; streamed requests
+with tools buffer output and emit a parsed tool_calls delta). Falls back to the builtin
+engine if jinja init/apply throws.
+
+Validated live (nanocoder-shaped request): finish_reason="tool_calls",
+function={name:"list_directory", arguments:'{"path":"..."}'}, speculation active during
+the tool turn (23.5 tok/s, 1.91 tok/step, mtp 84%, vetoed 1).
+
+Also this session: prefill chunked to n_batch in all three binaries (fixes
+GGML_ASSERT(n_tokens_all <= n_batch) on >1024-token prompts), max_tokens clamped to
+usable ctx everywhere, pti_lookup gained -c (the ~1100-token death was its hardcoded
+4096 ctx), llama-server flag compatibility (--jinja/--ctx-size/--cache-type-k/v/etc.,
+unknown flags warn instead of die).

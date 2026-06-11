@@ -238,8 +238,10 @@ $(PTI_SERVER): pti_server.cpp | $(BINDIR)
 	g++ $(LLAMA_CXXFLAGS) \
 	    -I$(LLAMA_DIR)/vendor \
 	    -I$(LLAMA_DIR)/vendor/cpp-httplib \
+	    -I$(LLAMA_DIR)/common \
 	    -o $@ $< \
 	    $(LLAMA_DIR)/build/vendor/cpp-httplib/libcpp-httplib.a \
+	    -lllama-common \
 	    $(LLAMA_LDFLAGS) -lpthread -lssl -lcrypto
 	@echo "Built $@"
 

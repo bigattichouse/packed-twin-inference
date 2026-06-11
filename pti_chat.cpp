@@ -117,7 +117,7 @@ static void batch_clear(struct llama_batch *b) { b->n_tokens = 0; }
 
 // ── n-gram lookup draft (as pti_lookup.cpp) ──────────────────────────────────
 static int ngram_draft(const llama_token *hist, int n_hist,
-                       int g, int L_min, int k, llama_token *out) {
+                       int g, int L_min, int k, llama_token *out, int *L_out = nullptr) {
     if (n_hist < g + 1) return 0;
     const llama_token *tail = hist + n_hist - g;
     for (int m = n_hist - 2; m >= g - 1; m--) {
@@ -132,6 +132,7 @@ static int ngram_draft(const llama_token *hist, int n_hist,
         int n_draft = avail < k ? avail : k;
         if (n_draft < 1) continue;
         for (int t = 0; t < n_draft; t++) out[t] = hist[m + 1 + t];
+        if (L_out) *L_out = L;
         return n_draft;
     }
     return 0;
@@ -259,16 +260,19 @@ static std::string generate_turn(const std::string &prompt) {
     while (n_gen < max_new && !llama_vocab_is_eog(g.vocab, tok_last)) {
         llama_token draft[MAX_DRAFT];
         int k = 0;
+        int fire_L = 0;
         bool mtp_fired = false;
         if (mode == MODE_PTI && n_zero < 3)
-            k = ngram_draft(hist.data(), n_hist, g.ngram_g, L_dyn, k_cur, draft);
+            k = ngram_draft(hist.data(), n_hist, g.ngram_g, L_dyn, k_cur, draft, &fire_L);
 
         bool mtp_alive = g.ctx_mtp && mode >= MODE_MTP && mtp_cand != -1
                       && !(mtp_fire >= 10 && mtp_acc * 10 < mtp_fire * 3);
 
-        // MTP arbitration (M7.3): veto probe-rung n-gram fires that the MTP
-        // candidate disagrees with — mtp mode becomes the floor of pti mode.
-        if (k > 0 && mtp_alive && k_cur <= g.draft_k && mtp_cand != draft[0])
+        // MTP arbitration (M7.3, L-aware M7.6): veto only marginal fires
+        // (suffix match < L_TRUST); long matches override the MTP vote.
+        constexpr int L_TRUST = 10;
+        if (k > 0 && mtp_alive && k_cur <= g.draft_k
+            && fire_L < L_TRUST && mtp_cand != draft[0])
             k = 0;
 
         if (k == 0 && mtp_alive) {
