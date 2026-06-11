@@ -27,6 +27,7 @@
 #include "../llama.cpp/src/llama-ext.h"   // pre-norm hidden access for MTP
 #include "chat.h"                          // llama.cpp common: jinja templates + tool-call parsing (M7.7)
 
+#include <algorithm>
 #include <atomic>
 #include <cfloat>
 #include <cmath>
@@ -319,11 +320,62 @@ struct GenStats {
     int    ng_fire    = 0, ng_acc  = 0;   // lookup drafts proposed/accepted
     int    mtp_fire   = 0, mtp_acc = 0;   // MTP drafts fired/accepted
     int    n_veto     = 0;                // n-gram fires vetoed by MTP disagreement
+    double prefill_s  = 0.0;
     double tok_s      = 0.0;
     const char *mode  = "base";
 };
 
 using TokenSink = std::function<bool(const std::string &)>;
+
+// ── persistent generation contexts + prompt cache (M7.5) ────────────────────
+// Contexts are created once and reused; seq 0 holds the previous request's
+// state so conversation EXTENSIONS prefill only the delta. Hybrid-SSM cannot
+// rewind, so any divergence from the cached stream = full re-prefill.
+struct GenCache {
+    llama_context *ctx     = nullptr;
+    llama_context *ctx_mtp = nullptr;
+    llama_memory_t mem     = nullptr;
+    std::vector<llama_token> toks;   // prompt+emitted stream of the last request
+    int  clean_c = 0;                // seq0 state is clean through position clean_c;
+                                     // toks[clean_c..) are correct but unconsumed
+    bool valid   = false;
+} GC;
+
+static bool ensure_gen_ctx() {
+    if (GC.ctx) return true;
+
+    // IDENTICAL config for ALL modes (n_seq_max, pre-norm): different cache
+    // layouts shift flash-attention numerics enough to flip near-tie tokens.
+    // kv_unified MUST stay false and KV defaults to f16 — both measured to
+    // break cross-mode byte-identity otherwise (see KERNEL_PLAN M7.2).
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx        = (uint32_t)G.args.n_ctx;
+    cparams.n_batch      = (uint32_t)G.args.n_batch;
+    cparams.n_ubatch     = (uint32_t)G.args.n_ubatch;
+    cparams.n_seq_max    = 2;                            // working + checkpoint
+    cparams.kv_unified   = false;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    if (G.args.kv_q8) {
+        cparams.type_k = GGML_TYPE_Q8_0;
+        cparams.type_v = GGML_TYPE_Q8_0;
+    }
+
+    GC.ctx = llama_init_from_model(G.model, cparams);
+    if (!GC.ctx) { fprintf(stderr, "Failed to create context\n"); return false; }
+    GC.mem = llama_get_memory(GC.ctx);
+    llama_set_embeddings_pre_norm(GC.ctx, true, false);
+
+    llama_context_params mp = llama_context_default_params();
+    mp.n_ctx     = (uint32_t)G.args.n_ctx;
+    mp.n_batch   = (uint32_t)G.args.n_batch;
+    mp.n_seq_max = 1;
+    mp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    GC.ctx_mtp = llama_init_from_model(G.model, mp);
+    if (!GC.ctx_mtp)
+        fprintf(stderr, "  [note] MTP context unavailable (no nextn head?) — lookup only\n");
+    return true;
+}
 
 static GenStats run_generate(const std::string &prompt, int max_new,
                              float temperature, uint64_t seed, int mode,
@@ -331,53 +383,10 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     GenStats stats;
     stats.mode = mode_name(mode);
 
-    // ── main context ─────────────────────────────────────────────────────────
-    // IDENTICAL config for ALL modes (n_seq_max, pre-norm): different cache
-    // layouts shift flash-attention numerics enough to flip near-tie tokens,
-    // which would break the byte-identical-across-modes guarantee. The only
-    // variable between modes is the drafting.
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx        = (uint32_t)G.args.n_ctx;
-    cparams.n_batch      = (uint32_t)G.args.n_batch;
-    cparams.n_ubatch     = (uint32_t)G.args.n_ubatch;
-    cparams.n_seq_max    = 2;                            // working + checkpoint
-    cparams.kv_unified   = false;                        // MUST stay false: unified KV
-                                                         // shifts FA numerics with batch
-                                                         // size → near-tie tokens flip
-                                                         // between modes (measured). The
-                                                         // proven-exact config matches
-                                                         // pti_lookup: non-unified + f16.
-                                                         // Cost: n_ctx splits across the
-                                                         // 2 streams (usable = n_ctx/2).
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    // KV defaults to f16: Q8_0 KV + flash attention makes attention numerics
-    // BATCH-SIZE-DEPENDENT (a 1-token and a 2-token decode of the same
-    // position can argmax differently), which breaks byte-identity between
-    // modes. f16 KV is chain-exact at every batch size (M6.0). --kv-q8 opts
-    // into more context at the cost of that guarantee.
-    if (G.args.kv_q8) {
-        cparams.type_k = GGML_TYPE_Q8_0;
-        cparams.type_v = GGML_TYPE_Q8_0;
-    }
-
-    llama_context *ctx = llama_init_from_model(G.model, cparams);
-    if (!ctx) { fprintf(stderr, "Failed to create context\n"); return stats; }
-    llama_memory_t mem = llama_get_memory(ctx);
-    llama_set_embeddings_pre_norm(ctx, true, false);
-
-    // ── MTP context (mtp/pti modes) ──────────────────────────────────────────
-    llama_context *ctx_mtp = nullptr;
-    if (mode >= MODE_MTP) {
-        llama_context_params mp = llama_context_default_params();
-        mp.n_ctx     = (uint32_t)G.args.n_ctx;
-        mp.n_batch   = (uint32_t)G.args.n_batch;
-        mp.n_seq_max = 1;
-        mp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
-        mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        ctx_mtp = llama_init_from_model(G.model, mp);
-        if (!ctx_mtp)
-            fprintf(stderr, "  [note] MTP context unavailable (no nextn head?) — lookup only\n");
-    }
+    if (!ensure_gen_ctx()) return stats;
+    llama_context *ctx     = GC.ctx;
+    llama_memory_t mem     = GC.mem;
+    llama_context *ctx_mtp = (mode >= MODE_MTP) ? GC.ctx_mtp : nullptr;
 
     // ── tokenize + prefill ───────────────────────────────────────────────────
     std::vector<llama_token> hist(MAX_PROMPT_TOKENS);
@@ -385,8 +394,6 @@ static GenStats run_generate(const std::string &prompt, int max_new,
                                 hist.data(), MAX_PROMPT_TOKENS, true, true);
     if (n_hist <= 0) {
         fprintf(stderr, "Tokenize failed\n");
-        if (ctx_mtp) llama_free(ctx_mtp);
-        llama_free(ctx);
         return stats;
     }
     // ── budget: clamp generation to the per-stream context ───────────────────
@@ -394,8 +401,6 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     if (n_hist + MAX_DRAFT + 8 >= usable) {
         fprintf(stderr, "  [error] prompt (%d tok) exceeds usable context (%d = n_ctx/2)\n",
                 n_hist, usable);
-        if (ctx_mtp) llama_free(ctx_mtp);
-        llama_free(ctx);
         return stats;
     }
     if (n_hist + max_new + MAX_DRAFT + 8 > usable) {
@@ -408,12 +413,36 @@ static GenStats run_generate(const std::string &prompt, int max_new,
     stats.n_prompt = n_hist;
     fprintf(stderr, "  prompt: %d tokens  mode: %s\n", n_hist, stats.mode);
 
+    // ── prompt cache: extension → delta prefill; divergence → full ──────────
+    int start = 0;
+    bool extend = GC.valid
+        && n_hist >= (int)GC.toks.size()
+        && GC.clean_c < (int)GC.toks.size()
+        && std::equal(GC.toks.begin(), GC.toks.end(), hist.begin());
+    if (extend) {
+        start = GC.clean_c;
+        fprintf(stderr, "  [cache] hit: reused %d, prefilling %d\n", start, n_hist - start);
+    } else {
+        llama_memory_seq_rm(mem, 0, 0, -1);
+        llama_memory_seq_rm(mem, 1, 0, -1);
+        if (GC.ctx_mtp) llama_memory_seq_rm(llama_get_memory(GC.ctx_mtp), 0, 0, -1);
+        if (GC.valid) {
+            size_t lim = std::min((size_t)n_hist, GC.toks.size());
+            size_t common = 0;
+            while (common < lim && GC.toks[common] == hist[common]) common++;
+            fprintf(stderr, "  [cache] miss: full prefill %d (prefix match %zu of prev %zu)\n",
+                    n_hist, common, GC.toks.size());
+        }
+    }
+    GC.valid = false;   // invalidated until a successful finalize below
+
     // ── prefill, chunked to n_batch (llama_decode asserts on larger) ─────────
     int chunk = G.args.n_batch;
     llama_batch batch = llama_batch_init(chunk + 160, 0, 2);
     int last_idx = 0;
     bool prefill_ok = true;
-    for (int i0 = 0; i0 < n_hist && prefill_ok; i0 += chunk) {
+    double t_pf0 = now_sec();
+    for (int i0 = start; i0 < n_hist && prefill_ok; i0 += chunk) {
         int nb = n_hist - i0 < chunk ? n_hist - i0 : chunk;
         batch_clear(&batch);
         for (int j = 0; j < nb; j++)
@@ -421,11 +450,10 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         if (llama_decode(ctx, batch) != 0) prefill_ok = false;
         last_idx = nb - 1;
     }
+    stats.prefill_s = now_sec() - t_pf0;
     if (!prefill_ok) {
         fprintf(stderr, "Prefill failed\n");
         llama_batch_free(batch);
-        if (ctx_mtp) llama_free(ctx_mtp);
-        llama_free(ctx);
         return stats;
     }
 
@@ -454,6 +482,8 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         llama_token pend_tok[128];
         llama_pos   pend_pos[128];
         int n_pend = 0;
+        llama_pos ckpt_p = -1;       // position of the last checkpoint refresh
+        bool stop_dirty = false;     // stopped mid-batch with wrong tail consumed
 
         double t0 = now_sec();
 
@@ -501,6 +531,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
             if (k > 0 && n_pend == 0 && mode != MODE_BASE) {
                 llama_memory_seq_rm(mem, 1, 0, -1);
                 llama_memory_seq_cp(mem, 0, 1, 0, -1);     // checkpoint S(p)
+                ckpt_p = p;
             }
 
             batch_clear(&batch);
@@ -551,7 +582,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
                                      base + e - 1, p + e, G.n_embd, G.n_vocab);
             }
 
-            if (stop) { p += e; break; }
+            if (stop) { stop_dirty = (k > 0 && e < k + 1); p += e; break; }
 
             if (e == k + 1 || k == 0) {
                 n_pend = 0;
@@ -570,6 +601,30 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         double elapsed = now_sec() - t0;
         stats.tok_s = elapsed > 0 ? stats.n_gen / elapsed : 0;
 
+        // ── prompt-cache finalize (M7.5): publish a known-clean state ───────
+        // clean path: seq0 = S(p), everything in hist consumed except the
+        // final emitted token. pending/dirty paths: state == / restored-to
+        // the checkpoint; hist[ckpt_p..) are correct-but-unconsumed.
+        {
+            int clean_c = -1;
+            if (stop_dirty) {
+                if (ckpt_p >= 0) {
+                    llama_memory_seq_rm(mem, 0, 0, -1);
+                    llama_memory_seq_cp(mem, 1, 0, 0, -1);
+                    clean_c = (int)ckpt_p;
+                }
+            } else if (n_pend > 0) {
+                clean_c = (int)ckpt_p;
+            } else {
+                clean_c = (int)p;
+            }
+            if (clean_c >= 0 && clean_c < n_hist) {
+                GC.toks.assign(hist.begin(), hist.begin() + n_hist);
+                GC.clean_c = clean_c;
+                GC.valid   = true;
+            }
+        }
+
         if (ctx_mtp) {
             free(mtp_batch.token);
             mtp_batch.token = nullptr;
@@ -577,9 +632,10 @@ static GenStats run_generate(const std::string &prompt, int max_new,
         }
     }
 
-    fprintf(stderr, "  → [%s] %d tok in %d steps (%.2f tok/step)  %.1f tok/s",
+    fprintf(stderr, "  → [%s] %d tok in %d steps (%.2f tok/step)  %.1f tok/s  (prefill %.1fs)",
             stats.mode, stats.n_gen, stats.n_steps,
-            stats.n_steps ? (double)stats.n_gen / stats.n_steps : 0.0, stats.tok_s);
+            stats.n_steps ? (double)stats.n_gen / stats.n_steps : 0.0, stats.tok_s,
+            stats.prefill_s);
     if (stats.ng_fire)  fprintf(stderr, "  lookup %d/%d", stats.ng_acc, stats.ng_fire);
     if (stats.mtp_fire) fprintf(stderr, "  mtp %d/%d (%.0f%%)",
                                 stats.mtp_acc, stats.mtp_fire,
@@ -589,8 +645,7 @@ static GenStats run_generate(const std::string &prompt, int max_new,
 
 done_early:
     llama_batch_free(batch);
-    if (ctx_mtp) llama_free(ctx_mtp);
-    llama_free(ctx);
+    (void)ctx; (void)ctx_mtp;        // persistent (GC) — not freed per request
     return stats;
 }
 
@@ -770,6 +825,14 @@ static void handle_chat_completions(const httplib::Request &req, httplib::Respon
             std::string reasoning;
             std::string stripped = strip_think(full, reasoning);
             message["content"] = stripped;
+            if (!reasoning.empty()) message["reasoning_content"] = reasoning;
+        }
+        // template parser does not always extract <think> (e.g. empty blocks):
+        // enforce the strip on whatever content we are about to return
+        if (G.args.strip_reasoning && message.contains("content") && message["content"].is_string()
+            && message["content"].get<std::string>().find("<think>") != std::string::npos) {
+            std::string reasoning;
+            message["content"] = strip_think(message["content"].get<std::string>(), reasoning);
             if (!reasoning.empty()) message["reasoning_content"] = reasoning;
         }
     };

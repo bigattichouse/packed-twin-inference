@@ -1,0 +1,107 @@
+# Packed Agents — spec (draft)
+
+**One model, one GPU, four cooperating agent streams in a single batched decode.**
+Coordinator + 3 workers progress simultaneously; a 4-stream step costs **1.86×** one
+stream (measured, M5.1) — so four agents run at **2.15× aggregate efficiency**, and
+splittable tasks finish in roughly the time of their longest piece instead of the sum.
+
+## Why this is feasible today (measured foundations)
+
+| fact | source |
+|---|---|
+| 4 sequences decode in ONE `llama_decode` at 1.86× cost | pti_4seq / M5.1, measured |
+| Each seq has independent KV + SSM state | pti_4seq machinery, proven |
+| Mid-flight token injection into any seq = just prefill into that seq | same plumbing as our delta prefill |
+| Per-stream MTP drafting stacks: batch 8 @ 3.11× → ~2.4× aggregate | M6.0 curve + M7.1 accept rates |
+| Position-keyed sampling: per-stream seeds, reproducible runs | M7.4 |
+
+The original "packed twin inference" idea returns — but instead of self-speculation
+(proven bounded below baseline) or independent users (declined), the streams **cooperate
+on one task**. The economics that killed the stagger don't apply: every stream does real,
+wanted work.
+
+## Honest economics (before anyone says 4×)
+
+- Worker phase wall-clock vs one sequential agent doing all three pieces:
+  `3·L sequential vs max(L_i)·1.86 packed` → **~1.6× wall speedup** for balanced pieces.
+- With the coordinator productively occupied during the worker phase (tests, docs,
+  integration scaffolding): **4 / 1.86 ≈ 2.15× effective work rate**.
+- Stacking per-stream MTP drafts (batch 8 ≈ 3.11×, ~1.9 tok/step/stream):
+  `4 × 1.9 / 3.11 ≈ **2.4× aggregate token rate**` — before any lookup hits.
+- "4×" is the in-flight parallelism, not the speedup. The speedup is ~1.6–2.4×,
+  which is still the largest single lever on the board for splittable tasks.
+
+## Architecture
+
+```
+seq 0: COORDINATOR        seq 1..3: WORKERS
+(one llama_context, n_seq_max = 4..8; per-stream sampling seeds)
+
+Phase 1  PLAN      coordinator alone: emit a JSON work order
+                   {shared_context, pieces: [{id, instructions, interface}, ×3]}
+Phase 2  FAN-OUT   prefill each worker seq: shared preamble + its piece
+                   (workers' prompts share the task header → batched prefill)
+Phase 3  PARALLEL  one llama_decode per step, one token per LIVE stream;
+                   streams hit EOG independently; batch shrinks as they finish
+         REFILL    coordinator keeps a backlog; a finished worker slot gets the
+                   next piece injected (keeps the batch full — stragglers are
+                   the main efficiency leak)
+Phase 4  GATHER    workers' outputs are injected into the coordinator as
+                   messages; coordinator integrates / resolves conflicts /
+                   emits the final artifact
+```
+
+### Coordination primitives (all already exist in our codebase)
+
+- **inject(seq, text)**: tokenize + prefill into that seq at its current position —
+  identical mechanics to the M7.5 delta prefill.
+- **broadcast**: coordinator finishes the class skeleton in Phase 1; it is part of
+  every worker's preamble. Mid-flight broadcast (v2): pause at a checkpoint round,
+  inject into all workers, resume.
+- **checkpoint rounds (v2)**: every N tokens, coordinator inspects worker tails and may
+  inject guidance ("stop, the signature changed") — possible because all streams pause
+  between steps anyway; it's one batch boundary.
+
+### Speculation stacking (v2)
+
+Each stream can carry its own MTP draft token: batch = up to 8 (4 real + 4 drafts) at
+3.11× → ~2.4× aggregate. Lookup drafting also applies per stream (workers writing
+similar functions hit each other's... no — histories are per-stream; lookup hits within
+a stream's own preamble+output). Rollback needs a checkpoint seq per stream →
+n_seq_max = 8, usable ctx = n_ctx/8: speculation costs context. v1 ships WITHOUT
+speculation (plain 4-stream, n_seq_max=4, ctx/4 each); v2 adds it behind a flag.
+
+## Interface (v1)
+
+```
+bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers 3]
+```
+- stdout: phase-tagged stream (`[plan] … [w1] … [w2] … [gather] …`), final artifact last
+- stderr: per-phase stats (tok/s per stream, aggregate, refills)
+- exit artifact: gather output written to a file via --out
+
+## Risks / open questions
+
+1. **Split quality** — the whole win depends on the coordinator producing genuinely
+   independent pieces with clean interfaces. Mitigation: strict plan schema; pieces
+   must declare their exported symbols; gather phase resolves collisions.
+2. **Stragglers** — unequal pieces idle the batch. Mitigation: work-queue refill; plan
+   prompt asks for similar-sized pieces.
+3. **Worker context isolation** — workers can't see each other mid-flight (by design);
+   overlapping helpers get deduped at gather. Acceptable for function-level splits.
+4. **Memory** — n_seq_max=4 non-unified → usable ctx/4 (16k each at -c 64000 q8).
+   Worker contexts are small (preamble + piece); the coordinator carries the big context.
+   Asymmetric ctx per seq is not supported by llama.cpp — all streams pay the same
+   reservation. Fine at v1 scale.
+5. **Failure modes** — a worker going off the rails burns its stream until EOG/cap;
+   checkpoint rounds (v2) give the coordinator a kill/retry switch.
+
+## Milestones
+
+- **PA.0** — plumbing demo: 4 independent prompts, one context, parallel decode, measure
+  aggregate tok/s vs 4 sequential runs (expect ≈2.15×). Mostly resurrects pti_4seq code.
+- **PA.1** — phased pipeline: plan → fan-out → parallel → gather on a canned task
+  ("write a class with 3 methods"); end-to-end artifact quality check.
+- **PA.2** — work-queue refill + straggler stats.
+- **PA.3** — speculation stacking (MTP per stream), measure ~2.4× aggregate.
+- **PA.4** — checkpoint rounds / mid-flight coordination.
