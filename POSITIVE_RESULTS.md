@@ -235,4 +235,13 @@ split: 3 isolated workers (`updateBirdPhysics` / `updatePipes` / `checkCollision
 shared `state`/`config` interface, plus a boss SELF piece (`initGame` / `gameLoop` + smoke
 test) — PARSE OK, no export collisions. A GPU-free `--parse-test` self-checks the parser.
 (Real model output also caught a bug a clean sample missed: `exports=a, b` with a space
-dropped `b` — fixed.) Next: PA.1b fan-out + parallel decode on the gate'd substrate.
+dropped `b` — fixed.)
+
+**PA.1b** then fanned all 4 lanes through the gate'd packed loop and produced the pieces — but
+measured the **straggler cost**: an unbalanced boss piece (~1500 tok: integration + a full
+mocked smoke test) vs ~280/worker gave **11 tok/s aggregate, slower than sequential** (the
+batch ran 4-wide briefly, then boss-alone for a long tail). The 2.15× needs *balanced* pieces.
+Fix (designed, §8.4): a **two-queue work-pool** — the boss emits a task list of any length;
+all 4 lanes (incl. slot 0, after its light scaffolding) pop work items on a `DONE` signal;
+slot 0 prioritizes a separate **boss queue** for decisions (questions/grants/gather). That
+keeps every lane balanced *and* full — PA.2.

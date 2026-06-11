@@ -251,13 +251,24 @@ This is the 2.15× region. The boss lane writes glue/tests *against the declared
 clarifying question here (§4.2 / §8.2), which parks its lane until the boss replies; v1
 disables the channel (one-shot), PA.4 enables it.
 
-### Phase 3.5 — REFILL (v1.1 / PA.2)
+### Phase 3.5 — REFILL (PA.2): a worker signals done → gets the next piece
 
-If the plan produced a backlog (>3 worker pieces), a finished worker slot gets the next
-piece injected at its current position (`inject(seq, next.blueprint)`), keeping the batch
-full. Stragglers are the dominant efficiency leak (§7), so the plan prompt asks for
-similar-sized pieces and refill recovers the rest. v1 ships **without** a backlog (exactly
-3 workers); refill is PA.2.
+A worker finishing is a **signal**: implicitly EOG (the lane stops — the harness already
+detects this and the batch shrinks), or explicitly a `<<<DONE>>>` marker / `done()` tool-call
+(more robust, and it can report what the lane produced). On that signal, if a **backlog** of
+pieces remains, the harness refills the freed lane: `seq_rm(lane)` + prefill the next piece
+into that seq (a small delta-prefill at the batch boundary), and the lane rejoins the packed
+loop — no context rebuild.
+
+This reframes the design from "exactly 3 workers + boss" to **the boss emits a *queue* of
+small, balanced pieces and the 4 lanes chew through it with refill**. That keeps lanes both
+*balanced* (all small → no straggler) and *full* (refilled → no idle tail) — the general fix
+for the straggler measured in PA.1b, which had no backlog (4 pieces, 4 lanes, one oversized
+boss → a long 1-wide tail at 11 tok/s). 4 lanes become a *pipeline* over many small pieces,
+not a fixed 3+1. **The boss lane joins the pool too:** once its light scaffolding is done it
+pulls the next queue piece like any worker — "boss" is just the role seq 0 plays at the
+bookends (PLAN up front, GATHER at the end), never an idle lane in between. v1 ships without a
+backlog (pieces == lanes); refill is PA.2.
 
 ### Phase 4 — GATHER (boss integrates)
 
@@ -354,9 +365,14 @@ The BluePrint framework is the **boss's** system prompt, never loaded into a wor
 1. **Split quality** — the entire win depends on the boss producing genuinely independent
    pieces with clean interfaces. Mitigation: strict envelope schema, declared exports,
    collision check, gather drift-diff. Measured in PA.1 (artifact quality gate).
-2. **Stragglers** — unequal pieces idle the batch; a 4-lane batch with 1 live lane is back
-   to ~1× and you have paid 1.86× overhead for nothing. Mitigation: "similar-sized" in the
-   prompt + work-queue refill (PA.2) + checkpoint kill of runaways (PA.4).
+2. **Stragglers — MEASURED, and it can be *worse* than ~1× (PA.1b, 2026-06-11).** Unequal
+   pieces idle the batch. On the flappy-bird task the boss wrote ~1500 tok (integration + a
+   full mocked smoke test) vs ~280/worker, so the batch ran 4-wide briefly then **1-wide
+   (boss alone) for a long tail → 11.0 tok/s aggregate, 237s wall, SLOWER than sequential
+   (~19 tok/s).** The 2.15× needs *balanced* pieces. Mitigations: (a) the boss's
+   parallel-phase piece must be **light scaffolding** (file layout, harness skeleton, glue
+   stubs), not a heavy re-impl — tighten the boss prompt; (b) work-queue refill (PA.2);
+   (c) checkpoint kill of runaways (PA.4).
 3. **Plan latency** — Phase 1 is serial (1×) before any parallelism. For small tasks the
    plan tax can erase the worker-phase win. Open: a minimum-task-size threshold below which
    `pti_agents` should just run one lane. Measure the crossover in PA.1.
@@ -429,6 +445,65 @@ answer and roll back if wrong (faster, needs the v2 checkpoint seq). v1 stays on
 channel); this is PA.4. **PA.4 is independent of PA.3 (speculation)** — if conversation
 quality matters more than the extra ~0.25×, do PA.4 first.
 
+### 8.3 Worker tool-calls — autonomous file creation (PA.5, user's idea)
+
+Today every lane's output funnels back through the boss at gather. Instead, let a worker
+**emit tool calls** the harness executes directly — `write_file(path, content)`, `mkdir`,
+later `run(cmd)` — so it writes its own file and stops, with nothing routed through the boss.
+The parser already exists: the M7.7/M7.8 jinja + XML `<function=NAME><parameter=K>` machinery
+(this model emits that markup readily). Per lane, the harness scans the worker's stream for a
+tool call, executes it, and (v1) ends that lane on success.
+
+This reshapes the pipeline:
+- **Workers become actors:** code → `write_file` → harness writes it; the lane is done.
+- **Gather** stops being "boss stitches text" and becomes "boss verifies the assembled tree
+  and runs the smoke test" — far less funneling, and it sidesteps the text-merge for
+  file-per-piece splits.
+- **The boss's scaffolding lane** writes the `package.json`, test harness, and glue via the
+  same `write_file` calls — and because those are *small*, the boss lane stays balanced with
+  the workers (this is also the straggler fix, risk #2).
+- **Safety:** tool calls have real side effects — sandbox to a workdir (`--out-dir`),
+  allowlist the verbs, and never run `run(cmd)` without an explicit flag. Attribute each
+  lane's calls to its piece id for audit.
+
+Open: a tool call is a serial harness step (like the §8.2 Q&A) — batch it at the step
+boundary; a worker emitting malformed markup needs the same re-ask fallback as the envelope (§4).
+
+### 8.4 Two queues, one broker — the coordination primitive
+
+The refill backlog (§3.5), the coordination channel (§8.2), dependency requests (§6/§8.3), the
+done-signal, and worker tool-calls (§8.3) are all the same shape: a lane emits a short
+structured message, the harness acts on it, and sometimes injects something back. Unify them
+as **two harness-owned queues**:
+
+- **Worker queue (work items)** — the boss builds a task list **as long as the job needs**
+  (not capped at 3) and pushes them, topping up anytime. **Any lane pops** — workers *and*
+  slot 0. (The v1/PA.1 "≤3 PIECE + SELF" envelope is just the small-N case.)
+- **Boss queue (decision requests)** — items only slot 0 can resolve: a worker's `ASK <q>`, a
+  `NEED <lib>`, a gather/integration task. **Only slot 0 pops** it.
+
+Posting: a lane emits a marker on its stream and the harness routes it — side-effecting verbs
+(`write_file`, `mkdir`) it runs inline; a decision request lands on the **boss queue**; `DONE`
+frees the lane to pop its next work item.
+
+Scheduling: **slot 0 drains the boss queue first, then falls back to the worker queue** —
+coordination (answers, grants, gather) outranks grunt work, but slot 0 never idles: with the
+boss queue empty it pops work items like any worker. Workers (seqs 1+) pop the worker queue
+only. The boss's `REPLY`/`GRANT`/`GUIDE` is injected back into the target lane.
+
+The lane↔queue interface is the same marker parsing already done on the token stream; the
+broker runs at the **batch boundary** (every step is a natural sync point — §8.2). Mental
+model: a tiny **blackboard** — workers (seqs 1+) pop the worker queue; **slot 0** produces
+work items, prioritizes the boss queue, then falls back to the worker queue; the harness is
+the broker.
+
+Honesty: every queue op is a **serial** harness step (parse + inject), trading a little
+throughput for coordination — the same tax as Q&A (§8.2) and tool-calls (§8.3), and why the
+default path stays quiet (claim → work → done) with messages as the exception. Coordinated
+runs are intentionally **not** byte-deterministic w.r.t. timing (an injected message changes a
+lane's KV); the byte-identity gate (§2.1) governs the *uncoordinated* packed path. Build order:
+the **work-items half is PA.2** (fixes the straggler), the **message half is PA.4/PA.5**.
+
 ---
 
 ## 9. Milestones
@@ -436,8 +511,9 @@ quality matters more than the extra ~0.25×, do PA.4 first.
 | id | deliverable | acceptance gate |
 |---|---|---|
 | **PA.0** | plumbing demo (`pti_agents.cpp`): 4 prompts, one context, packed vs sequential | **DONE: ~1.9× aggregate** (1.87–1.95× run-to-run; 19.3 → ~37 tok/s, 4 independent buffers) and **byte-identity gate PASS (2026-06-11)** — all 4 lanes byte-identical packed-vs-solo, asserted in-binary (`kv_unified=false`, exits non-zero on divergence). Survivors-continue-after-EOG path coded, not yet exercised (equal-cap run). |
-| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a DONE (2026-06-11):** boss PLAN → parseable work-order, verified on the real model (flappy-bird → 3 isolated workers + boss SELF, PARSE OK, no collisions); `-p "task"` mode + GPU-free `--parse-test`. **PA.1b** (fan-out + parallel) / **PA.1c** (gather) pending. Full gate: artifact compiles & passes the boss's smoke test; envelope parses reliably over ≥20 plans; plan-tax crossover (risk #3) measured. |
-| **PA.2** | work-queue refill + straggler stats | batch stays full with a >3-piece backlog; report idle-lane-fraction |
+| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a+b DONE (2026-06-11):** boss PLAN → parseable work-order, then fan-out → 4 lanes generate their pieces in the gate'd packed loop (`-p "task"`), verified on flappy-bird. **Straggler measured**: an unbalanced boss piece (~1500 tok vs ~280/worker) gave 11 tok/s — *slower than sequential* — so balanced pieces / light-boss-scaffolding are required (risk #2). **PA.1c** (gather/verify) pending. |
+| **PA.5** | worker tool-calls — autonomous `write_file` (§8.3) | a worker writes its own file via a tool call the harness executes; gather verifies the tree + runs the smoke test (no text funnel) |
+| **PA.2** | work-queue refill: worker signals done (EOG / `<<<DONE>>>`) → harness prefills the next backlog piece into the freed lane; + straggler stats | batch stays full with a >N-piece backlog; idle-lane-fraction drops; **beats sequential on the PA.1b task** |
 | **PA.3** | speculation stacking (MTP/lookup per stream, `n_seq_max=8`) | ~2.4× aggregate; per-lane output still reproducible |
 | **PA.4** | bidirectional coordination: worker `ASK`→boss `REPLY`, plus boss GUIDE/KILL (independent of PA.3) | a worker blocked on an ambiguous spec gets an answer and finishes; boss kills+retries a sabotaged runaway within N tokens; Q&A stays within `q_budget` |
 
@@ -445,9 +521,11 @@ quality matters more than the extra ~0.25×, do PA.4 first.
 37.4 tok/s packed), the **byte-identity gate PASSES at N=4**, and the lane count is now
 **configurable (`-s 1..16`)**. An N-sweep settled the "more lanes?" question: **4 is the
 sweet spot** — higher N loses on speed (idle-seq SSM tax, §2) *and* byte-identity (near-ties,
-§2.1). Default stays 4. **PA.1a DONE** (2026-06-11): the boss decomposes a task into a
-parseable work-order (`-p "task"`), verified on the real model. Next: **PA.1b** — fan-out the
-parsed pieces into worker seqs + parallel decode on the gate'd substrate, then **PA.1c** gather.
+§2.1). Default stays 4. **PA.1a+b DONE** (2026-06-11): boss decomposes → 4 lanes generate
+their pieces in parallel (`-p "task"`). PA.1b also **measured the straggler cost** (unbalanced
+boss piece → 11 tok/s, *slower than sequential*): the boss's parallel-phase piece must be
+**light scaffolding**. Next: tighten the boss to scaffolding-only, add **worker tool-calls**
+(§8.3 — write files directly), and **PA.1c** gather/verify.
 
 ---
 
@@ -461,6 +539,13 @@ parsed pieces into worker seqs + parallel decode on the gate'd substrate, then *
 - **Task shape:** boss chooses function / file / role per task via a selection rubric
   (§5.1); not hard-coded.
 - **Boss is a fourth worker,** not an idle dispatcher — this is what buys 2.15× over 1.6×.
+  Sharper (PA.2): "boss" is the *role* seq 0 plays at the bookends (PLAN, GATHER); once its
+  light scaffolding is done it pulls from the same queue as any worker, so no lane idles
+  mid-flight.
+- **Coordination = two queues (§8.4).** A **worker queue** (work items; any lane pops) and a
+  **boss queue** (decision requests; only slot 0 pops, *before* it falls back to work items).
+  The boss produces items + drains its queue; the harness brokers at the batch boundary.
+  Worker queue = PA.2; boss queue = PA.4/PA.5.
 - **Communication:** v1 is one-shot assign → implement → gather (no mid-flight talk — keeps
   lanes parallel). A **bounded** bidirectional channel (worker questions + boss guidance/
   kill, `q_budget`-capped) is **PA.4**, independent of speculation. Clear subtasks are the
