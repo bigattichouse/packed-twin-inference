@@ -207,22 +207,219 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
     return total;
 }
 
+// ───────────────────────── PA.1: work-order envelope ─────────────────────────
+// The boss emits ONE planning block; the harness parses only the thin marker
+// envelope (passing BluePrint bodies through verbatim). Format — design §4:
+//   <<<PLAN strategy=function lang=js>>>
+//   shared:
+//   <blueprint> ...frozen interface + deps... </blueprint>
+//   <<<PIECE id=w1 exports=foo,bar>>>
+//   instruction: implement this function ...
+//   <blueprint> ...spec... </blueprint>
+//   <<<SELF id=boss exports=integrate,smokeTest>>>  ...
+//   <<<END>>>
+struct Piece {
+    std::string id;
+    std::vector<std::string> exports;
+    std::string language;
+    std::string instruction;
+    std::string blueprint;
+    bool        is_boss = false;
+};
+struct WorkOrder {
+    std::string strategy;
+    std::string shared;             // frozen interface, prepended to every lane
+    std::vector<Piece> pieces;      // workers, then the boss SELF piece
+    bool        ok = false;
+    std::string error;
+};
+
+static std::string trim(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static std::vector<std::string> split_csv(const std::string &s) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t c = s.find(',', i);
+        if (c == std::string::npos) c = s.size();
+        std::string t = trim(s.substr(i, c - i));
+        if (!t.empty()) out.push_back(t);
+        i = c + 1;
+    }
+    return out;
+}
+
+// "<<<TAG k=v k=v>>>" → tag + attrs; false if the line is not a marker
+static bool parse_marker(const std::string &line, std::string &tag,
+                         std::vector<std::pair<std::string,std::string>> &attrs) {
+    std::string t = trim(line);
+    if (t.rfind("<<<", 0) != 0) return false;
+    size_t end = t.find(">>>");
+    if (end == std::string::npos) return false;
+    std::string inner = trim(t.substr(3, end - 3));
+    size_t sp = inner.find_first_of(" \t");
+    tag = inner.substr(0, sp);
+    attrs.clear();
+    if (sp == std::string::npos) return true;
+    std::string rest = inner.substr(sp + 1);
+    size_t i = 0;
+    while (i < rest.size()) {
+        size_t nsp = rest.find_first_of(" \t", i);
+        if (nsp == std::string::npos) nsp = rest.size();
+        std::string kv = rest.substr(i, nsp - i);
+        size_t eq = kv.find('=');
+        if (eq != std::string::npos)
+            attrs.push_back({ trim(kv.substr(0, eq)), trim(kv.substr(eq + 1)) });
+        i = nsp + 1;
+    }
+    return true;
+}
+
+static std::string attr_get(const std::vector<std::pair<std::string,std::string>> &a,
+                            const std::string &k, const std::string &dflt = "") {
+    for (auto &p : a) if (p.first == k) return p.second;
+    return dflt;
+}
+
+// <blueprint>...</blueprint> if present, else the trimmed body
+static std::string extract_blueprint(const std::string &body) {
+    size_t a = body.find("<blueprint>");
+    size_t b = body.find("</blueprint>");
+    if (a != std::string::npos && b != std::string::npos && b > a)
+        return trim(body.substr(a + 11, b - (a + 11)));
+    return trim(body);
+}
+
+// text after the first "instruction:" line
+static std::string extract_instruction(const std::string &body) {
+    size_t p = body.find("instruction:");
+    if (p == std::string::npos) return "";
+    size_t e = body.find('\n', p);
+    size_t s = p + 12;
+    return trim(body.substr(s, (e == std::string::npos ? body.size() : e) - s));
+}
+
+static WorkOrder parse_work_order(const std::string &text) {
+    WorkOrder wo;
+    std::vector<std::string> lines;
+    { size_t i = 0; while (true) {
+        size_t nl = text.find('\n', i);
+        if (nl == std::string::npos) { lines.push_back(text.substr(i)); break; }
+        lines.push_back(text.substr(i, nl - i)); i = nl + 1; } }
+
+    std::string default_lang;
+    enum { NONE, SHARED, INPIECE } sect = NONE;
+    std::string buf;
+    Piece cur; bool have_cur = false;
+    auto flush_piece = [&]() {
+        if (!have_cur) return;
+        cur.instruction = extract_instruction(buf);
+        cur.blueprint   = extract_blueprint(buf);
+        wo.pieces.push_back(cur);
+        have_cur = false; cur = Piece();
+    };
+    for (auto &ln : lines) {
+        std::string tag; std::vector<std::pair<std::string,std::string>> at;
+        if (parse_marker(ln, tag, at)) {
+            if (tag == "PLAN") {
+                wo.strategy  = attr_get(at, "strategy");
+                default_lang = attr_get(at, "lang");
+                sect = SHARED; buf.clear();
+            } else if (tag == "PIECE" || tag == "SELF") {
+                if (sect == SHARED) wo.shared = extract_blueprint(buf);
+                flush_piece();
+                cur.id       = attr_get(at, "id");
+                cur.exports  = split_csv(attr_get(at, "exports"));
+                cur.language = attr_get(at, "lang", default_lang);
+                cur.is_boss  = (tag == "SELF");
+                have_cur = true; sect = INPIECE; buf.clear();
+            } else if (tag == "END") {
+                if (sect == SHARED) wo.shared = extract_blueprint(buf);
+                flush_piece();
+                break;
+            }
+        } else {
+            buf += ln; buf += '\n';
+        }
+    }
+    if (have_cur) flush_piece();
+    if (sect == SHARED && wo.shared.empty()) wo.shared = extract_blueprint(buf);
+
+    if (wo.pieces.empty()) { wo.error = "no pieces parsed"; return wo; }
+    for (auto &p : wo.pieces)
+        if (p.id.empty()) { wo.error = "a piece is missing id="; return wo; }
+    std::vector<std::string> seen;
+    for (auto &p : wo.pieces) for (auto &e : p.exports) {
+        for (auto &s : seen) if (s == e) { wo.error = "export collision: " + e; return wo; }
+        seen.push_back(e);
+    }
+    wo.ok = true;
+    return wo;
+}
+
+static const char *SAMPLE_ENVELOPE =
+    "<<<PLAN strategy=function lang=js>>>\n"
+    "shared:\n"
+    "<blueprint>\n"
+    "  World { pipes: Pipe[], bird: {x,y,vy}, score: int, gravity: float }\n"
+    "  Pipe  { x: float, gapY: float, gapH: float, passed: bool }\n"
+    "  deps: []\n"
+    "</blueprint>\n"
+    "<<<PIECE id=w1 exports=gravityStep>>>\n"
+    "instruction: implement this function given the public params of the current class, in js\n"
+    "<blueprint> gravityStep(bird, dt) -> void { apply gravity then velocity to bird } </blueprint>\n"
+    "<<<PIECE id=w2 exports=spawnPipe>>>\n"
+    "instruction: implement this function given the public params of the current class, in js\n"
+    "<blueprint> spawnPipe(world) -> void { append a Pipe with a random gap to world.pipes } </blueprint>\n"
+    "<<<PIECE id=w3 exports=checkCollision>>>\n"
+    "instruction: implement this function given the public params of the current class, in js\n"
+    "<blueprint> checkCollision(bird, pipes) -> bool { true if bird hits a pipe or ground } </blueprint>\n"
+    "<<<SELF id=boss exports=stepWorld,smokeTest>>>\n"
+    "instruction: implement this object in js - wire the three functions and a smoke test\n"
+    "<blueprint> Integration { stepWorld(world, dt) -> void, smokeTest() -> bool } </blueprint>\n"
+    "<<<END>>>\n";
+
+static int parse_self_test() {
+    WorkOrder wo = parse_work_order(SAMPLE_ENVELOPE);
+    fprintf(stderr, "── PA.1a work-order envelope parse self-test ──\n");
+    fprintf(stderr, "strategy : %s\n", wo.strategy.c_str());
+    fprintf(stderr, "shared   : %zu chars — \"%.50s...\"\n", wo.shared.size(), trim(wo.shared).c_str());
+    for (auto &p : wo.pieces) {
+        fprintf(stderr, "  %-5s boss=%d lang=%-3s exports=[", p.id.c_str(), p.is_boss, p.language.c_str());
+        for (size_t i = 0; i < p.exports.size(); i++) fprintf(stderr, "%s%s", i ? "," : "", p.exports[i].c_str());
+        fprintf(stderr, "]\n");
+        fprintf(stderr, "        instr: %.66s\n", p.instruction.c_str());
+        fprintf(stderr, "        bp   : %.66s\n", p.blueprint.c_str());
+    }
+    if (wo.ok) { fprintf(stderr, "PARSE OK — %zu pieces, no export collisions\n", wo.pieces.size()); return 0; }
+    fprintf(stderr, "PARSE FAIL — %s\n", wo.error.c_str());
+    return 2;
+}
+
 int main(int argc, char **argv) {
     char  model_path[512] = {};
     int   max_new   = 96;
     int   n_ctx     = 16384;
     int   n_streams = 4;
     bool  show_text = false;
+    bool  parse_test = false;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(model_path, argv[++i], sizeof(model_path)-1);
         else if (!strcmp(argv[i], "-n")   && i+1 < argc) max_new   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c")   && i+1 < argc) n_ctx     = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--streams")) && i+1 < argc) n_streams = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--parse-test")) parse_test = true;
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
+    if (parse_test) return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
