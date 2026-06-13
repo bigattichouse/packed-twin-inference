@@ -654,6 +654,179 @@ static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
     return s;
 }
 
+// ───────────────────────── PA.3: streaming decomposition ─────────────────────
+// Boss (lane nW) plans WHILE workers (lanes 0..nW-1) execute. Each <<<PIECE>>>…
+// <<</PIECE>>> the boss closes is parsed from its live stream and enqueued; a free
+// worker clones the cached shared prefix + delta-prefills it and starts immediately.
+// After <<<END>>> the boss lane joins the worker pool. Kills the plan-tax idle.
+struct QItem { std::string id, instruction, blueprint, language; std::vector<std::string> exports; };
+
+static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
+    const int nW   = n_lanes > 1 ? n_lanes - 1 : 1;   // worker lanes 0..nW-1
+    const int BOSS = nW;                              // boss lane/seq (joins pool after END)
+    const int BASE = nW + 1;                          // cached shared-prefix seq
+    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, n_lanes + 1);
+    double t0 = now_sec();
+
+    struct Lane { int seq; int item; bool live; bool is_boss; std::string text;
+                  llama_token tok; llama_pos pos; int n_gen; };
+    std::vector<Lane> lanes(nW + 1);
+    for (int i = 0; i <= nW; i++) { lanes[i] = Lane{ i, -1, false, false, "", 0, 0, 0 }; }
+    lanes[BOSS].is_boss = true;
+
+    std::vector<QItem> queue;
+    std::vector<std::string> outv;
+    int next_assign = 0, total = 0;
+
+    std::string shared;
+    bool prefix_cached = false;
+    std::vector<llama_token> prefix_toks; int prefix_len = 0;
+
+    auto cache_prefix = [&](const std::string &sh) -> bool {
+        std::string pfx = apply_chat_template({ {"system",
+            std::string(WORKER_PREAMBLE) + "\n\nShared interface (rely on these):\n" + sh} }, false);
+        prefix_toks.assign(pfx.size() + 16, 0);
+        int pn = llama_tokenize(G.vocab, pfx.c_str(), (int32_t)pfx.size(),
+                                prefix_toks.data(), (int32_t)prefix_toks.size(), true, true);
+        if (pn <= 0) return false;
+        prefix_toks.resize(pn); prefix_len = pn;
+        llama_memory_seq_rm(G.mem, BASE, 0, -1);
+        Stream tmp; tmp.prompt_toks = prefix_toks; int li = 0;
+        return prefill_stream(tmp, BASE, batch, &li);
+    };
+
+    // prefill boss prompt into seq BOSS
+    G.tmpl = llama_model_chat_template(G.model, nullptr);
+    std::string bprompt = apply_chat_template({ {"system", BOSS_PROMPT}, {"user", task} });
+    if (g_no_think) bprompt += "<think>\n\n</think>\n\n";
+    {
+        std::vector<llama_token> bt(bprompt.size() + 16);
+        int bn = llama_tokenize(G.vocab, bprompt.c_str(), (int32_t)bprompt.size(), bt.data(), (int32_t)bt.size(), true, true);
+        if (bn < 0) { bt.resize(-bn); bn = llama_tokenize(G.vocab, bprompt.c_str(), (int32_t)bprompt.size(), bt.data(), (int32_t)bt.size(), true, true); }
+        bt.resize(bn > 0 ? bn : 0);
+        llama_memory_seq_rm(G.mem, BOSS, 0, -1);
+        Stream tmp; tmp.prompt_toks = bt; int li = 0;
+        if (!prefill_stream(tmp, BOSS, batch, &li)) { fprintf(stderr, "boss prefill failed\n"); llama_batch_free(batch); return; }
+        lanes[BOSS].tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, li), G.n_vocab);
+        lanes[BOSS].pos = (llama_pos)bt.size();
+        lanes[BOSS].live = true;
+    }
+    fprintf(stderr, "\n══ PA.3 streaming pipeline — boss(lane %d) + %d workers (live) ══\n", BOSS, nW);
+
+    size_t parse_cur = 0; bool boss_done = false;
+    auto pump_boss = [&]() {
+        std::string &bp = lanes[BOSS].text;
+        if (!prefix_cached) {
+            size_t fp = bp.find("<<<PIECE"), pl = bp.find("<<<PLAN");
+            if (fp != std::string::npos && pl != std::string::npos) {
+                size_t ple = bp.find(">>>", pl);
+                if (ple != std::string::npos && ple < fp) {
+                    shared = extract_blueprint(bp.substr(ple + 3, fp - (ple + 3)));
+                    if (cache_prefix(shared)) { prefix_cached = true;
+                        fprintf(stderr, "\n  [shared cached: %d tok — workers can start]\n", prefix_len); }
+                }
+            }
+        }
+        for (;;) {
+            size_t open = bp.find("<<<PIECE", parse_cur);
+            if (open == std::string::npos) break;
+            size_t oend = bp.find(">>>", open);
+            if (oend == std::string::npos) break;
+            size_t close = bp.find("<<</PIECE>>>", oend);
+            if (close == std::string::npos) break;
+            std::string omark = bp.substr(open, oend + 3 - open), tag;
+            std::vector<std::pair<std::string,std::string>> at;
+            parse_marker(omark, tag, at);
+            std::string body = bp.substr(oend + 3, close - (oend + 3));
+            QItem q; q.id = attr_get(at, "id"); q.exports = split_csv(attr_get(at, "exports"));
+            q.language = attr_get(at, "lang"); q.instruction = extract_instruction(body); q.blueprint = extract_blueprint(body);
+            queue.push_back(q); outv.push_back("");
+            fprintf(stderr, "\n  [enqueued %s — %d queued]\n", q.id.c_str(), (int)queue.size());
+            parse_cur = close + 12;
+        }
+        if (bp.find("<<<END>>>", parse_cur) != std::string::npos) boss_done = true;
+    };
+
+    auto start_worker = [&](int L, int qi) -> bool {
+        const QItem &q = queue[qi];
+        std::string user = "Your piece";
+        if (!q.language.empty()) user += " (" + q.language + ")";
+        user += ": " + q.instruction + "\n\nSpec:\n" + q.blueprint;
+        std::string full = apply_chat_template({ {"system",
+            std::string(WORKER_PREAMBLE) + "\n\nShared interface (rely on these):\n" + shared}, {"user", user} }, true);
+        if (g_no_think) full += "<think>\n\n</think>\n\n";
+        std::vector<llama_token> ft(full.size() + 16);
+        int fn = llama_tokenize(G.vocab, full.c_str(), (int32_t)full.size(), ft.data(), (int32_t)ft.size(), true, true);
+        if (fn <= 0) return false;
+        ft.resize(fn);
+        bool cached = prefix_cached && fn > prefix_len && (fn - prefix_len) <= PREFILL_CHUNK;
+        for (int k = 0; cached && k < prefix_len; k++) if (ft[k] != prefix_toks[k]) cached = false;
+        llama_memory_seq_rm(G.mem, lanes[L].seq, 0, -1);
+        int last_idx = 0;
+        if (cached) {
+            llama_memory_seq_cp(G.mem, BASE, lanes[L].seq, 0, -1);
+            batch_clear(&batch);
+            int dn = fn - prefix_len;
+            for (int j = 0; j < dn; j++) batch_add(&batch, ft[prefix_len + j], (llama_pos)(prefix_len + j), lanes[L].seq, j == dn - 1);
+            if (llama_decode(G.ctx, batch) != 0) return false;
+            last_idx = dn - 1;
+        } else {
+            Stream tmp; tmp.prompt_toks = ft; if (!prefill_stream(tmp, lanes[L].seq, batch, &last_idx)) return false;
+        }
+        lanes[L].tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
+        lanes[L].pos = (llama_pos)fn; lanes[L].text = tok_str(lanes[L].tok);
+        lanes[L].n_gen = 1; lanes[L].live = true; lanes[L].item = qi; total++;
+        fprintf(stderr, "  → %s → lane %d (%s)\n", q.id.c_str(), L, cached ? "cloned+delta" : "full");
+        return true;
+    };
+
+    double tg = now_sec();
+    for (;;) {
+        if (prefix_cached)
+            for (int L = 0; L <= nW && next_assign < (int)queue.size(); L++)
+                if (!lanes[L].live && lanes[L].item < 0 && (!lanes[L].is_boss || boss_done))
+                    start_worker(L, next_assign++);
+
+        batch_clear(&batch);
+        std::vector<int> ord;
+        for (int L = 0; L <= nW; L++) if (lanes[L].live) { batch_add(&batch, lanes[L].tok, lanes[L].pos, lanes[L].seq, true); ord.push_back(L); }
+        if (ord.empty()) break;
+        if (llama_decode(G.ctx, batch) != 0) { fprintf(stderr, "pipeline decode failed\n"); break; }
+        for (size_t i = 0; i < ord.size(); i++) {
+            int L = ord[i];
+            llama_token nxt = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, (int)i), G.n_vocab);
+            lanes[L].pos++; lanes[L].tok = nxt; lanes[L].n_gen++; total++;
+            if (lanes[L].is_boss && !boss_done) {
+                std::string pc = tok_str(nxt); lanes[L].text += pc; fputs(pc.c_str(), stderr);
+                pump_boss();
+                if (boss_done || llama_vocab_is_eog(G.vocab, nxt) || lanes[L].n_gen >= max_new * 3) {
+                    boss_done = true; lanes[L].live = false; lanes[L].item = -1;
+                    fprintf(stderr, "\n  [boss done planning (%d tok) — joins the worker pool]\n", lanes[L].n_gen);
+                }
+            } else {
+                if (llama_vocab_is_eog(G.vocab, nxt) || lanes[L].n_gen >= max_new) {
+                    outv[lanes[L].item] = lanes[L].text;
+                    fprintf(stderr, "  ✓ %s done (%d tok)\n", queue[lanes[L].item].id.c_str(), lanes[L].n_gen);
+                    lanes[L].live = false; lanes[L].item = -1;
+                } else lanes[L].text += tok_str(nxt);
+            }
+        }
+    }
+    double wall = now_sec() - tg;
+    llama_batch_free(batch);
+
+    fprintf(stderr, "\n════════════════════════════════════════════════\n");
+    fprintf(stderr, "  PA.3 streaming pipeline result\n");
+    fprintf(stderr, "  %d items, %d worker lanes + boss, prefix %d tok\n", (int)queue.size(), nW, prefix_len);
+    fprintf(stderr, "  %d tok in %.1fs concurrent (plan overlapped), %.1fs total\n", total, wall, now_sec() - t0);
+    fprintf(stderr, "  aggregate  : %.1f tok/s = %.2fx vs 19.3 baseline\n", wall > 0 ? total / wall : 0.0, wall > 0 ? total / wall / 19.3 : 0.0);
+    fprintf(stderr, "════════════════════════════════════════════════\n");
+    for (size_t i = 0; i < queue.size(); i++) {
+        std::string body = outv[i]; size_t th = body.find("</think>"); if (th != std::string::npos) body = body.substr(th + 8);
+        printf("\n───── item %s ─────\n%s\n", queue[i].id.c_str(), trim(body).c_str());
+    }
+}
+
 int main(int argc, char **argv) {
     char  model_path[512] = {};
     char  task[2048] = {};
@@ -665,6 +838,7 @@ int main(int argc, char **argv) {
     int   pool_items = 0;
     bool  plan_only  = false;
     bool  kv_q8      = true;    // Q8 KV default: byte-exactness is a spec-dec artifact, not needed for agents (~2x context)
+    bool  no_stream  = false;   // --no-stream: old sequential plan->pool path (for A/B vs streaming)
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(model_path, argv[++i], sizeof(model_path)-1);
@@ -678,9 +852,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--kv-q8"))    kv_q8 = true;
         else if (!strcmp(argv[i], "--kv-f16"))   kv_q8 = false;   // opt into f16: reproducible (byte-identical) runs
         else if (!strcmp(argv[i], "--no-think")) g_no_think = true;
+        else if (!strcmp(argv[i], "--no-stream")) no_stream = true;
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test) return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
@@ -721,6 +896,11 @@ int main(int argc, char **argv) {
 
     // ── PA.1 pipeline (PA.1a = PLAN phase): boss decomposes the task ──────────
     if (task[0]) {
+        if (!no_stream) {                 // PA.3: streaming decomposition — default for -p
+            run_pipeline(task, max_new, n_streams);
+            llama_free(G.ctx); llama_model_free(G.model); llama_backend_free();
+            return 0;
+        }
         G.tmpl = llama_model_chat_template(G.model, nullptr);
         std::vector<Msg> msgs = {{"system", BOSS_PROMPT}, {"user", task}};
         std::string prompt = apply_chat_template(msgs);
