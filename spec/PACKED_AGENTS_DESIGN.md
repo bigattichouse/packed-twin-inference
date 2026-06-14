@@ -524,11 +524,11 @@ the **work-items half is PA.2** (fixes the straggler), the **message half is PA.
 | id | deliverable | acceptance gate |
 |---|---|---|
 | **PA.0** | plumbing demo (`pti_agents.cpp`): 4 prompts, one context, packed vs sequential | **DONE: ~1.9× aggregate** (1.87–1.95× run-to-run; 19.3 → ~37 tok/s, 4 independent buffers) and **byte-identity gate PASS (2026-06-11)** — all 4 lanes byte-identical packed-vs-solo, asserted in-binary (`kv_unified=false`, exits non-zero on divergence). Survivors-continue-after-EOG path coded, not yet exercised (equal-cap run). |
-| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a+b DONE (2026-06-11):** boss PLAN → parseable work-order, then fan-out → 4 lanes generate their pieces in the gate'd packed loop (`-p "task"`), verified on flappy-bird. **Straggler measured**: an unbalanced boss piece (~1500 tok vs ~280/worker) gave 11 tok/s — *slower than sequential* — so balanced pieces / light-boss-scaffolding are required (risk #2). **PA.1c** (gather/verify) pending. |
-| **PA.5** | worker tool-calls — autonomous `write_file` (§8.3) | a worker writes its own file via a tool call the harness executes; gather verifies the tree + runs the smoke test (no text funnel) |
+| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a+b DONE (2026-06-11):** boss PLAN → parseable work-order, then fan-out → 4 lanes generate their pieces in the gate'd packed loop (`-p "task"`), verified on flappy-bird. **Straggler measured**: an unbalanced boss piece (~1500 tok vs ~280/worker) gave 11 tok/s — *slower than sequential* — so balanced pieces / light-boss-scaffolding are required (risk #2). **PA.1c DONE (2026-06-14):** gather implemented + built + GPU-free `--gather-test` green (10/10). Boss merges worker outputs into one artifact via a fresh-seq chat-turn decode; `--out` writes it; wired into **both** the streaming (default) and `--no-stream` pipelines through a shared `finish_gather()`. Bugs caught on first build and fixed — gather was wired into `--no-stream` only; the merge injected onto stale seq KV (corrupt attention); a format-string UB in the self-test — see [`PA1C_GATHER_DESIGN.md`](PA1C_GATHER_DESIGN.md) §Implementation status. Remaining: run the GPU integration suite (I1–I7). |
 | **PA.2** | work-queue refill: worker signals done → harness prefills the next backlog piece into the freed lane | **DONE (2026-06-11):** `--pool` mechanism (34.2 tok/s, 1.77×) + **end-to-end** (boss plan → pool, 8 correct functions) + **PA.2.1 prefix cache** (clone the cached starter per lane, delta-prefill the item; prefill 13.6→6.2s). Q8 KV default → **128k verified**. Tiny-item floor + plan tax noted (POSITIVE_RESULTS §12). Remaining: boss-queue/messages = PA.4. |
 | **PA.3** | speculation stacking (MTP/lookup per stream, `n_seq_max=8`) | ~2.4× aggregate; per-lane output still reproducible |
 | **PA.4** | bidirectional coordination: worker `ASK`→boss `REPLY`, plus boss GUIDE/KILL (independent of PA.3) | a worker blocked on an ambiguous spec gets an answer and finishes; boss kills+retries a sabotaged runaway within N tokens; Q&A stays within `q_budget` |
+| **PA.5** | worker tool-calls — autonomous `write_file` (§8.3) | a worker writes its own file via a tool call the harness executes; gather verifies the tree + runs the smoke test (no text funnel) |
 
 **Immediate next action:** PA.0 is built (`make agents`), measured (**~1.9×** at N=4,
 37.4 tok/s packed), the **byte-identity gate PASSES at N=4**, and the lane count is now
@@ -537,8 +537,15 @@ sweet spot** — higher N loses on speed (idle-seq SSM tax, §2) *and* byte-iden
 §2.1). Default stays 4. **PA.1a+b DONE** (2026-06-11): boss decomposes → 4 lanes generate
 their pieces in parallel (`-p "task"`). PA.1b also **measured the straggler cost** (unbalanced
 boss piece → 11 tok/s, *slower than sequential*): the boss's parallel-phase piece must be
-**light scaffolding**. Next: tighten the boss to scaffolding-only, add **worker tool-calls**
-(§8.3 — write files directly), and **PA.1c** gather/verify.
+**light scaffolding**. **PA.1c DONE (2026-06-14):** gather merges the pieces into one `--out`
+artifact on **both** pipelines; GPU-free `--gather-test` green (10/10); streaming `--out`
+smoke-tested end-to-end (plan → pool → gather → clean fenced code written to file). The smoke
+run also re-confirmed the two known open problems, neither a pipeline bug: **split quality**
+(risk #1 — on a tiny "js" task the boss emitted one piece and the model returned Python,
+dropping the second function) and the **tiny-task plan-tax floor** (0.97× — §3, POSITIVE_RESULTS
+§12). Next: run the full GPU gather suite (I1–I7 in [`PA1C_GATHER_DESIGN.md`](PA1C_GATHER_DESIGN.md)),
+tighten the boss to scaffolding-only + stronger language/exports adherence, and add
+**worker tool-calls** (§8.3 — write files directly).
 
 ---
 

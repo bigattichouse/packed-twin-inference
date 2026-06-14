@@ -3,7 +3,48 @@
 **Goal**: After all worker pieces are generated, assemble them into a single final artifact
 (a runnable, cohesive file) and write it to `--out`.
 
-**Current state**: Workers produce individual outputs printed to stdout with `───── item <id> ─────` headers. No assembly happens. The boss SELF piece generates glue code against declared interfaces only.
+**Original state (pre-PA.1c)**: Workers produced individual outputs printed to stdout with `───── item <id> ─────` headers. No assembly happened. The boss SELF piece generated glue code against declared interfaces only.
+
+---
+
+## Implementation status (2026-06-14) — IMPLEMENTED + BUILT + tested
+
+Decision **B (boss-led integration)** is implemented in `pti_agents.cpp`:
+`extract_code_fence`, `build_gather_prompt`, `run_gather_phase`, `finish_gather`,
+`write_artifact`, plus `--out`, `--no-gather`, `--gather-test`. GPU-free `--gather-test`
+passes **10/10**; the binary is built; the streaming `--out` path is smoke-tested
+end-to-end (plan → pool → gather → fenced code → file).
+
+**Bugs found on the first real build (the code had never been compiled before) and fixed:**
+
+1. **Gather was wired into `--no-stream` only.** The default `-p` path is streaming
+   (`run_pipeline`) and returned before gathering — so the headline `pti_agents -p "task"
+   --out file` (acceptance #1, test I4) silently wrote nothing. **Fix:** both pipelines now
+   call a shared `finish_gather()`; the streaming path builds a `WorkOrder` view of its
+   `QItem` queue (the boss joins the pool after planning, so every output is a worker piece —
+   no separate SELF there).
+2. **Gather injected onto stale KV → corrupt attention.** `run_gather_phase` prefilled the
+   gather turn at pos 0 of a seq that still held leftovers (the boss's plan in `--no-stream`,
+   or the last pool item that ran on that lane in streaming), duplicating KV cells at the same
+   positions. **Fix:** `run_gather_phase` now `llama_memory_seq_rm`s the boss seq first and
+   starts the merge from a clean pos 0. This makes gather a **fresh boss turn**, not a
+   continuation — superseding the "inject at the boss's current position" note in §"Inject
+   mechanics" below (the gather prompt is self-contained: it carries every worker body + the
+   declared exports, so no prior context is needed).
+3. **Gather prompt was injected as raw text.** On an instruct model that continues the prose
+   rather than answering. **Fix:** the gather turn is wrapped in the chat template
+   (`GATHER_SYSTEM` + the build_gather_prompt body), matching `boss_generate` / worker prompts.
+4. **`extract_code_fence` on an unclosed fence** returned the full text *with* the `` ``` ``
+   marker (U7). **Fix:** it now treats EOF as the close (markdown convention) and returns the
+   content after the opening fence line — strips prose + the dangling marker, which is what
+   the merge wants. (U7 row in the Testing Plan updated to match.)
+5. **Format-string UB in `gather_self_test`** — a `std::string` passed to `%s` and a `%d`
+   with no argument. **Fix:** `%s`+`const char*`, `%d`+`int`.
+
+**Remaining:** the GPU integration suite (I1–I7) beyond the streaming smoke test; and the
+**split-quality** problem the smoke run re-exposed (boss emitted one piece, model returned
+Python for a "js" task and dropped the second function) — a boss-prompt / language-adherence
+issue (risk #1), not a gather bug.
 
 ---
 
@@ -287,7 +328,7 @@ All pure-text utilities are testable without loading a model. Add a `--gather-te
 | U4 | `extract_code_fence` | Input: multiple fences | Returns content of **first** fence only |
 | U5 | `extract_code_fence` | Input: fence with prose before/after | Returns fenced content only, strips surrounding prose |
 | U6 | `extract_code_fence` | Input: empty string | Returns empty string |
-| U7 | `extract_code_fence` | Input: unclosed fence | Returns full text unchanged (graceful degradation) |
+| U7 | `extract_code_fence` | Input: unclosed fence | Returns content after the opening fence (EOF treated as the close); strips the ` ``` ` marker + any leading prose |
 | U8 | `build_gather_prompt` | WorkOrder with 3 pieces + boss SELF | Output contains all `<<<WORKER_DONE>>>` markers, `<<<GATHER_INSTRUCTION>>>`, and piece ids |
 | U9 | `build_gather_prompt` | WorkOrder with 0 pieces (edge case) | Output contains `<<<GATHER_INSTRUCTION>>>` but no `<<<WORKER_DONE>>>` markers |
 | U10 | `build_gather_prompt` | Worker output contains `<<<` markers | Worker output is escaped or placed so markers don't confuse the boss (verify no false marker matches) |

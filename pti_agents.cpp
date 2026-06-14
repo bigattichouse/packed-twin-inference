@@ -41,6 +41,8 @@ static double now_sec() {
 static bool g_verbose_logs = false;
 static bool g_no_think     = false;   // --no-think: force a closed empty <think></think> after the
                                       // generation prompt so boss+workers skip reasoning (faster, esp. the plan)
+static char g_out_path[512] = {};     // --out: write final artifact to this file
+static bool g_no_gather    = false;   // --no-gather: skip gather phase, print pieces separately
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
     if (g_verbose_logs) { fputs(text, stderr); return; }
@@ -654,6 +656,298 @@ static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
     return s;
 }
 
+// ───────────────────────── PA.1c: gather phase ───────────────────────────────
+// After all workers finish, inject their outputs into the boss and let it
+// produce a single merged artifact.
+
+// Extract content from ```lang ... ``` fenced code blocks.
+// If no fences found, return the full text unchanged (graceful fallback).
+// If multiple fences, return the first one.
+static std::string extract_code_fence(const std::string &text) {
+    size_t open = text.find("```");
+    if (open == std::string::npos) return trim(text);   // no fence → raw code, pass through
+    // skip the fence marker + optional lang tag to find newline
+    size_t nl = text.find('\n', open + 3);
+    if (nl == std::string::npos) nl = open + 3;
+    else nl++;  // include the newline
+    size_t close = text.find("```", nl);
+    // Unclosed fence (e.g. truncated worker output): treat EOF as the close, per
+    // markdown convention. Returning the content after the opening fence still
+    // strips the ``` marker and any prose before it — more useful for the merge
+    // than passing the raw fence through.
+    if (close == std::string::npos) return trim(text.substr(nl));
+    return trim(text.substr(nl, close - nl));
+}
+
+// Build the gather injection text: each worker's output wrapped in markers,
+// followed by the gather instruction for the boss.
+static std::string build_gather_prompt(
+    const WorkOrder &wo,
+    const std::vector<std::pair<std::string, std::string>> &worker_results,  // id -> output
+    const std::string &boss_self_output)
+{
+    std::string p;
+    p += "Below are the actual outputs from your workers. Use these implementations AS-IS.\n\n";
+
+    for (auto &wr : worker_results) {
+        p += "<<<WORKER_DONE id=" + wr.first + ">>>";
+        // extract clean code from fenced blocks if present
+        p += extract_code_fence(wr.second);
+        p += "\n<<<END_WORKER>>>\n\n";
+    }
+
+    if (!boss_self_output.empty()) {
+        p += "<<<SELF_DONE id=boss>>>\n";
+        p += extract_code_fence(boss_self_output);
+        p += "\n<<<END_SELF>>>\n\n";
+    }
+
+    // declared exports for drift detection
+    p += "<<<GATHER_INSTRUCTION>>>\n";
+    p += "You have received the outputs from all workers. Your job is to produce a SINGLE, ";
+    p += "COMPLETE, RUNNABLE artifact.\n\n";
+    p += "For each worker above, you see their actual implementation. Use these implementations ";
+    p += "AS-IS — do not rewrite them. Deduplicate overlapping helpers (keep one copy).\n\n";
+    p += "Declared exports per worker for reference:\n";
+    for (auto &pc : wo.pieces) {
+        if (pc.is_boss) continue;
+        p += "  " + pc.id + " -> [";
+        for (size_t i = 0; i < pc.exports.size(); i++)
+            p += (i ? "," : "") + pc.exports[i];
+        p += "]\n";
+    }
+
+    p += "\nYour output must:\n";
+    p += "1. Include the shared interface (types, signatures)\n";
+    p += "2. Include every worker's implementation (dedup overlapping helpers — keep one copy)\n";
+    p += "3. Include your integration/glue code, UPDATED to match actual worker signatures\n";
+    p += "4. Add a dependency manifest if needed\n";
+    p += "5. Be wrapped in a single code fence: ```<lang> ... ```\n\n";
+    p += "Output ONLY the code fence, nothing else.\n";
+    p += "<<<END_GATHER>>>";
+    return p;
+}
+
+// Delta-prefill tokens into seq at position start_pos (the inject mechanism,
+// same as PA.2.1 delta prefill). Returns the last logits index.
+static bool inject(llama_seq_id seq, llama_pos start_pos,
+                   const std::vector<llama_token> &toks, llama_batch &batch) {
+    int n = (int)toks.size();
+    for (int i0 = 0; i0 < n; i0 += PREFILL_CHUNK) {
+        int nb = n - i0 < PREFILL_CHUNK ? n - i0 : PREFILL_CHUNK;
+        batch_clear(&batch);
+        for (int j = 0; j < nb; j++)
+            batch_add(&batch, toks[i0 + j], (llama_pos)(start_pos + i0 + j), seq,
+                      i0 + j == n - 1);
+        if (llama_decode(G.ctx, batch) != 0) return false;
+    }
+    return true;
+}
+
+// System prompt for the gather pass — sets the boss's role for the merge. The
+// user turn (built by build_gather_prompt) carries the actual instruction + bodies.
+static const char *GATHER_SYSTEM =
+    "You are the COORDINATOR of a packed-agent coding team. Your workers have finished "
+    "their pieces in isolation; integrate them into one cohesive, runnable artifact.";
+
+// Run the gather phase: clear the boss seq, prefill the gather turn, decode the
+// merged artifact until EOG or max_gather. Returns the boss's gather output.
+static std::string run_gather_phase(llama_seq_id boss_seq,
+                                     const std::string &gather_content, int max_gather)
+{
+    // Fresh boss context for the merge. The seq's KV still holds leftovers — the
+    // boss's own plan (non-stream) or the last pool item that ran on this lane
+    // (streaming). Prefilling the gather turn on top would write KV cells at
+    // positions that already have cells in this seq, duplicating them and
+    // corrupting attention. Clear the seq and start the gather turn at pos 0.
+    llama_memory_seq_rm(G.mem, boss_seq, 0, -1);
+
+    // Wrap as a chat turn so the instruct model *answers* the merge request rather
+    // than continuing raw text (matches boss_generate / the worker prompts).
+    std::string prompt = apply_chat_template(
+        { {"system", GATHER_SYSTEM}, {"user", gather_content} }, /*add_ass=*/true);
+    if (g_no_think) prompt += "<think>\n\n</think>\n\n";
+
+    std::vector<llama_token> gt(prompt.size() + 16, 0);
+    int gn = llama_tokenize(G.vocab, prompt.c_str(), (int32_t)prompt.size(),
+                            gt.data(), (int32_t)gt.size(), true, true);
+    if (gn <= 0) return "[gather tokenize failed]";
+    gt.resize(gn);
+
+    llama_batch batch = llama_batch_init(PREFILL_CHUNK + 8, 0, 1);
+    if (!inject(boss_seq, 0, gt, batch)) {
+        llama_batch_free(batch);
+        return "[gather inject failed]";
+    }
+
+    llama_token tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, gn - 1), G.n_vocab);
+    llama_pos pos = (llama_pos)gn;
+    std::string out;
+
+    fprintf(stderr, "\n── PA.1c GATHER — boss merging artifact ──\n");
+    for (int gen = 0; gen < max_gather && !llama_vocab_is_eog(G.vocab, tok); gen++) {
+        std::string piece = tok_str(tok);
+        out += piece;
+        fputs(piece.c_str(), stderr);
+        batch_clear(&batch);
+        batch_add(&batch, tok, pos, boss_seq, true);
+        if (llama_decode(G.ctx, batch) != 0) break;
+        tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, 0), G.n_vocab);
+        pos++;
+    }
+    llama_batch_free(batch);
+    return out;
+}
+
+// Write the final artifact to --out (if set) or stdout.
+static void write_artifact(const std::string &artifact) {
+    if (g_out_path[0]) {
+        FILE *fp = fopen(g_out_path, "w");
+        if (fp) { fputs(artifact.c_str(), fp); fclose(fp);
+            fprintf(stderr, "\n── artifact written to %s (%zu chars) ──\n", g_out_path, artifact.size());
+        } else { perror("fopen --out"); }
+    } else {
+        printf("\n════════════════════════════════════════════════\n");
+        printf("── FINAL ARTIFACT (%zu chars) ──\n%s\n════════════════════════════════════════════════\n",
+               artifact.size(), artifact.c_str());
+    }
+}
+
+// Drive the gather→write step shared by both pipelines: build the gather prompt,
+// run the boss merge, strip the fence, emit the artifact. n_lanes is the worker
+// lane count (n_seq_max = n_lanes + 1, the +1 being the prefix-cache seq).
+static void finish_gather(const WorkOrder &wo,
+                          const std::vector<std::pair<std::string,std::string>> &worker_results,
+                          const std::string &boss_self_output, int n_lanes) {
+    std::string gprompt    = build_gather_prompt(wo, worker_results, boss_self_output);
+    int total_ctx  = (int)llama_n_ctx(G.ctx);
+    int max_gather = (total_ctx / (n_lanes + 1)) / 2;   // generous cap for the merge
+    if (max_gather < 512) max_gather = 512;
+    std::string gather_out = run_gather_phase(0, gprompt, max_gather);
+    std::string artifact   = extract_code_fence(gather_out);
+    if (artifact.empty()) artifact = trim(gather_out);
+    write_artifact(artifact);
+}
+
+// Self-test for gather text utilities (GPU-free, like --parse-test)
+static int gather_self_test() {
+    fprintf(stderr, "── PA.1c gather self-test ──\n");
+    int fail = 0;
+
+    // U1: fenced code
+    {
+        std::string input = "```js\nfunction foo() { return 1; }\n```";
+        std::string result = extract_code_fence(input);
+        bool ok = result == "function foo() { return 1; }";
+        fprintf(stderr, "  U1 fenced js: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U2: fenced with lang tag
+    {
+        std::string input = "```javascript\nconst x = 42;\n```";
+        std::string result = extract_code_fence(input);
+        bool ok = result == "const x = 42;";
+        fprintf(stderr, "  U2 fenced javascript: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U3: no fences → fallback to full text
+    {
+        std::string input = "function bar() { return 2; }";
+        std::string result = extract_code_fence(input);
+        bool ok = result == "function bar() { return 2; }";
+        fprintf(stderr, "  U3 no fences: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U4: multiple fences → first only
+    {
+        std::string input = "```js\nfirst()\n```\n```js\nsecond()\n```";
+        std::string result = extract_code_fence(input);
+        bool ok = result == "first()";
+        fprintf(stderr, "  U4 multiple fences: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U5: fence with prose before/after
+    {
+        std::string input = "Here is the code:\n```python\ndef hello(): pass\n```\nDone.";
+        std::string result = extract_code_fence(input);
+        bool ok = result == "def hello(): pass";
+        fprintf(stderr, "  U5 fence with prose: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U6: empty string
+    {
+        std::string input = "";
+        std::string result = extract_code_fence(input);
+        bool ok = result.empty();
+        fprintf(stderr, "  U6 empty: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U7: unclosed fence → fallback
+    {
+        std::string input = "```js\nfunction unclosed() {";
+        std::string result = extract_code_fence(input);
+        bool ok = result == "function unclosed() {";
+        fprintf(stderr, "  U7 unclosed fence: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    got: \"%s\"\n", result.c_str()); fail++; }
+    }
+
+    // U8: build_gather_prompt contains markers and instruction
+    {
+        std::vector<std::pair<std::string, std::string>> workers = {
+            {"w1", "function gravityStep() {}"},
+            {"w2", "```js\nfunction spawnPipe() {}\n```"}
+        };
+        WorkOrder wo; wo.ok = false;
+        Piece p1; p1.id = "w1"; p1.exports = {"gravityStep"};
+        Piece p2; p2.id = "w2"; p2.exports = {"spawnPipe"};
+        wo.pieces.push_back(p1); wo.pieces.push_back(p2);
+
+        std::string prompt = build_gather_prompt(wo, workers, "");
+        bool ok = (prompt.find("<<<WORKER_DONE id=w1>>>") != std::string::npos) &&
+                  (prompt.find("<<<END_WORKER>>>") != std::string::npos) &&
+                  (prompt.find("<<<GATHER_INSTRUCTION>>>") != std::string::npos) &&
+                  (prompt.find("<<<END_GATHER>>>") != std::string::npos) &&
+                  (prompt.find("w2") != std::string::npos);
+        fprintf(stderr, "  U8 gather prompt markers: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) { fprintf(stderr, "    prompt length: %zu\n", prompt.size()); fail++; }
+    }
+
+    // U9: build_gather_prompt with 0 workers (edge case)
+    {
+        WorkOrder wo; wo.ok = false;
+        std::string prompt = build_gather_prompt(wo, {}, "");
+        bool ok = (prompt.find("<<<GATHER_INSTRUCTION>>>") != std::string::npos) &&
+                  (prompt.find("<<<WORKER_DONE") == std::string::npos);
+        fprintf(stderr, "  U9 empty gather prompt: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) fail++;
+    }
+
+    // U10: worker output contains <<< markers — verify no false matches
+    {
+        std::vector<std::pair<std::string, std::string>> workers = {
+            {"w1", "function test() { if (a <<< b) return a; }"}
+        };
+        WorkOrder wo; wo.ok = false;
+        Piece p1; p1.id = "w1"; p1.exports = {"test"};
+        wo.pieces.push_back(p1);
+
+        std::string prompt = build_gather_prompt(wo, workers, "");
+        // The <<<WORKER_DONE marker should be present; the <<< inside the code is just text
+        bool ok = (prompt.find("<<<WORKER_DONE id=w1>>>") != std::string::npos);
+        fprintf(stderr, "  U10 worker with markers: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) fail++;
+    }
+
+    fprintf(stderr, "  %s (%d/10 passed)\n", fail == 0 ? "ALL PASS" : "SOME FAILED", 10 - fail);
+    return fail > 0 ? 3 : 0;
+}
+
 // ───────────────────────── PA.3: streaming decomposition ─────────────────────
 // Boss (lane nW) plans WHILE workers (lanes 0..nW-1) execute. Each <<<PIECE>>>…
 // <<</PIECE>>> the boss closes is parsed from its live stream and enqueued; a free
@@ -821,9 +1115,26 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
     fprintf(stderr, "  %d tok in %.1fs concurrent (plan overlapped), %.1fs total\n", total, wall, now_sec() - t0);
     fprintf(stderr, "  aggregate  : %.1f tok/s = %.2fx vs 19.3 baseline\n", wall > 0 ? total / wall : 0.0, wall > 0 ? total / wall / 19.3 : 0.0);
     fprintf(stderr, "════════════════════════════════════════════════\n");
-    for (size_t i = 0; i < queue.size(); i++) {
-        std::string body = outv[i]; size_t th = body.find("</think>"); if (th != std::string::npos) body = body.substr(th + 8);
-        printf("\n───── item %s ─────\n%s\n", queue[i].id.c_str(), trim(body).c_str());
+    // ── PA.1c GATHER (streaming path) — boss merges the pieces into one artifact ──
+    // The boss joined the worker pool after planning, so every outv[i] is a worker
+    // piece (no separate SELF lane here). Build a WorkOrder view of the queue so the
+    // gather prompt can list each piece's declared exports for drift detection.
+    if (!g_no_gather && !queue.empty()) {
+        WorkOrder wo; wo.shared = shared; wo.ok = true;
+        std::vector<std::pair<std::string, std::string>> worker_results;
+        for (size_t i = 0; i < queue.size() && i < outv.size(); i++) {
+            Piece p; p.id = queue[i].id; p.exports = queue[i].exports; p.language = queue[i].language;
+            wo.pieces.push_back(p);
+            std::string body = outv[i];
+            size_t th = body.find("</think>"); if (th != std::string::npos) body = body.substr(th + 8);
+            worker_results.push_back({ queue[i].id, trim(body) });
+        }
+        finish_gather(wo, worker_results, "", n_lanes);
+    } else {
+        for (size_t i = 0; i < queue.size(); i++) {
+            std::string body = outv[i]; size_t th = body.find("</think>"); if (th != std::string::npos) body = body.substr(th + 8);
+            printf("\n───── item %s ─────\n%s\n", queue[i].id.c_str(), trim(body).c_str());
+        }
     }
 }
 
@@ -835,6 +1146,7 @@ int main(int argc, char **argv) {
     int   n_streams = 4;
     bool  show_text = false;
     bool  parse_test = false;
+    bool  gather_test = false;
     int   pool_items = 0;
     bool  plan_only  = false;
     bool  kv_q8      = true;    // Q8 KV default: byte-exactness is a spec-dec artifact, not needed for agents (~2x context)
@@ -854,10 +1166,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-think")) g_no_think = true;
         else if (!strcmp(argv[i], "--no-stream")) no_stream = true;
         else if (!strcmp(argv[i], "--text"))     show_text = true;
+        else if (!strcmp(argv[i], "--out")     && i+1 < argc) strncpy(g_out_path, argv[++i], sizeof(g_out_path)-1);
+        else if (!strcmp(argv[i], "--no-gather")) g_no_gather = true;
+        else if (!strcmp(argv[i], "--gather-test")) gather_test = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
-    if (parse_test) return parse_self_test();   // PA.1a: GPU-free envelope parser check
+    if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
+    if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
@@ -927,11 +1243,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n══ PA.2 POOL — %d work items, %d lanes ══\n", (int)items.size(), n_streams);
         std::vector<std::string> outputs;
         run_pool(items, n_streams, max_new, &outputs, build_prefix(wo));   // PA.2.1: cache preamble+shared
-        for (size_t i = 0; i < wo.pieces.size() && i < outputs.size(); i++) {
-            std::string body = outputs[i];
-            size_t bth = body.find("</think>");
-            if (bth != std::string::npos) body = body.substr(bth + 8);
-            printf("\n───── item %s ─────\n%s\n", wo.pieces[i].id.c_str(), trim(body).c_str());
+        // ── PA.1c GATHER ─────────────────────────────────────────────────────
+        if (!g_no_gather) {
+            // build worker_results vector: id -> output (strip thinking tags)
+            std::vector<std::pair<std::string, std::string>> worker_results;
+            std::string boss_self_output;
+            for (size_t i = 0; i < wo.pieces.size() && i < outputs.size(); i++) {
+                std::string body = outputs[i];
+                size_t bth = body.find("</think>");
+                if (bth != std::string::npos) body = body.substr(bth + 8);
+                body = trim(body);
+                if (wo.pieces[i].is_boss) {
+                    boss_self_output = body;
+                } else {
+                    worker_results.push_back({ wo.pieces[i].id, body });
+                }
+            }
+            finish_gather(wo, worker_results, boss_self_output, n_streams);
+        } else {
+            for (size_t i = 0; i < wo.pieces.size() && i < outputs.size(); i++) {
+                std::string body = outputs[i];
+                size_t bth = body.find("</think>");
+                if (bth != std::string::npos) body = body.substr(bth + 8);
+                printf("\n───── item %s ─────\n%s\n", wo.pieces[i].id.c_str(), trim(body).c_str());
+            }
         }
         llama_free(G.ctx);
         llama_model_free(G.model);

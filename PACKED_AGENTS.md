@@ -102,9 +102,13 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
 
 - **PA.0** ✓ *(2026-06-10)* — plumbing demo (`pti_agents.cpp`): 4 independent prompts, one
   context, parallel decode. **Measured 1.95× aggregate** (19.3 → 37.7 tok/s); four
-  independent buffers. Remaining: byte-identity packed-vs-solo gate.
-- **PA.1** — phased pipeline: plan → fan-out → parallel → gather on a canned task
-  ("write a class with 3 methods"); end-to-end artifact quality check.
-- **PA.2** — work-queue refill + straggler stats.
+  independent buffers. **Byte-identity gate PASS** (2026-06-11, N=4).
+- **PA.1** ✓ *(2026-06-14)* — phased pipeline plan → fan-out → parallel → **gather**.
+  PA.1a+b: boss decomposes → lanes generate (`-p "task"`). **PA.1c**: boss merges the pieces
+  into one `--out` artifact (both pipelines); `--gather-test` 10/10; streaming `--out`
+  smoke-tested. Straggler + split-quality remain the open risks (design §7).
+- **PA.2** ✓ *(2026-06-11)* — work-queue refill (`--pool`, 34.2 tok/s) + PA.2.1 prefix cache;
+  Q8 KV → 128k verified.
 - **PA.3** — speculation stacking (MTP per stream), measure ~2.4× aggregate.
 - **PA.4** — checkpoint rounds / mid-flight coordination.
+- **PA.5** — worker tool-calls (autonomous `write_file`).

@@ -1,7 +1,34 @@
 # pti_agents.cpp — Gaps for Generating Actual Code Output
 
-**Date**: 2026-06-13
+**Date**: 2026-06-13 · **Updated**: 2026-06-14
+
 **Based on**: `pti_agents.cpp`, `PACKED_AGENTS.md`, `POSITIVE_RESULTS.md`, `spec/PACKED_AGENTS_DESIGN.md`
+
+---
+
+> ## ⚠️ Status update (2026-06-14): the top gaps are now CLOSED
+>
+> This doc was written against the pre-PA.1c code. The gather phase has since been designed
+> ([`spec/PA1C_GATHER_DESIGN.md`](spec/PA1C_GATHER_DESIGN.md)) and **implemented + built**:
+>
+> - **#1 Gather / final artifact assembly — RESOLVED.** `run_gather_phase` + `finish_gather`
+>   merge worker outputs into one artifact (boss-led integration, decision B).
+> - **#2 `--out` flag — RESOLVED.** Parsed + written, on **both** pipelines.
+> - **#3 Boss sees actual worker output — RESOLVED *at gather*.** The merge injects real
+>   worker bodies (not just declared exports) into the boss. (The *parallel-phase* boss SELF
+>   still sees only declared exports — by design; isolation is what keeps lanes parallel.)
+> - **#4 Code-fence extraction — RESOLVED.** `extract_code_fence` strips prose/fences.
+>
+> Three implementation bugs were caught on the first build (the gather code had never been
+> compiled) and fixed: gather was wired into `--no-stream` only; the merge injected onto stale
+> seq KV (corrupt attention); a format-string UB in the self-test. GPU-free `--gather-test`
+> now passes 10/10 and the streaming `--out` path is smoke-tested. Details:
+> [`spec/PA1C_GATHER_DESIGN.md`](spec/PA1C_GATHER_DESIGN.md) §Implementation status.
+>
+> **Still open: #5 re-plan on parse failure, #6 worker termination guard, #7 per-stream
+> sampling, #8 context-budget guard.** Plus the standing **split-quality** problem (risk #1)
+> — the gather plumbing works, but boss/worker output quality (language adherence, dropped
+> pieces) is the real remaining lever.
 
 ---
 
@@ -82,15 +109,19 @@ The `run_pipeline` function collects `outv` for worker items, but the boss's gen
 
 ## Summary of what to add for "actual code output"
 
-| Priority | What | Why |
-|---|---|---|
-| **Critical** | Final artifact assembly (gather) | Without this, you get N disconnected snippets, not a usable program |
-| **Critical** | `--out` flag | Design promises it; needed for editor integration |
-| **High** | Code extraction from worker output | Workers may emit prose; need fence stripping |
-| **High** | Re-plan on parse failure | Boss occasionally emits bad envelopes; retry is essential for reliability |
-| **Medium** | Boss sees worker output | Integration code won't match if workers deviate from spec |
-| **Medium** | Worker termination guard | Runaway workers waste tokens; basic length check would help |
-| **Low** | Per-stream temperature sampling | Greedy works for code; temperature is a v2 nicety |
-| **Low** | `<<<ASK>>>` / `<<<REPLY>>>` channel | PA.4 feature; valuable for ambiguous specs |
+| Priority | What | Status (2026-06-14) | Why |
+|---|---|---|---|
+| **Critical** | Final artifact assembly (gather) | ✅ RESOLVED | Without this, you get N disconnected snippets, not a usable program |
+| **Critical** | `--out` flag | ✅ RESOLVED (both pipelines) | Design promises it; needed for editor integration |
+| **High** | Code extraction from worker output | ✅ RESOLVED (`extract_code_fence`) | Workers may emit prose; need fence stripping |
+| **High** | Re-plan on parse failure | ⬜ OPEN | Boss occasionally emits bad envelopes; retry is essential for reliability |
+| **Medium** | Boss sees worker output | ✅ RESOLVED at gather | Integration code won't match if workers deviate from spec |
+| **Medium** | Worker termination guard | ⬜ OPEN | Runaway workers waste tokens; basic length check would help |
+| **Low** | Per-stream temperature sampling | ⬜ OPEN | Greedy works for code; temperature is a v2 nicety |
+| **Low** | `<<<ASK>>>` / `<<<REPLY>>>` channel | ⬜ OPEN (PA.4) | PA.4 feature; valuable for ambiguous specs |
 
-The single biggest gap is **the missing gather phase**. The code produces individual pieces but never assembles them into the "final artifact" that PACKED_AGENTS.md promises. Everything else is incremental.
+The original biggest gap — **the missing gather phase** — is now closed (see the status banner
+at the top). The code assembles the pieces into a final artifact and writes it via `--out`. The
+remaining open items are reliability hardening (re-plan, runaway guard) and v2 niceties; the
+real lever now is **split/output quality** (the boss producing balanced, language-correct,
+complete pieces), not plumbing.
