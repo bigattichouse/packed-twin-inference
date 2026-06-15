@@ -467,6 +467,35 @@ This reshapes the pipeline:
 Open: a tool call is a serial harness step (like the §8.2 Q&A) — batch it at the step
 boundary; a worker emitting malformed markup needs the same re-ask fallback as the envelope (§4).
 
+**Implementation status — PA.5 v1 (2026-06-14): worker tool-calls implemented.**
+
+- **Format: nanocoder's XML convention, not the Qwen `<function=>` form above.** Per the user's
+  `../nanocoder` reference, the tool NAME is the tag and parameters are nested tags:
+  `<create_file><path>…</path><content>…</content></create_file>`. `parse_tool_calls` recognises
+  the **known verbs only** (so a stray `<div>` in worker code is never mistaken for a call).
+- **Verbs:** `create_file` (params `path`/`file_path`, `content`) and `execute_bash` (param
+  `command`) — same names/params as nanocoder's `source/tools/`.
+- **Flags:** `--tools` advertises the verbs in the worker preamble + executes calls;
+  `--allow-run` enables `execute_bash` (implies `--tools`); `--work-dir DIR` is the sandbox
+  (default `pti_work`). Default runs are unchanged (tools off).
+- **Safety (mirrors nanocoder + stricter sandbox):** `create_file` is confined to the work dir
+  (relative paths only, `..` rejected); `execute_bash` runs `cd work_dir && timeout 60 <cmd>`,
+  gated behind `--allow-run`, with a destructive-command blocklist (`rm -rf /`, `mkfs`, `dd if=`,
+  fork bomb, `>/dev/sd*`, `chmod -R 000`).
+- **Execution model (v1):** **post-completion** — after the lanes finish, the harness scans each
+  worker's output, runs its tool calls, and folds a `<<<TOOL_RESULTS>>>` report (files written +
+  command output) into the **gather** context so the boss sees what was built/tested. Not yet a
+  *live* mid-stream round-trip (worker iterating on test output is the PA.4 escape hatch), and a
+  lane does not yet end-on-tool-call.
+- **Tested:** `--gather-test` T1–T4 (parser + dangerous-command guard), GPU-free. **E2E
+  (2026-06-14):** on the Stack task the two workers emitted `create_file` and the harness wrote
+  `stack.js` + `test.js` to the work dir; running the worker-written `test.js` passes ("All tests
+  passed!"). Notably the **real files were correct while the text gather-merge drifted** (rewrote
+  to TypeScript, renamed the class) — evidence that for file-per-piece splits the tool-call path
+  should *replace* the text merge (the §8.3 vision), not run alongside it. `execute_bash` is wired
+  + guarded but the model didn't emit it this run (running the assembled tree is better done once
+  by the boss at gather than per-worker mid-flight — a follow-up).
+
 ### 8.4 Two queues, one broker — the coordination primitive
 
 The refill backlog (§3.5), the coordination channel (§8.2), dependency requests (§6/§8.3), the
@@ -524,11 +553,11 @@ the **work-items half is PA.2** (fixes the straggler), the **message half is PA.
 | id | deliverable | acceptance gate |
 |---|---|---|
 | **PA.0** | plumbing demo (`pti_agents.cpp`): 4 prompts, one context, packed vs sequential | **DONE: ~1.9× aggregate** (1.87–1.95× run-to-run; 19.3 → ~37 tok/s, 4 independent buffers) and **byte-identity gate PASS (2026-06-11)** — all 4 lanes byte-identical packed-vs-solo, asserted in-binary (`kv_unified=false`, exits non-zero on divergence). Survivors-continue-after-EOG path coded, not yet exercised (equal-cap run). |
-| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a+b DONE (2026-06-11):** boss PLAN → parseable work-order, then fan-out → 4 lanes generate their pieces in the gate'd packed loop (`-p "task"`), verified on flappy-bird. **Straggler measured**: an unbalanced boss piece (~1500 tok vs ~280/worker) gave 11 tok/s — *slower than sequential* — so balanced pieces / light-boss-scaffolding are required (risk #2). **PA.1c DONE (2026-06-14):** gather implemented + built + GPU-free `--gather-test` green (10/10). Boss merges worker outputs into one artifact via a fresh-seq chat-turn decode; `--out` writes it; wired into **both** the streaming (default) and `--no-stream` pipelines through a shared `finish_gather()`. Bugs caught on first build and fixed — gather was wired into `--no-stream` only; the merge injected onto stale seq KV (corrupt attention); a format-string UB in the self-test — see [`PA1C_GATHER_DESIGN.md`](PA1C_GATHER_DESIGN.md) §Implementation status. Remaining: run the GPU integration suite (I1–I7). |
+| **PA.1** | phased pipeline: plan → fan-out → parallel → gather on a canned task; boss authors BluePrint, harness routes | **PA.1a+b DONE (2026-06-11):** boss PLAN → parseable work-order, then fan-out → 4 lanes generate their pieces in the gate'd packed loop (`-p "task"`), verified on flappy-bird. **Straggler measured**: an unbalanced boss piece (~1500 tok vs ~280/worker) gave 11 tok/s — *slower than sequential* — so balanced pieces / light-boss-scaffolding are required (risk #2). **PA.1c DONE (2026-06-14):** gather implemented + built + GPU-free `--gather-test` green (10/10). Boss merges worker outputs into one artifact via a fresh-seq chat-turn decode; `--out` writes it; wired into **both** the streaming (default) and `--no-stream` pipelines through a shared `finish_gather()`. Bugs caught on first build and fixed — gather was wired into `--no-stream` only; the merge injected onto stale seq KV (corrupt attention); a format-string UB in the self-test — see [`PA1C_GATHER_DESIGN.md`](PA1C_GATHER_DESIGN.md) §Implementation status. **Also fixed (2026-06-14): the streaming (default) path never started any worker** when the boss dropped the leading `<<<` on the PLAN line — the shared block was keyed on `<<<PLAN`, so it was never cached (`prefix 0 tok`) and no lane ever launched. Shared extraction now takes the blueprint before the first `<<<PIECE` and no longer requires `<<<PLAN` (both pipelines). Remaining: run the GPU integration suite (I1–I7). |
 | **PA.2** | work-queue refill: worker signals done → harness prefills the next backlog piece into the freed lane | **DONE (2026-06-11):** `--pool` mechanism (34.2 tok/s, 1.77×) + **end-to-end** (boss plan → pool, 8 correct functions) + **PA.2.1 prefix cache** (clone the cached starter per lane, delta-prefill the item; prefill 13.6→6.2s). Q8 KV default → **128k verified**. Tiny-item floor + plan tax noted (POSITIVE_RESULTS §12). Remaining: boss-queue/messages = PA.4. |
 | **PA.3** | speculation stacking (MTP/lookup per stream, `n_seq_max=8`) | ~2.4× aggregate; per-lane output still reproducible |
 | **PA.4** | bidirectional coordination: worker `ASK`→boss `REPLY`, plus boss GUIDE/KILL (independent of PA.3) | a worker blocked on an ambiguous spec gets an answer and finishes; boss kills+retries a sabotaged runaway within N tokens; Q&A stays within `q_budget` |
-| **PA.5** | worker tool-calls — autonomous `write_file` (§8.3) | a worker writes its own file via a tool call the harness executes; gather verifies the tree + runs the smoke test (no text funnel) |
+| **PA.5** | worker tool-calls — autonomous file creation (§8.3) | **v1 DONE (2026-06-14):** nanocoder-style `<create_file>` / `<execute_bash>` calls (`--tools` / `--allow-run`), sandboxed to `--work-dir` with a destructive-command guard; results folded into the gather context. Parser + guard unit-tested (`--gather-test` T1–T4). Remaining: live mid-stream round-trip (worker iterates on test output) + end-lane-on-tool-call. |
 
 **Immediate next action:** PA.0 is built (`make agents`), measured (**~1.9×** at N=4,
 37.4 tok/s packed), the **byte-identity gate PASSES at N=4**, and the lane count is now
@@ -557,7 +586,11 @@ tighten the boss to scaffolding-only + stronger language/exports adherence, and 
 - **Orchestration:** one C++ binary (`pti_agents`), harness-routed; all lanes in one
   `llama_context`. No tool-call round-trips, no external orchestrator in v1.
 - **Task shape:** boss chooses function / file / role per task via a selection rubric
-  (§5.1); not hard-coded.
+  (§5.1); not hard-coded. **Size floor (2026-06-14): every piece is at least a full class or
+  module** (a cohesive component + its tests), never a lone function — the boss prompt now
+  enforces this and prefers the `file` strategy. Bigger, balanced pieces cut per-item overhead
+  and the plan-tax-vs-work ratio; verified the boss picks `strategy=file` with class-sized
+  pieces on the Stack task.
 - **Boss is a fourth worker,** not an idle dispatcher — this is what buys 2.15× over 1.6×.
   Sharper (PA.2): "boss" is the *role* seq 0 plays at the bookends (PLAN, GATHER); once its
   light scaffolding is done it pulls from the same queue as any worker, so no lane idles

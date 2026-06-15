@@ -24,7 +24,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <regex>
 #include <string>
+#include <sys/wait.h>
 #include <vector>
 
 #define MAX_STREAMS   16
@@ -43,6 +46,9 @@ static bool g_no_think     = false;   // --no-think: force a closed empty <think
                                       // generation prompt so boss+workers skip reasoning (faster, esp. the plan)
 static char g_out_path[512] = {};     // --out: write final artifact to this file
 static bool g_no_gather    = false;   // --no-gather: skip gather phase, print pieces separately
+static bool g_tools        = false;   // --tools: let workers emit <function=...> tool calls (write_file/run)
+static bool g_allow_run    = false;   // --allow-run: permit the `run` verb (sandboxed shell exec); implies --tools
+static char g_work_dir[512] = "pti_work";  // --work-dir: sandbox dir for write_file / run
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
     if (g_verbose_logs) { fputs(text, stderr); return; }
@@ -474,6 +480,14 @@ static WorkOrder parse_work_order(const std::string &text) {
     }
     if (have_cur) flush_piece();
     if (sect == SHARED && wo.shared.empty()) wo.shared = extract_blueprint(buf);
+    // Robustness: if the PLAN marker was malformed (model drops the leading <<< on PLAN),
+    // the shared block never got captured — recover it from the blueprint before piece 1.
+    if (wo.shared.empty()) {
+        size_t fp = text.find("<<<PIECE"), fs = text.find("<<<SELF");
+        size_t f = std::min(fp == std::string::npos ? text.size() : fp,
+                            fs == std::string::npos ? text.size() : fs);
+        wo.shared = extract_blueprint(text.substr(0, f));
+    }
 
     if (wo.pieces.empty()) { wo.error = "no pieces parsed"; return wo; }
     for (auto &p : wo.pieces)
@@ -588,11 +602,14 @@ static const char *BOSS_PROMPT =
     "never another worker or you. Workers are FULL, CAPABLE models: give each a meaty,\n"
     "clearly-specified chunk and it will handle it.\n\n"
     "Decompose the user's coding task into a HANDFUL of SUBSTANTIAL, independent, balanced\n"
-    "items — each one a <<<PIECE>>>. Right-size them: NOT trivial one-liners (tiny items waste\n"
-    "time on per-item overhead) and NOT one giant item (it stragglers the batch). Group related\n"
-    "functions into a single item, or give an involved component per item; aim for a few\n"
-    "similar-sized pieces. Pick a split strategy: function (related functions grouped per item\n"
-    "over one shared interface), file (one module per item), or role (impl/tests/docs).\n\n"
+    "items — each one a <<<PIECE>>>. SIZE FLOOR: every item is AT LEAST a full class or module —\n"
+    "a cohesive component with several methods/functions AND its own tests. NEVER a single\n"
+    "function and never a one-liner (tiny items waste time on per-item overhead). When unsure,\n"
+    "make pieces BIGGER: a whole class, a whole module, or a whole subsystem per item — err\n"
+    "toward fewer, meatier pieces. Avoid one giant item that stragglers the batch, but a class\n"
+    "is the minimum unit. Pick a split strategy: file (one module/class per item — PREFER THIS),\n"
+    "function (several related functions grouped per item over one shared interface), or role\n"
+    "(impl/tests/docs over one target).\n\n"
     "Output EXACTLY this envelope, one <<<PIECE>>> per work item, nothing after <<<END>>>\n"
     "(UPPERCASE = placeholders):\n\n"
     "<<<PLAN strategy=STRATEGY lang=LANG>>>\n"
@@ -627,10 +644,29 @@ static const char *WORKER_PREAMBLE =
     "else — no prose, no other functions, no re-declaring the shared interface. Match the\n"
     "declared signatures exactly. Output only code.";
 
+// Tool-call instructions appended to the worker preamble when --tools is set. Format and verb
+// names match nanocoder's XML convention (../nanocoder, source/app/prompts + source/tools):
+// the tool name is the tag, parameters are nested tags.
+static std::string worker_preamble_text() {
+    std::string p = WORKER_PREAMBLE;
+    if (g_tools) {
+        p += "\n\nYou MAY call tools to act on the filesystem. Emit calls in EXACTLY this XML "
+             "format (the tool NAME is the tag; each parameter is a nested tag):\n"
+             "<create_file>\n<path>relative/path.ext</path>\n<content>\n"
+             "...the full file contents...\n</content>\n</create_file>\n"
+             "- create_file — write your implementation (and its tests) to a file. RELATIVE paths only.";
+        if (g_allow_run)
+            p += "\n<execute_bash>\n<command>npm test</command>\n</execute_bash>\n"
+                 "- execute_bash — run a quick check or your tests; the output is captured and shown to the coordinator.";
+        p += "\nUse the tools to write your files, then also output the code inline as usual.";
+    }
+    return p;
+}
+
 // the common system turn (preamble + shared interface) — identical for every item in a job,
 // so its rendered+tokenized form is the cacheable prefix (PA.2.1).
 static std::string build_worker_system(const WorkOrder &wo) {
-    return std::string(WORKER_PREAMBLE) + "\n\nShared interface (rely on these):\n" + wo.shared;
+    return worker_preamble_text() + "\n\nShared interface (rely on these):\n" + wo.shared;
 }
 static std::string build_prefix(const WorkOrder &wo) {
     return apply_chat_template({ {"system", build_worker_system(wo)} }, /*add_ass=*/false);
@@ -813,6 +849,137 @@ static void write_artifact(const std::string &artifact) {
     }
 }
 
+// ───────────────────────── PA.5: worker tool-calls (§8.3) ────────────────────
+// Workers may emit nanocoder-style XML tool calls (see ../nanocoder): the tool name
+// is the tag, parameters are nested tags. The harness executes a small allowlist —
+// create_file (sandboxed to --work-dir) and execute_bash (gated behind --allow-run,
+// run inside --work-dir with a timeout + a destructive-command guard).
+struct ToolCall {
+    std::string name;
+    std::vector<std::pair<std::string,std::string>> params;
+};
+static std::string tc_param(const ToolCall &c, const std::string &k) {
+    for (auto &p : c.params) if (p.first == k) return p.second;
+    return "";
+}
+
+// Parse <tool>...<param>value</param>...</tool> for the KNOWN tool names only (so a
+// stray <div> etc. in worker code is never mistaken for a tool call).
+static std::vector<ToolCall> parse_tool_calls(const std::string &text) {
+    static const char *TOOLS[] = { "create_file", "execute_bash" };
+    std::vector<ToolCall> calls;
+    for (const char *tool : TOOLS) {
+        std::string open = std::string("<") + tool + ">", close = std::string("</") + tool + ">";
+        size_t pos = 0;
+        while (true) {
+            size_t o = text.find(open, pos);
+            if (o == std::string::npos) break;
+            size_t c = text.find(close, o + open.size());
+            if (c == std::string::npos) break;
+            std::string inner = text.substr(o + open.size(), c - (o + open.size()));
+            ToolCall call; call.name = tool;
+            size_t pp = 0;
+            while (true) {                                   // nested <key>value</key> params
+                size_t k0 = inner.find('<', pp);
+                if (k0 == std::string::npos) break;
+                size_t k1 = inner.find('>', k0);
+                if (k1 == std::string::npos) break;
+                std::string key = trim(inner.substr(k0 + 1, k1 - (k0 + 1)));
+                if (key.empty() || key[0] == '/') { pp = k1 + 1; continue; }   // skip close tags
+                std::string kclose = "</" + key + ">";
+                size_t v1 = inner.find(kclose, k1 + 1);
+                if (v1 == std::string::npos) { pp = k1 + 1; continue; }
+                std::string val = inner.substr(k1 + 1, v1 - (k1 + 1));
+                if (!val.empty() && val.front() == '\n') val.erase(0, 1);
+                if (!val.empty() && val.back()  == '\n') val.pop_back();
+                call.params.push_back({ key, val });
+                pp = v1 + kclose.size();
+            }
+            calls.push_back(call);
+            pos = c + close.size();
+        }
+    }
+    return calls;
+}
+
+// Destructive-command guard for execute_bash — mirrors nanocoder's blocklist.
+static bool is_dangerous_cmd(const std::string &cmd) {
+    static const std::regex pats[] = {
+        std::regex(R"(rm\s+-rf\s+/(?!\w))", std::regex::icase),  // rm -rf / (but allow /path)
+        std::regex("mkfs", std::regex::icase),
+        std::regex(R"(dd\s+if=)", std::regex::icase),
+        std::regex(R"(:\(\)\{:\|:&\};:)"),                       // fork bomb
+        std::regex(R"(>\s*/dev/sd[a-z])", std::regex::icase),
+        std::regex(R"(chmod\s+-R\s+000)", std::regex::icase),
+    };
+    for (auto &p : pats) if (std::regex_search(cmd, p)) return true;
+    return false;
+}
+
+// Resolve a worker-supplied path inside the work dir; reject absolute / traversal.
+static bool safe_join(const std::string &rel, std::filesystem::path &out) {
+    if (rel.empty() || rel.front() == '/') return false;
+    if (rel.find("..") != std::string::npos) return false;
+    out = std::filesystem::path(g_work_dir) / rel;
+    return true;
+}
+
+// Execute the tool calls in each worker's output; return a textual report (files
+// written + command output) that gets folded into the gather context.
+static std::string run_worker_tools(
+    const std::vector<std::pair<std::string,std::string>> &worker_results) {
+    namespace fs = std::filesystem;
+    std::error_code ec; fs::create_directories(g_work_dir, ec);
+    std::string report;
+    for (auto &wr : worker_results) {
+        for (auto &c : parse_tool_calls(wr.second)) {
+            if (c.name == "create_file") {
+                std::string rel = tc_param(c, "path");
+                if (rel.empty()) rel = tc_param(c, "file_path");
+                std::string content = tc_param(c, "content");
+                fs::path p;
+                if (!safe_join(rel, p)) {
+                    fprintf(stderr, "  ⚠ %s: create_file rejected unsafe path '%s'\n", wr.first.c_str(), rel.c_str());
+                    report += "  [" + wr.first + "] create_file REJECTED (unsafe path: " + rel + ")\n";
+                    continue;
+                }
+                fs::create_directories(p.parent_path(), ec);
+                FILE *fp = fopen(p.string().c_str(), "w");
+                if (fp) { fwrite(content.data(), 1, content.size(), fp); fclose(fp);
+                    fprintf(stderr, "  ✎ %s wrote %s (%zu bytes)\n", wr.first.c_str(), p.string().c_str(), content.size());
+                    report += "  [" + wr.first + "] wrote " + p.string() + " (" + std::to_string(content.size()) + " bytes)\n";
+                } else {
+                    report += "  [" + wr.first + "] create_file FAILED: " + p.string() + "\n";
+                }
+            } else if (c.name == "execute_bash") {
+                std::string cmd = trim(tc_param(c, "command"));
+                if (cmd.empty()) continue;
+                if (!g_allow_run) {
+                    fprintf(stderr, "  ⏭ %s: execute_bash skipped (--allow-run off): %s\n", wr.first.c_str(), cmd.c_str());
+                    report += "  [" + wr.first + "] execute_bash SKIPPED (--allow-run off): " + cmd + "\n";
+                    continue;
+                }
+                if (is_dangerous_cmd(cmd)) {
+                    fprintf(stderr, "  ⛔ %s: blocked destructive command: %s\n", wr.first.c_str(), cmd.c_str());
+                    report += "  [" + wr.first + "] execute_bash BLOCKED (destructive): " + cmd + "\n";
+                    continue;
+                }
+                std::string full = "cd " + std::string(g_work_dir) + " && timeout 60 " + cmd + " 2>&1";
+                fprintf(stderr, "  ▶ %s: execute_bash `%s`\n", wr.first.c_str(), cmd.c_str());
+                FILE *pp = popen(full.c_str(), "r");
+                if (!pp) { report += "  [" + wr.first + "] execute_bash FAILED to start: " + cmd + "\n"; continue; }
+                std::string out; char buf[4096]; size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), pp)) > 0) out.append(buf, n);
+                int rc = pclose(pp); int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+                fputs(out.c_str(), stderr);
+                if (out.size() > 2000) out = out.substr(0, 2000) + "\n...[truncated]...";
+                report += "  [" + wr.first + "] ran `" + cmd + "` -> exit " + std::to_string(code) + ":\n" + out + "\n";
+            }
+        }
+    }
+    return report;
+}
+
 // Drive the gather→write step shared by both pipelines: build the gather prompt,
 // run the boss merge, strip the fence, emit the artifact. n_lanes is the worker
 // lane count (n_seq_max = n_lanes + 1, the +1 being the prefix-cache seq).
@@ -820,6 +987,14 @@ static void finish_gather(const WorkOrder &wo,
                           const std::vector<std::pair<std::string,std::string>> &worker_results,
                           const std::string &boss_self_output, int n_lanes) {
     std::string gprompt    = build_gather_prompt(wo, worker_results, boss_self_output);
+    if (g_tools) {
+        fprintf(stderr, "\n── PA.5 TOOLS — executing worker tool calls (work-dir: %s, run %s) ──\n",
+                g_work_dir, g_allow_run ? "ENABLED" : "disabled");
+        std::string report = run_worker_tools(worker_results);
+        if (!report.empty())
+            gprompt += "\n\n<<<TOOL_RESULTS>>>\nFiles written / commands run by the workers "
+                       "(sandboxed in '" + std::string(g_work_dir) + "'):\n" + report + "<<<END_TOOL_RESULTS>>>\n";
+    }
     int total_ctx  = (int)llama_n_ctx(G.ctx);
     int max_gather = (total_ctx / (n_lanes + 1)) / 2;   // generous cap for the merge
     if (max_gather < 512) max_gather = 512;
@@ -944,7 +1119,39 @@ static int gather_self_test() {
         if (!ok) fail++;
     }
 
-    fprintf(stderr, "  %s (%d/10 passed)\n", fail == 0 ? "ALL PASS" : "SOME FAILED", 10 - fail);
+    // ── PA.5 tool-call parser + safety guard (nanocoder-style <tool><param>…) ──
+    // T1: create_file with path + content
+    {
+        std::string in = "<create_file>\n<path>src/a.js</path>\n<content>\nconst a=1;\n</content>\n</create_file>";
+        auto calls = parse_tool_calls(in);
+        bool ok = calls.size() == 1 && calls[0].name == "create_file" &&
+                  tc_param(calls[0], "path") == "src/a.js" && tc_param(calls[0], "content") == "const a=1;";
+        fprintf(stderr, "  T1 parse create_file: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) fail++;
+    }
+    // T2: execute_bash with command
+    {
+        auto calls = parse_tool_calls("<execute_bash><command>node test.js</command></execute_bash>");
+        bool ok = calls.size() == 1 && calls[0].name == "execute_bash" &&
+                  tc_param(calls[0], "command") == "node test.js";
+        fprintf(stderr, "  T2 parse execute_bash: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) fail++;
+    }
+    // T3: stray <div> etc. is NOT a tool call (known-tools-only)
+    {
+        bool ok = parse_tool_calls("render() { return <div>hi</div>; }").empty();
+        fprintf(stderr, "  T3 ignores unknown tags: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) fail++;
+    }
+    // T4: destructive-command guard (mirrors nanocoder's blocklist)
+    {
+        bool ok = is_dangerous_cmd("rm -rf /") && is_dangerous_cmd("mkfs.ext4 /dev/sda") &&
+                  !is_dangerous_cmd("npm test") && !is_dangerous_cmd("rm -rf /tmp/build");
+        fprintf(stderr, "  T4 dangerous-cmd guard: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) fail++;
+    }
+
+    fprintf(stderr, "  %s (%d/14 passed)\n", fail == 0 ? "ALL PASS" : "SOME FAILED", 14 - fail);
     return fail > 0 ? 3 : 0;
 }
 
@@ -978,7 +1185,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
 
     auto cache_prefix = [&](const std::string &sh) -> bool {
         std::string pfx = apply_chat_template({ {"system",
-            std::string(WORKER_PREAMBLE) + "\n\nShared interface (rely on these):\n" + sh} }, false);
+            worker_preamble_text() + "\n\nShared interface (rely on these):\n" + sh} }, false);
         prefix_toks.assign(pfx.size() + 16, 0);
         int pn = llama_tokenize(G.vocab, pfx.c_str(), (int32_t)pfx.size(),
                                 prefix_toks.data(), (int32_t)prefix_toks.size(), true, true);
@@ -1011,14 +1218,15 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
     auto pump_boss = [&]() {
         std::string &bp = lanes[BOSS].text;
         if (!prefix_cached) {
-            size_t fp = bp.find("<<<PIECE"), pl = bp.find("<<<PLAN");
-            if (fp != std::string::npos && pl != std::string::npos) {
-                size_t ple = bp.find(">>>", pl);
-                if (ple != std::string::npos && ple < fp) {
-                    shared = extract_blueprint(bp.substr(ple + 3, fp - (ple + 3)));
-                    if (cache_prefix(shared)) { prefix_cached = true;
-                        fprintf(stderr, "\n  [shared cached: %d tok — workers can start]\n", prefix_len); }
-                }
+            // Shared block = the <blueprint> before the first <<<PIECE. Do NOT require a
+            // literal <<<PLAN marker: the model sometimes drops the leading <<< on the PLAN
+            // line (while emitting <<<PIECE / <<<END correctly), which used to stall the whole
+            // run — no shared cached → prefix 0 tok → no worker ever starts.
+            size_t fp = bp.find("<<<PIECE");
+            if (fp != std::string::npos) {
+                shared = extract_blueprint(bp.substr(0, fp));
+                if (cache_prefix(shared)) { prefix_cached = true;
+                    fprintf(stderr, "\n  [shared cached: %d tok — workers can start]\n", prefix_len); }
             }
         }
         for (;;) {
@@ -1047,7 +1255,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
         if (!q.language.empty()) user += " (" + q.language + ")";
         user += ": " + q.instruction + "\n\nSpec:\n" + q.blueprint;
         std::string full = apply_chat_template({ {"system",
-            std::string(WORKER_PREAMBLE) + "\n\nShared interface (rely on these):\n" + shared}, {"user", user} }, true);
+            worker_preamble_text() + "\n\nShared interface (rely on these):\n" + shared}, {"user", user} }, true);
         if (g_no_think) full += "<think>\n\n</think>\n\n";
         std::vector<llama_token> ft(full.size() + 16);
         int fn = llama_tokenize(G.vocab, full.c_str(), (int32_t)full.size(), ft.data(), (int32_t)ft.size(), true, true);
@@ -1169,8 +1377,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--out")     && i+1 < argc) strncpy(g_out_path, argv[++i], sizeof(g_out_path)-1);
         else if (!strcmp(argv[i], "--no-gather")) g_no_gather = true;
         else if (!strcmp(argv[i], "--gather-test")) gather_test = true;
+        else if (!strcmp(argv[i], "--tools")) g_tools = true;
+        else if (!strcmp(argv[i], "--allow-run")) { g_allow_run = true; g_tools = true; }  // run implies tools
+        else if (!strcmp(argv[i], "--work-dir") && i+1 < argc) strncpy(g_work_dir, argv[++i], sizeof(g_work_dir)-1);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test

@@ -111,4 +111,6 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   Q8 KV → 128k verified.
 - **PA.3** — speculation stacking (MTP per stream), measure ~2.4× aggregate.
 - **PA.4** — checkpoint rounds / mid-flight coordination.
-- **PA.5** — worker tool-calls (autonomous `write_file`).
+- **PA.5** ✓ *v1 (2026-06-14)* — worker tool-calls: nanocoder-style `<create_file>` /
+  `<execute_bash>` (`--tools` / `--allow-run`), sandboxed to `--work-dir`. create_file verified
+  end-to-end (workers wrote stack.js + test.js; the generated tests pass).
