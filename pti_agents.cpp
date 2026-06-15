@@ -62,6 +62,7 @@ static float    g_temp     = -1.0f;   // -t: override temperature for both roles
 static uint32_t g_seed     = 42;      // base seed; lane L uses g_seed + L (per-stream streams)
 static bool     g_general  = false;   // --general: boss uses thinking-general temps (1.0) vs coding (0.6)
 static bool     g_greedy   = false;   // resolved: true under --mtp (greedy speculative decode)
+static int      g_repair_budget = 2;  // --repair-budget: max verify→repair rounds (PA.4c)
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
     if (g_verbose_logs) { fputs(text, stderr); return; }
@@ -1318,6 +1319,8 @@ static int coord_self_test() {
     return fail > 0 ? 5 : 0;
 }
 
+static std::string read_file_str(const std::string &path);   // defined in the PA.6 block below
+
 // PA.4: files-on-disk finalize + the "test verifier" (replaces merge-gather under --tools).
 //   1) STORE modules to disk; 2) TEST-GEN: a test task per module (given its file + the design),
 //   run as a second pool; 3) STORE tests; 4) VERIFY: run every *.test.js (done only when green).
@@ -1362,35 +1365,78 @@ static void finalize_verify(const WorkOrder &wo,
         run_worker_tools(test_results);
     }
 
-    // ── VERIFY: run every *.test.js ──
-    std::vector<std::string> tests;
-    for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) break;
-        if (it->is_regular_file(ec)) {
-            std::string n = it->path().filename().string();
-            if (n.size() >= 8 && n.substr(n.size() - 8) == ".test.js") tests.push_back(it->path().string());
+    // ── VERIFY + REPAIR (PA.4c): run all tests; on failure amend the module & re-verify ──
+    struct TestRes { std::string rel; bool ok; std::string out; };
+    auto run_all_tests = [&]() {
+        std::vector<TestRes> res; std::vector<std::string> tests;
+        for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
+             it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            if (it->is_regular_file(ec)) { std::string n = it->path().filename().string();
+                if (n.size() >= 8 && n.substr(n.size()-8) == ".test.js") tests.push_back(it->path().string()); }
         }
+        std::sort(tests.begin(), tests.end());
+        for (auto &t : tests) {
+            std::string rel = fs::relative(t, g_work_dir, ec).string();
+            std::string cmd = "cd '" + std::string(g_work_dir) + "' && timeout 30 node '" + rel + "' 2>&1";
+            FILE *pp = popen(cmd.c_str(), "r");
+            std::string out; if (pp){ char b[4096]; size_t k; while((k=fread(b,1,sizeof(b),pp))>0) out.append(b,k); }
+            int rc = pp ? pclose(pp) : -1; int code = (pp && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
+            res.push_back({ rel, code == 0, out });
+        }
+        return res;
+    };
+    auto list_modules = [&]() {
+        std::vector<std::string> mods;
+        for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
+             it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            if (!it->is_regular_file(ec)) continue;
+            std::string n = it->path().filename().string();
+            if (n.size() >= 3 && n.substr(n.size()-3) == ".js" && !(n.size()>=8 && n.substr(n.size()-8)==".test.js"))
+                mods.push_back(it->path().string());
+        }
+        return mods;
+    };
+
+    for (int round = 0; ; round++) {
+        std::vector<TestRes> res = run_all_tests();
+        fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s) ══\n", round ? " (re-check)" : "", (int)res.size());
+        if (res.empty()) { fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify\n"); return; }
+        int passed = 0; std::vector<TestRes> fails;
+        for (auto &r : res) {
+            if (r.ok) { passed++; fprintf(stderr, "  [PASS] %s\n", r.rel.c_str()); }
+            else { fails.push_back(r); fprintf(stderr, "  [FAIL] %s\n", r.rel.c_str());
+                   std::string o = r.out; if (o.size() > 300) o = o.substr(0,300) + "..."; if (!o.empty()) fprintf(stderr, "      %s\n", o.c_str()); }
+        }
+        RepairAction act = repair_verdict(round, g_repair_budget, (int)fails.size());
+        if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
+        if (act == RA_GIVEUP) { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d repair round(s) ══\n", passed, (int)res.size(), g_repair_budget); break; }
+
+        // RA_REPAIR: amend each failing module (given its file + the test + the error), then re-verify
+        fprintf(stderr, "\n══ PA.4c REPAIR round %d/%d — amending %d failing module(s) ══\n", round+1, g_repair_budget, (int)fails.size());
+        std::vector<std::string> mods = list_modules(), aitems, aids;
+        for (auto &r : fails) {
+            std::string testfn = std::filesystem::path(r.rel).filename().string();
+            std::string modpath = module_for_test(testfn, mods);
+            if (modpath.empty()) { fprintf(stderr, "  (no module maps to %s — skip)\n", testfn.c_str()); continue; }
+            std::string base = testfn; size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
+            std::string modrel = fs::relative(modpath, g_work_dir, ec).string();
+            std::string user = build_amend_user(base, modrel, read_file_str(modpath),
+                                                read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out);
+            std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
+            if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
+            aitems.push_back(sp); aids.push_back(modrel);
+        }
+        if (aitems.empty()) { fprintf(stderr, "  nothing repairable; stopping\n"); break; }
+        std::vector<std::string> aouts; run_pool(aitems, n_lanes, max_new, &aouts, "");
+        std::vector<std::pair<std::string,std::string>> ares;
+        for (size_t i = 0; i < aids.size() && i < aouts.size(); i++) {
+            std::string b = aouts[i]; size_t t = b.find("</think>"); if (t != std::string::npos) b = b.substr(t + 8);
+            ares.push_back({ aids[i], trim(b) });
+        }
+        run_worker_tools(ares);   // overwrite the fixed modules; loop re-verifies
     }
-    std::sort(tests.begin(), tests.end());
-    fprintf(stderr, "\n══ PA.4 VERIFY — test verifier: %d test file(s) ══\n", (int)tests.size());
-    if (tests.empty()) { fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify\n"); return; }
-    int passed = 0;
-    for (auto &t : tests) {
-        std::string rel = fs::relative(t, g_work_dir, ec).string();
-        std::string cmd = "cd '" + std::string(g_work_dir) + "' && timeout 30 node '" + rel + "' 2>&1";
-        FILE *pp = popen(cmd.c_str(), "r");
-        std::string out; if (pp) { char b[4096]; size_t k; while ((k = fread(b,1,sizeof(b),pp)) > 0) out.append(b,k); }
-        int rc = pp ? pclose(pp) : -1; int code = (pp && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
-        bool ok = (code == 0);
-        passed += ok ? 1 : 0;
-        std::string tail = ok ? "" : ("  (exit " + std::to_string(code) + ")");
-        fprintf(stderr, "  %s %s%s\n", ok ? "[PASS]" : "[FAIL]", rel.c_str(), tail.c_str());
-        if (!ok && !out.empty()) { if (out.size() > 400) out = out.substr(0,400) + "..."; fprintf(stderr, "      %s\n", out.c_str()); }
-    }
-    fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — %s ══\n",
-            passed, (int)tests.size(),
-            passed == (int)tests.size() ? "DONE (all green)" : "NOT all passing (repair loop = PA.4c)");
 }
 
 // ───────────────────────── PA.6: staged design→build pipeline ─────────────────
@@ -1958,9 +2004,10 @@ int main(int argc, char **argv) {
         else if ((!strcmp(argv[i], "-t") || !strcmp(argv[i], "--temp")) && i+1 < argc) g_temp = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
         else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
+        else if (!strcmp(argv[i], "--repair-budget") && i+1 < argc) g_repair_budget = atoi(argv[++i]);  // PA.4c
         else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--all-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--all-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--repair-budget N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
