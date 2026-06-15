@@ -1465,6 +1465,20 @@ static std::string build_impl_task(const Piece &p, const std::string &goal) {
     return s;
 }
 
+// RECONCILE: the boss unifies the parallel (possibly-conflicting) blueprints into ONE
+// authoritative interface contract that all implementers obey (fixes cross-component drift).
+static std::string build_reconcile_user(const std::string &goal, const std::string &blueprints) {
+    return "The DESIGNERS independently proposed the component blueprints below. They likely CONFLICT "
+           "on shared signatures (constructor shapes, method names/args, who owns input/score, "
+           "canvas vs context, module system). Produce ONE AUTHORITATIVE INTERFACE CONTRACT that every "
+           "implementer MUST follow.\n\n" + goal + "\nProposed blueprints:\n" + blueprints +
+           "\n\nResolve EVERY cross-component conflict decisively. State, per component, the exact "
+           "exported name + method signatures (names, params, returns). Pin the GLOBAL decisions all "
+           "files share: (1) MODULE SYSTEM = CommonJS (module.exports / require) so `node <file>.test.js` "
+           "works; (2) how components are instantiated/wired; (3) who handles input and who owns score; "
+           "(4) the canvas/context convention. Output the contract as concise markdown — no preamble, no code.";
+}
+
 // strip a leading <think>…</think> from a worker output
 static std::string strip_think(const std::string &in) {
     size_t t = in.find("</think>");
@@ -1499,7 +1513,31 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
     run_worker_tools(dres);
     g_worker_think = sv_wt; g_worker_sp = sv_sp;   // restore (implementers = instruct)
 
-    // ── IMPLEMENT pool (parallel, instruct) → modules, reading the blueprints ──
+    // ── RECONCILE (boss, serial but bounded): unify the parallel blueprints into ONE
+    //    authoritative interface contract → design/INTERFACE.md, appended to the goal so every
+    //    implementer obeys the SAME signatures (fixes the cross-component drift). ──
+    {
+        namespace fs = std::filesystem; std::error_code ec;
+        std::string bps, ddir = std::string(g_work_dir) + "/design";
+        for (auto it = fs::directory_iterator(ddir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            std::string n = it->path().filename().string();
+            if (n == "INTERFACE.md") continue;
+            bps += "=== " + n + " ===\n" + read_file_str(it->path().string()) + "\n";
+        }
+        if (!bps.empty()) {
+            std::string rprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", build_reconcile_user(goal, bps)} });
+            fprintf(stderr, "\n══ PA.6 RECONCILE — boss unifying the interface contract ══\n");
+            std::string contract = strip_think(boss_generate(rprompt, 3072));   // boss thinks (resolve conflicts), bounded
+            FILE *cf = fopen((ddir + "/INTERFACE.md").c_str(), "w");
+            if (cf) { fputs(contract.c_str(), cf); fclose(cf);
+                fprintf(stderr, "\n── wrote design/INTERFACE.md (%zu chars) ──\n", contract.size()); }
+            goal += "\n\n=== AUTHORITATIVE INTERFACE CONTRACT (obey EXACTLY; overrides individual blueprints) ===\n"
+                  + contract + "\n";
+        }
+    }
+
+    // ── IMPLEMENT pool (parallel, instruct) → modules, reading the contract + blueprints ──
     std::vector<std::string> iitems, iids;
     for (auto &p : wo.pieces) { iitems.push_back(build_impl_task(p, goal)); iids.push_back(p.id); }
     fprintf(stderr, "\n══ PA.6 IMPLEMENT — %d implementers (parallel) ══\n", (int)iitems.size());

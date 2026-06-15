@@ -37,13 +37,25 @@ Boss TRIAGE (light, fast — little/no deep thinking)
     → GOAL BLUEPRINT: the component map + how they connect + per-worker assignments
         ↓   every lane carries the goal blueprint + "you are X, here is where you fit"
 DESIGN pool   (parallel, THINKING)   each designer writes design/<comp>.blueprint
-        ↓   harness seeds each lane with the goal blueprint + sibling blueprints (read-file→inject)
-IMPLEMENT pool (parallel, instruct)  each writes src/<comp>.js against its + siblings' blueprints
+        ↓
+RECONCILE     (boss, serial-bounded) unify the blueprints → design/INTERFACE.md (the CONTRACT)
+        ↓   harness seeds each lane with the goal blueprint + the CONTRACT (+ blueprints)
+IMPLEMENT pool (parallel, instruct)  each writes src/<comp>.js against the CONTRACT
         ↓
 TEST-GEN pool (parallel)             a test per module (given the file + its blueprint)  [PA.4b]
         ↓
 VERIFY → done when green; failures → repair loop  [PA.4c]
 ```
+
+**Why RECONCILE (added 2026-06-15, validated):** the first PA.6 run proved that parallel designers
+keep the high-level *structure* coherent (via the goal blueprint) but **drift on signatures** — the
+verify failed with `this.canvas.addEventListener is not a function` (a canvas-vs-context mismatch
+between `index` and `renderer`), exactly as the blueprint review predicted. So after the parallel
+DESIGN pool, the boss does ONE bounded **reconcile** pass that merges the proposed blueprints into a
+single authoritative interface contract (canonical signatures + global decisions: **module system =
+CommonJS** so `node` tests run, wiring, input/score owner, canvas/ctx). Implementers obey the
+contract, not five mutually-inconsistent specs. Reconcile is serial but *merges* (it doesn't invent),
+so it's far lighter than the old upfront full-plan think.
 
 Only the **triage** is serial, and it is deliberately *light* (a component map, not a full design).
 The expensive **design thinking is parallel** — exactly where packing wins, and where the per-token
@@ -161,6 +173,20 @@ N modules, test/ has N tests, verifier runs, wall < serial baseline.
 
 Out of scope (v1): mid-flight blueprint renegotiation, a dedicated critic lane, streaming-path
 staging.
+
+### Future idea — parallel pairwise reconcile (round-robin / orthogonal array) (user, 2026-06-15)
+
+The v1 reconcile is one serial boss pass (bounded, but serial — the new long pole). Most interface
+conflicts are **pairwise** (A's assumed view of B vs B's actual). So reconcile could itself be
+parallelized: schedule **pairwise reconcile tasks** round-robin-tournament style — `(A,B),(C,D)…` in
+round 1, rotate to `(A,C),(B,D)…` in round 2 — so **N/2 disjoint pairs run in parallel each round**,
+and N−1 rounds cover all C(N,2) pairs. A **Taguchi / orthogonal array** prunes that to the few rounds
+that still cover the important interactions (no full factorial). Each pair agrees its shared boundary
+and writes it to the contract (the blackboard); a final light merge assembles the global contract.
+Caveats: pairwise agreements can be **globally inconsistent** → iterate to convergence; and schedule
+by the **actual dependency graph** from the goal blueprint (a hub like `engine` must pair with
+everyone; a mesh benefits most from the orthogonal-array pruning). Explore after single-pass reconcile
+is validated.
 
 ### Future idea — worker self-splits an oversized piece (user, 2026-06-15)
 
