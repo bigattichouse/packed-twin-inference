@@ -5,9 +5,12 @@ on the multi-file Flappy task) — by **parallelizing the design phase**, and ke
 production default**. The packed team's win was never raw decode speed; it's doing the *thinking*
 (design) and the *implementation* in parallel, then shipping **verified** multi-file code.
 
-**Status**: design. Synthesizes the 2026-06-15 conversation. Builds on PA.2 (pool+refill), PA.4
-(files-on-disk + test verifier + repair), PA.5 (tools). Supersedes the "one boss thinks the whole
-plan" model in PACKED_AGENTS_DESIGN §5.
+**Status**: design + **IMPLEMENTED (2026-06-15, increment 1–4)** — `run_pipeline_staged` (triage →
+parallel design pool → parallel implement pool → test-gen + verify) on the `--tools --no-stream`
+path; build clean + GPU-free tests green; GPU end-to-end verification pending. Synthesizes the
+2026-06-15 conversation. Builds on PA.2 (pool+refill), PA.4 (files-on-disk + test verifier +
+repair), PA.5 (tools). Supersedes the "one boss thinks the whole plan" model in
+PACKED_AGENTS_DESIGN §5.
 
 ---
 
@@ -158,3 +161,12 @@ N modules, test/ has N tests, verifier runs, wall < serial baseline.
 
 Out of scope (v1): mid-flight blueprint renegotiation, a dedicated critic lane, streaming-path
 staging.
+
+### Future idea — worker self-splits an oversized piece (user, 2026-06-15)
+
+A worker (designer or implementer) that judges its assigned piece **too big** could itself emit a
+*split*: spawn sub-pieces back onto the queue (recursive decomposition) rather than produce one
+giant file. This turns the static triage→design→implement depth into an **adaptive** tree — the
+boss does a coarse map, and lanes refine where needed. Fits the existing queue/blackboard (a split
+is just "push N smaller work items + their blueprints"). Explore after the repair loop (PA.4c);
+needs a depth/anti-runaway budget so splitting can't recurse forever.

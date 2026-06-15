@@ -1347,6 +1347,124 @@ static void finalize_verify(const WorkOrder &wo,
             passed == (int)tests.size() ? "DONE (all green)" : "NOT all passing (repair loop = PA.4c)");
 }
 
+// ───────────────────────── PA.6: staged design→build pipeline ─────────────────
+// Light triage → goal blueprint → parallel DESIGN pool (blueprints) → parallel
+// IMPLEMENT pool (modules, reading blueprints) → test-gen + verify. Parallelizes
+// the design thinking (the serial plan tax). See spec/PA6_PIPELINE_DESIGN.md.
+static const char *TRIAGE_PROMPT =
+    "You are the COORDINATOR. Make a BRIEF component MAP for a multi-file project — you are NOT "
+    "designing or coding; separate DESIGNER agents will write each component's blueprint and "
+    "IMPLEMENTERS will code them. Emit ONLY this envelope:\n\n"
+    "<<<PLAN strategy=file lang=LANG>>>\n"
+    "shared:\n<blueprint>\n  one or two lines: how the components connect (the goal); deps: []\n</blueprint>\n"
+    "<<<PIECE id=NAME exports=SYM,...>>>\n"
+    "instruction: one line — responsibility + target file path (e.g. src/bird.js)\n"
+    "<blueprint> one line — key responsibility, NOT a spec </blueprint>\n"
+    "<<</PIECE>>>\n"
+    "(one PIECE per component; short lowercase ids like bird, pipes, renderer, engine; include an "
+    "index.html piece with id=index)\n"
+    "<<<END>>>\n\n"
+    "Keep it to names + one-line responsibilities + exports + paths. Do NOT write specs or code.";
+
+static std::string read_file_str(const std::string &path) {
+    std::string s; FILE *f = fopen(path.c_str(), "r");
+    if (f) { char b[8192]; size_t k; while ((k = fread(b,1,sizeof(b),f)) > 0) s.append(b,k); fclose(f); }
+    return s;
+}
+
+// the goal blueprint: the component map every lane carries (global context, §3)
+static std::string build_goal_blueprint(const WorkOrder &wo) {
+    std::string g = "GOAL BLUEPRINT — the project's components and how they connect:\n" + wo.shared + "\nComponents:\n";
+    for (auto &p : wo.pieces) {
+        g += "  - " + p.id + " — " + p.instruction + "  [exports: ";
+        for (size_t i = 0; i < p.exports.size(); i++) g += (i ? "," : "") + p.exports[i];
+        g += "]\n";
+    }
+    return g;
+}
+
+// DESIGN task: one designer per component → design/<id>.blueprint (run with g_worker_think=true)
+static std::string build_design_task(const Piece &p, const std::string &goal) {
+    std::string exp; for (size_t i = 0; i < p.exports.size(); i++) exp += (i ? "," : "") + p.exports[i];
+    std::string user =
+        "You are the DESIGNER for component '" + p.id + "'.\n\n" + goal +
+        "\nYour component '" + p.id + "': " + p.instruction + "\nExports: " + exp + "\n\n"
+        "Write a concise BLUEPRINT for '" + p.id + "': its exported API (names, params, types), behavior, "
+        "key edge cases, and how it interacts with the other components above. Precise prose/pseudocode, "
+        "NOT full code. Save it with create_file at path design/" + p.id + ".blueprint";
+    std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
+    if (!g_worker_think) s += "<think>\n\n</think>\n\n";
+    return s;
+}
+
+// IMPLEMENT task: one implementer per component → its module, given its blueprint + siblings (read-file→inject)
+static std::string build_impl_task(const Piece &p, const std::string &goal) {
+    namespace fs = std::filesystem; std::error_code ec;
+    std::string own = read_file_str(std::string(g_work_dir) + "/design/" + p.id + ".blueprint");
+    std::string sibs, ddir = std::string(g_work_dir) + "/design";
+    for (auto it = fs::directory_iterator(ddir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::string n = it->path().filename().string();
+        if (n == p.id + ".blueprint") continue;
+        sibs += "--- " + n + " ---\n" + read_file_str(it->path().string()) + "\n";
+    }
+    std::string user =
+        "You are the IMPLEMENTER for component '" + p.id + "'.\n\n" + goal +
+        "\nYour component's blueprint:\n" + (own.empty() ? ("(design missing) " + p.instruction) : own) +
+        "\n\nOther components' interfaces (integrate via these):\n" + (sibs.empty() ? "(none)" : sibs) +
+        "\nImplement '" + p.id + "' exactly per its blueprint, integrating through the interfaces above. "
+        "Save it with create_file at the file path its blueprint/assignment specifies.";
+    std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
+    if (!g_worker_think) s += "<think>\n\n</think>\n\n";
+    return s;
+}
+
+// strip a leading <think>…</think> from a worker output
+static std::string strip_think(const std::string &in) {
+    size_t t = in.find("</think>");
+    return trim(t != std::string::npos ? in.substr(t + 8) : in);
+}
+
+// The PA.6 staged pipeline (non-stream, --tools): triage → design → implement → test → verify.
+static void run_pipeline_staged(const std::string &task, int n_lanes, int max_new) {
+    G.tmpl = llama_model_chat_template(G.model, nullptr);
+
+    // ── TRIAGE (light/fast): boss emits the component map; the design pool does the thinking ──
+    std::string tprompt = apply_chat_template({ {"system", TRIAGE_PROMPT}, {"user", task} });
+    tprompt += "<think>\n\n</think>\n\n";   // light triage — no deep thinking here
+    fprintf(stderr, "\n══ PA.6 TRIAGE — boss mapping components (light) ══\n");
+    std::string plan = strip_think(boss_generate(tprompt, 2048));
+    fprintf(stderr, "\n── triage parsed ──\n");
+    WorkOrder wo = parse_work_order(plan);
+    print_work_order(wo);
+    if (!wo.ok || wo.pieces.empty()) { fprintf(stderr, "PA.6 triage parse failed: %s\n", wo.error.c_str()); return; }
+    std::string goal = build_goal_blueprint(wo);
+
+    // ── DESIGN pool (parallel, THINKING) → design/<id>.blueprint ──
+    bool sv_wt = g_worker_think; SParams sv_sp = g_worker_sp;
+    g_worker_think = true; g_worker_sp = qwen_params(true, false);   // designers reason (coding 0.6)
+    std::vector<std::string> ditems, dids;
+    for (auto &p : wo.pieces) { ditems.push_back(build_design_task(p, goal)); dids.push_back(p.id); }
+    fprintf(stderr, "\n══ PA.6 DESIGN — %d designers (parallel, thinking) ══\n", (int)ditems.size());
+    std::vector<std::string> douts; run_pool(ditems, n_lanes, max_new, &douts, "");
+    std::vector<std::pair<std::string,std::string>> dres;
+    for (size_t i = 0; i < dids.size() && i < douts.size(); i++) dres.push_back({ dids[i], strip_think(douts[i]) });
+    fprintf(stderr, "\n══ PA.6 STORE — design blueprints ══\n");
+    run_worker_tools(dres);
+    g_worker_think = sv_wt; g_worker_sp = sv_sp;   // restore (implementers = instruct)
+
+    // ── IMPLEMENT pool (parallel, instruct) → modules, reading the blueprints ──
+    std::vector<std::string> iitems, iids;
+    for (auto &p : wo.pieces) { iitems.push_back(build_impl_task(p, goal)); iids.push_back(p.id); }
+    fprintf(stderr, "\n══ PA.6 IMPLEMENT — %d implementers (parallel) ══\n", (int)iitems.size());
+    std::vector<std::string> iouts; run_pool(iitems, n_lanes, max_new, &iouts, "");
+    std::vector<std::pair<std::string,std::string>> ires;
+    for (size_t i = 0; i < iids.size() && i < iouts.size(); i++) ires.push_back({ iids[i], strip_think(iouts[i]) });
+
+    // ── TEST-GEN + VERIFY (PA.4b): store modules → a test per module → run all tests ──
+    finalize_verify(wo, ires, n_lanes, max_new);
+}
+
 // Self-test for gather text utilities (GPU-free, like --parse-test)
 static int gather_self_test() {
     fprintf(stderr, "── PA.1c gather self-test ──\n");
@@ -1829,6 +1947,12 @@ int main(int argc, char **argv) {
     if (task[0]) {
         if (!no_stream) {                 // PA.3: streaming decomposition — default for -p
             run_pipeline(task, max_new, n_streams);
+            llama_free(G.ctx); llama_model_free(G.model); llama_backend_free();
+            return 0;
+        }
+        if (g_tools) {                    // PA.6: staged design→build pipeline (triage → design → implement → test → verify)
+            run_pipeline_staged(task, n_streams, max_new);
+            if (G.ctx_mtp) llama_free(G.ctx_mtp);
             llama_free(G.ctx); llama_model_free(G.model); llama_backend_free();
             return 0;
         }
