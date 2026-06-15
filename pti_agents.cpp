@@ -1272,6 +1272,52 @@ static std::string build_test_task(const std::string &relpath, const std::string
     return s;
 }
 
+// ───────────────────────── PA.4c: verify→repair helpers ──────────────────────
+// Pure, unit-tested via --coord-test. The loop that uses them is wired into the verifier.
+// Which module a failing test targets: "bird.test.js" → the module whose base is "bird".
+static std::string module_for_test(const std::string &test_filename,
+                                   const std::vector<std::string> &modules) {
+    std::string base = test_filename;
+    size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
+    for (auto &m : modules)
+        if (std::filesystem::path(m).filename().string() == base + ".js") return m;
+    return "";
+}
+// Amend instruction (user turn) for a failing module — fix the code so its test passes.
+static std::string build_amend_user(const std::string &base, const std::string &modpath,
+                                    const std::string &modcontent, const std::string &testcontent,
+                                    const std::string &error) {
+    return "Component '" + base + "' FAILED its test. Fix the MODULE so the test passes (do not "
+           "change the test).\n\nModule (" + modpath + "):\n```\n" + modcontent + "\n```\n\nTest:\n```\n"
+           + testcontent + "\n```\n\nTest output / error:\n" + error +
+           "\n\nRe-emit the corrected module via create_file at " + modpath + ". Output only the tool call.";
+}
+// Repair scheduler verdict given the round, the budget, and how many tests still fail.
+enum RepairAction { RA_DONE, RA_REPAIR, RA_GIVEUP };
+static RepairAction repair_verdict(int round, int budget, int n_failed) {
+    if (n_failed == 0) return RA_DONE;
+    if (round >= budget) return RA_GIVEUP;
+    return RA_REPAIR;
+}
+// GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
+static int coord_self_test() {
+    fprintf(stderr, "── PA.4c coord self-test ──\n");
+    int fail = 0;
+    auto chk = [&](const char *n, bool ok){ fprintf(stderr, "  %s: %s\n", n, ok?"PASS":"FAIL"); if(!ok) fail++; };
+    { std::vector<std::string> m={"src/bird.js","src/pipes.js"};
+      chk("R1 module_for_test",  module_for_test("bird.test.js", m) == "src/bird.js"); }
+    { std::vector<std::string> m={"src/bird.js"};
+      chk("R2 no-match empty",   module_for_test("zzz.test.js", m).empty()); }
+    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR");
+      chk("R3 amend has parts",  u.find("src/bird.js")!=std::string::npos && u.find("CODE")!=std::string::npos
+                              && u.find("TEST")!=std::string::npos && u.find("ERR")!=std::string::npos); }
+    chk("R4 verdict done",   repair_verdict(0,3,0) == RA_DONE);
+    chk("R5 verdict repair", repair_verdict(0,3,2) == RA_REPAIR);
+    chk("R6 verdict giveup", repair_verdict(3,3,2) == RA_GIVEUP);
+    fprintf(stderr, "  %s (%d/6 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 6-fail);
+    return fail > 0 ? 5 : 0;
+}
+
 // PA.4: files-on-disk finalize + the "test verifier" (replaces merge-gather under --tools).
 //   1) STORE modules to disk; 2) TEST-GEN: a test task per module (given its file + the design),
 //   run as a second pool; 3) STORE tests; 4) VERIFY: run every *.test.js (done only when green).
@@ -1841,6 +1887,7 @@ int main(int argc, char **argv) {
     bool  parse_test = false;
     bool  gather_test = false;
     bool  mtp_test = false;
+    bool  coord_test = false;
     int   pool_items = 0;
     bool  plan_only  = false;
     bool  kv_q8      = true;    // Q8 KV default: byte-exactness is a spec-dec artifact, not needed for agents (~2x context)
@@ -1869,6 +1916,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--work-dir") && i+1 < argc) strncpy(g_work_dir, argv[++i], sizeof(g_work_dir)-1);
         else if (!strcmp(argv[i], "--mtp"))      g_mtp = true;            // PA.3 per-lane MTP drafting
         else if (!strcmp(argv[i], "--mtp-test")) mtp_test = true;
+        else if (!strcmp(argv[i], "--coord-test")) coord_test = true;
         else if ((!strcmp(argv[i], "-t") || !strcmp(argv[i], "--temp")) && i+1 < argc) g_temp = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
         else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
@@ -1879,6 +1927,7 @@ int main(int argc, char **argv) {
     if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
     if (mtp_test)    return mtp_self_test();     // PA.3: GPU-free MTP bookkeeping self-test
+    if (coord_test)  return coord_self_test();   // PA.4c: GPU-free repair-loop bookkeeping self-test
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
