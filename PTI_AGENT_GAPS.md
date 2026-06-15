@@ -91,11 +91,14 @@ If the boss emits a malformed envelope, the code exits with code 2. The design d
 
 Workers run until EOG or `max_new`. There's no checkpoint round (PA.4) to kill a runaway worker, no quality check, no `<<<ASK>>>` channel. A worker that starts emitting garbage will burn its entire token budget. The design acknowledges this as a PA.4 item, but for "generating actual code," even a basic safeguard (e.g., checking for EOG + minimum output length) would help.
 
-### 7. Per-stream temperature sampling not implemented
+### 7. Per-stream temperature sampling — ✅ RESOLVED (2026-06-15)
 
-The design calls out per-stream seeds for reproducible runs at any temperature. The code uses `argmax_f` (greedy, temperature=0) everywhere. If you want diverse or higher-temperature output (useful for creative code), the sampling infrastructure isn't there.
-
-This is a v2 feature (stacking MTP + sampling), but it's worth noting if you want anything other than greedy decode.
+Implemented: per-lane `llama_sampler` chains seeded `g_seed + L` (independent reproducible
+streams), with **Qwen3.6 model-card defaults keyed by mode** — thinking/coding (default)
+`temp 0.6, top_p 0.95, top_k 20, min_p 0`; thinking/general (`--general`) `1.0/0.95/20/0`;
+instruct (`--no-think`) `0.7/0.80/20 + presence 1.5`. `-t` overrides temperature; `--seed` sets
+the base seed. Per Qwen guidance, thinking mode **never** uses greedy. The lone greedy path is
+`--mtp` (greedy speculative decode; mutually exclusive with sampling, by design choice).
 
 ### 8. Context budget management is fragile
 
@@ -117,7 +120,7 @@ The `run_pipeline` function collects `outv` for worker items, but the boss's gen
 | **High** | Re-plan on parse failure | ⬜ OPEN | Boss occasionally emits bad envelopes; retry is essential for reliability |
 | **Medium** | Boss sees worker output | ✅ RESOLVED at gather | Integration code won't match if workers deviate from spec |
 | **Medium** | Worker termination guard | ⬜ OPEN | Runaway workers waste tokens; basic length check would help |
-| **Low** | Per-stream temperature sampling | ⬜ OPEN | Greedy works for code; temperature is a v2 nicety |
+| **Low** | Per-stream temperature sampling | ✅ RESOLVED | Qwen model-card sampling per mode (thinking 0.6 / general 1.0 / instruct 0.7); per-lane seeded |
 | **Low** | `<<<ASK>>>` / `<<<REPLY>>>` channel | ⬜ OPEN (PA.4) | PA.4 feature; valuable for ambiguous specs |
 
 The original biggest gap — **the missing gather phase** — is now closed (see the status banner

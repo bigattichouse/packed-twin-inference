@@ -585,6 +585,12 @@ tighten the boss to scaffolding-only + stronger language/exports adherence, and 
   compile, harness routes only the envelope.
 - **Orchestration:** one C++ binary (`pti_agents`), harness-routed; all lanes in one
   `llama_context`. No tool-call round-trips, no external orchestrator in v1.
+- **Sampling (2026-06-15): Qwen3.6 model-card defaults, keyed by mode** (per-lane `llama_sampler`,
+  seed `g_seed+L`). Thinking/coding (default) `temp 0.6 / top_p 0.95 / top_k 20 / min_p 0`;
+  `--general` `1.0/0.95/20/0`; `--no-think` (instruct) `0.7/0.80/20 + presence 1.5`. Qwen says
+  **never greedy in thinking mode** (repetition/degradation). **`--mtp` is the lone greedy path
+  and is mutually exclusive with sampling** (MTP = greedy speculative decode; the two are
+  alternative levers, user's call). `-t` overrides temperature; `--seed` the base seed.
 - **Task shape:** boss chooses function / file / role per task via a selection rubric
   (§5.1); not hard-coded. **Size floor (2026-06-14): every piece is at least a full class or
   module** (a cohesive component + its tests), never a lone function — the boss prompt now

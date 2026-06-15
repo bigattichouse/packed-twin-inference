@@ -51,6 +51,16 @@ static bool g_tools        = false;   // --tools: let workers emit <function=...
 static bool g_allow_run    = false;   // --allow-run: permit the `run` verb (sandboxed shell exec); implies --tools
 static char g_work_dir[512] = "pti_work";  // --work-dir: sandbox dir for write_file / run
 static bool g_mtp          = false;   // --mtp: per-lane MTP drafting (PA.3) — doubles n_seq_max
+// Qwen3.6 recommended sampling (model card) — resolved by mode in main(). NEVER greedy in
+// thinking mode (Qwen: greedy → repetition/degradation). --mtp is the one greedy path.
+static float    g_temp     = -1.0f;   // -1 = auto by mode; -t overrides
+static float    g_top_p    = 0.95f;
+static int      g_top_k    = 20;
+static float    g_min_p    = 0.0f;
+static float    g_presence = 0.0f;
+static uint32_t g_seed     = 42;      // base seed; lane L uses g_seed + L (per-stream streams)
+static bool     g_general  = false;   // --general: thinking-general temps (1.0) vs coding (0.6)
+static bool     g_greedy   = false;   // resolved: true under --mtp (greedy speculative decode)
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
     if (g_verbose_logs) { fputs(text, stderr); return; }
@@ -291,6 +301,27 @@ static llama_token mtp_feed1(llama_batch *mb, llama_seq_id seq,
     return (llama_token)argmax_f(logits, G.n_vocab);
 }
 
+// ───────────────────────── Qwen sampling (model-card defaults) ───────────────
+// One chain per lane (per-lane seed → independent reproducible streams; penalties
+// keep per-lane history). Order: penalties → top_k → top_p → min_p → temp → dist.
+static llama_sampler *make_sampler(uint32_t seed) {
+    llama_sampler *s = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (g_presence > 0.0f)   // instruct mode / quantized-repetition guard (Qwen: presence 1.5)
+        llama_sampler_chain_add(s, llama_sampler_init_penalties(1024, 1.0f, 0.0f, g_presence));
+    llama_sampler_chain_add(s, llama_sampler_init_top_k(g_top_k));
+    llama_sampler_chain_add(s, llama_sampler_init_top_p(g_top_p, 1));
+    llama_sampler_chain_add(s, llama_sampler_init_min_p(g_min_p, 1));
+    llama_sampler_chain_add(s, llama_sampler_init_temp(g_temp));
+    llama_sampler_chain_add(s, llama_sampler_init_dist(seed));
+    return s;
+}
+// Pick a token from the logits at batch index `idx`: sampler if present, else greedy
+// (greedy only on the --mtp path and prefill seeds; thinking decode always samples).
+static llama_token pick(llama_sampler *s, int idx) {
+    if (!s) return (llama_token)argmax_f(llama_get_logits_ith(G.ctx, idx), G.n_vocab);
+    return llama_sampler_sample(s, G.ctx, idx);
+}
+
 // ───────────────────────── PA.2: work-pool ───────────────────────────────────
 // M items over n_lanes; a lane that finishes (EOG or cap) is refilled from the
 // queue (seq_rm + prefill the next item), keeping the batch full while backlog
@@ -337,6 +368,9 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
         mtp_batch.token = (llama_token *)malloc(8 * sizeof(llama_token));
         mem_mtp = llama_get_memory(G.ctx_mtp);
     }
+    // per-lane Qwen samplers (null when greedy / --mtp); seed g_seed+L → independent streams
+    std::vector<llama_sampler *> smpl(n_lanes, nullptr);
+    if (!g_greedy) for (int L = 0; L < n_lanes; L++) smpl[L] = make_sampler(g_seed + (uint32_t)L);
 
     auto start_lane = [&](int L, int item) -> bool {
         std::vector<llama_token> full(items[item].size() + 16, 0);
@@ -347,6 +381,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
         bool cached = use_cache && fn > prefix_len && (fn - prefix_len) <= PREFILL_CHUNK;
         for (int k = 0; cached && k < prefix_len; k++) if (full[k] != prefix_toks[k]) cached = false;
         llama_memory_seq_rm(G.mem, L, 0, -1);
+        if (smpl[L]) llama_sampler_reset(smpl[L]);             // fresh sampler history for the new item
         int last_idx = 0;
         if (cached) {
             llama_memory_seq_cp(G.mem, BASE, L, 0, -1);        // clone the starter (= roll back to base)
@@ -360,7 +395,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
             lanes[L].prompt_toks = full;
             if (!prefill_stream(lanes[L], L, batch, &last_idx)) return false;
         }
-        lanes[L].tok_last = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
+        lanes[L].tok_last = pick(smpl[L], last_idx);          // sample (Qwen) or greedy (--mtp)
         lanes[L].pos      = (llama_pos)fn;
         lanes[L].text     = tok_str(lanes[L].tok_last);
         lanes[L].n_gen    = 1;
@@ -481,7 +516,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
         std::vector<int> finished;
         for (size_t i = 0; i < ord.size(); i++) {
             int L = ord[i];
-            llama_token nxt = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, (int)i), G.n_vocab);
+            llama_token nxt = pick(smpl[L], (int)i);            // Qwen sampling per lane
             lanes[L].pos++; lanes[L].tok_last = nxt; lanes[L].n_gen++; total++;
             if (llama_vocab_is_eog(G.vocab, nxt) || lanes[L].n_gen >= max_new) {
                 out[lane_item[L]] = lanes[L].text;
@@ -499,6 +534,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
       }
     }
     double wall = now_sec() - t1;
+    for (auto *s : smpl) if (s) llama_sampler_free(s);
     if (mtp_on) { free(mtp_batch.token); mtp_batch.token = nullptr; llama_batch_free(mtp_batch); }
     llama_batch_free(batch);
 
@@ -765,7 +801,8 @@ static std::string boss_generate(const std::string &prompt, int max_tok) {
         if (llama_decode(G.ctx, batch) != 0) { llama_batch_free(batch); return "[prefill failed]"; }
         last_idx = nb - 1;
     }
-    llama_token tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
+    llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed);   // boss plan sampler (Qwen)
+    llama_token tok = pick(s, last_idx);
     llama_pos pos = n;
     std::string out;
     for (int gen = 0; gen < max_tok && !llama_vocab_is_eog(G.vocab, tok); gen++) {
@@ -773,9 +810,10 @@ static std::string boss_generate(const std::string &prompt, int max_tok) {
         batch_clear(&batch);
         batch_add(&batch, tok, pos, 0, true);
         if (llama_decode(G.ctx, batch) != 0) break;
-        tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, 0), G.n_vocab);
+        tok = pick(s, 0);
         pos++;
     }
+    if (s) llama_sampler_free(s);
     llama_batch_free(batch);
     return out;
 }
@@ -1000,7 +1038,8 @@ static std::string run_gather_phase(llama_seq_id boss_seq,
         return "[gather inject failed]";
     }
 
-    llama_token tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, gn - 1), G.n_vocab);
+    llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed);   // gather sampler (Qwen)
+    llama_token tok = pick(s, gn - 1);
     llama_pos pos = (llama_pos)gn;
     std::string out;
 
@@ -1012,9 +1051,10 @@ static std::string run_gather_phase(llama_seq_id boss_seq,
         batch_clear(&batch);
         batch_add(&batch, tok, pos, boss_seq, true);
         if (llama_decode(G.ctx, batch) != 0) break;
-        tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, 0), G.n_vocab);
+        tok = pick(s, 0);
         pos++;
     }
+    if (s) llama_sampler_free(s);
     llama_batch_free(batch);
     return out;
 }
@@ -1376,6 +1416,9 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
     std::vector<Lane> lanes(nW + 1);
     for (int i = 0; i <= nW; i++) { lanes[i] = Lane{ i, -1, false, false, "", 0, 0, 0 }; }
     lanes[BOSS].is_boss = true;
+    // per-lane Qwen samplers (boss lane + workers); seed g_seed+L → independent streams
+    std::vector<llama_sampler *> smpl(nW + 1, nullptr);
+    if (!g_greedy) for (int i = 0; i <= nW; i++) smpl[i] = make_sampler(g_seed + (uint32_t)i);
 
     std::vector<QItem> queue;
     std::vector<std::string> outv;
@@ -1410,7 +1453,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
         llama_memory_seq_rm(G.mem, BOSS, 0, -1);
         Stream tmp; tmp.prompt_toks = bt; int li = 0;
         if (!prefill_stream(tmp, BOSS, batch, &li)) { fprintf(stderr, "boss prefill failed\n"); llama_batch_free(batch); return; }
-        lanes[BOSS].tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, li), G.n_vocab);
+        lanes[BOSS].tok = pick(smpl[BOSS], li);
         lanes[BOSS].pos = (llama_pos)bt.size();
         lanes[BOSS].live = true;
     }
@@ -1477,7 +1520,8 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
         } else {
             Stream tmp; tmp.prompt_toks = ft; if (!prefill_stream(tmp, lanes[L].seq, batch, &last_idx)) return false;
         }
-        lanes[L].tok = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, last_idx), G.n_vocab);
+        if (smpl[L]) llama_sampler_reset(smpl[L]);            // fresh sampler for the new piece
+        lanes[L].tok = pick(smpl[L], last_idx);
         lanes[L].pos = (llama_pos)fn; lanes[L].text = tok_str(lanes[L].tok);
         lanes[L].n_gen = 1; lanes[L].live = true; lanes[L].item = qi; total++;
         fprintf(stderr, "  → %s → lane %d (%s)\n", q.id.c_str(), L, cached ? "cloned+delta" : "full");
@@ -1498,7 +1542,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
         if (llama_decode(G.ctx, batch) != 0) { fprintf(stderr, "pipeline decode failed\n"); break; }
         for (size_t i = 0; i < ord.size(); i++) {
             int L = ord[i];
-            llama_token nxt = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, (int)i), G.n_vocab);
+            llama_token nxt = pick(smpl[L], (int)i);            // Qwen sampling per lane (boss + workers)
             lanes[L].pos++; lanes[L].tok = nxt; lanes[L].n_gen++; total++;
             if (lanes[L].is_boss && !boss_done) {
                 std::string pc = tok_str(nxt); lanes[L].text += pc; fputs(pc.c_str(), stderr);
@@ -1517,6 +1561,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
         }
     }
     double wall = now_sec() - tg;
+    for (auto *s : smpl) if (s) llama_sampler_free(s);
     llama_batch_free(batch);
 
     fprintf(stderr, "\n════════════════════════════════════════════════\n");
@@ -1585,8 +1630,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--work-dir") && i+1 < argc) strncpy(g_work_dir, argv[++i], sizeof(g_work_dir)-1);
         else if (!strcmp(argv[i], "--mtp"))      g_mtp = true;            // PA.3 per-lane MTP drafting
         else if (!strcmp(argv[i], "--mtp-test")) mtp_test = true;
+        else if ((!strcmp(argv[i], "-t") || !strcmp(argv[i], "--temp")) && i+1 < argc) g_temp = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
+        else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
@@ -1612,6 +1660,26 @@ int main(int argc, char **argv) {
     if (!G.model) { fprintf(stderr, "load failed\n"); return 1; }
     G.vocab   = llama_model_get_vocab(G.model);
     G.n_vocab = llama_vocab_n_tokens(G.vocab);
+
+    // ── Qwen3.6 recommended sampling (model card), keyed by mode; -t overrides temp ──
+    // Qwen: NEVER greedy in thinking mode (repetition/degradation). --mtp is the lone greedy path.
+    if (g_mtp) {
+        g_greedy = true;
+        fprintf(stderr, "[sampling] --mtp → greedy (MTP is greedy speculative decode)\n");
+    } else if (g_no_think) {                    // instruct / non-thinking
+        if (g_temp < 0) g_temp = 0.7f;
+        g_top_p = 0.80f; g_top_k = 20; g_min_p = 0.0f; g_presence = 1.5f;
+    } else if (g_general) {                      // thinking — general tasks
+        if (g_temp < 0) g_temp = 1.0f;
+        g_top_p = 0.95f; g_top_k = 20; g_min_p = 0.0f; g_presence = 0.0f;
+    } else {                                     // thinking — precise coding (default for this tool)
+        if (g_temp < 0) g_temp = 0.6f;
+        g_top_p = 0.95f; g_top_k = 20; g_min_p = 0.0f; g_presence = 0.0f;
+    }
+    if (!g_greedy)
+        fprintf(stderr, "[sampling] %s: temp %.2f top_p %.2f top_k %d min_p %.2f presence %.1f (seed %u)\n",
+                g_no_think ? "instruct" : g_general ? "thinking/general" : "thinking/coding",
+                g_temp, g_top_p, g_top_k, g_min_p, g_presence, g_seed);
 
     if (g_mtp && !no_stream) {    // PA.3 MTP v1 lives in the pool path; streaming MTP is a follow-up
         fprintf(stderr, "[note] --mtp is pool-path only (v1); forcing --no-stream\n");
