@@ -16,8 +16,12 @@ plan" model in PACKED_AGENTS_DESIGN §5.
 Measured on the multi-file task (both thinking @ 0.6, 128k):
 
 - Packed wall 1369 s, of which the **boss plan-think alone was 1105 s (~80%)** — one serial stream.
-- Worker pool aggregate was only ~12.8 tok/s (vs the greedy milestones' ~37) — see §6 (sampling).
-- Net: packed delivered *less* (no tests) yet wall was dominated by serial planning.
+- Worker pool aggregate was only ~12.8 tok/s — **but that was STRAGGLERS, not sampling** (§6):
+  the 5 items were 388/479/508/384/**1290** tok, so the 1290-tok module ran ~890 tokens **1-wide**
+  after the small ones finished. A uniform-item A/B shows sampled 4-wide = **36.5 tok/s (1.89×)**,
+  at the ceiling.
+- Net: the two real costs are **serial plan-think (80% of wall)** and **straggler tails from uneven
+  pieces** — both attacked by this pipeline (parallel design + more, smaller, balanced pieces).
 
 The boss doing *all* the design thinking, alone, is the bottleneck. Parallelize it.
 
@@ -86,25 +90,24 @@ it** (§6).
 
 ---
 
-## 6. Sampler cost — measure, then optimize (do NOT regress to greedy)
+## 6. Sampler cost — MEASURED: not the bottleneck (do NOT regress to greedy)
 
-Finding: 4-wide aggregate fell ~37 tok/s (greedy milestones) → ~12.8 (sampled). The Qwen
-`llama_sampler` chain runs on CPU, per lane, per token; the prime suspect is the per-call build of a
-~150K-entry candidate array (+ nth_element for top_k, + the presence-penalty window scan), which now
-dwarfs the cheap packed GPU decode. **This is unconfirmed by profiling** — first action is to
-**measure** (A/B greedy vs sampled at fixed `-s 4` / 128k; and per-component: temp-only vs
-+top_k vs +penalty).
+**Measured 2026-06-15 (`--pool 8 -s 4 -n 128`, the A/B):**
 
-Optimization options, cheapest first:
-1. **Profile** which chain element dominates (penalty? candidate build? top_k?).
-2. **Lean top-k path**: a custom sampler that does top-k on the raw logits (bounded heap, no 150K
-   `token_data` array), softmax over k, position-keyed pick — avoids the big allocation per call.
-3. **Bound the penalty window** (smaller `penalty_last_n`) if penalties dominate.
-4. **Parallelism amortizes it** (§2): with design parallelized, more useful tokens/wall.
-5. **GPU sampling** (deeper): llama.cpp sampling is CPU-only — no flag; a GPU top-k/sample is custom
-   kernels, a real project. Last resort, after 1–4.
+| mode | tokens | decode | aggregate |
+|---|---|---|---|
+| **sampled** (Qwen instruct 0.7/0.80/top_k20/presence1.5) | 1024 | 28.1 s | **36.5 tok/s (1.89×)** |
+| greedy (`--greedy`, argmax) | 939 | 31.2 s | 30.1 tok/s (1.56×) |
 
-Greedy stays available behind a flag purely as a **diagnostic/bench reference**, never the product.
+**Sampling is essentially free** — sampled 4-wide is at the ~37 ceiling, even *faster* than greedy
+here (greedy's items hit EOG earlier → 939 tok → more 1-wide tail → lower aggregate; a lane-occupancy
+artifact, not a sampler win). So the earlier "sampler caused 37→13" hypothesis was **wrong**.
+
+The flappy pool's 12.8 tok/s was **stragglers**: uneven item sizes (one 1290-tok module vs ~400-tok
+ones) → a long 1-wide tail. The fix is **balanced, smaller pieces + refill** (more items than lanes,
+even sizes) — which the per-component granularity of this pipeline naturally provides — plus parallel
+design to kill the plan-think. **No sampler optimization needed.** Greedy stays only as a
+diagnostic/bench reference + the MTP path; sampling is the product.
 
 ---
 
@@ -147,9 +150,10 @@ N modules, test/ has N tests, verifier runs, wall < serial baseline.
 
 ## 10. Build order
 
-1. **Sampler measurement + optimization** (§6) — quick speed win; restores sampled throughput.
+1. ~~Sampler optimization~~ — **DONE/N-A**: measured free (§6); the pool slowness was stragglers.
 2. **Staged pipeline** (§2): triage → design pool → implement pool (reuse PA.2 `run_pool` per stage;
-   blueprints + goal-blueprint context via read-file→inject).
+   blueprints + goal-blueprint context via read-file→inject). This also fixes stragglers by producing
+   **more, smaller, balanced pieces** (keep lanes full) and kills the serial plan-think.
 3. **Repair loop** (PA.4c): failing tests → amend items → re-run until green / budget.
 
 Out of scope (v1): mid-flight blueprint renegotiation, a dedicated critic lane, streaming-path
