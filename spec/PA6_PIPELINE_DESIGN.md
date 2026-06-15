@@ -57,6 +57,13 @@ CommonJS** so `node` tests run, wiring, input/score owner, canvas/ctx). Implemen
 contract, not five mutually-inconsistent specs. Reconcile is serial but *merges* (it doesn't invent),
 so it's far lighter than the old upfront full-plan think.
 
+**MEASURED (2026-06-15):** reconcile lifted the verifier from **1/3 → 2/3** passing on the Flappy
+task. The `index` integration failure (`addEventListener is not a function`, the canvas-vs-ctx drift)
+was **fixed** by the contract, which also picked **CommonJS** so `node` tests actually run. The lone
+remaining failure (`renderer`) is a per-module *logic* bug (most asserts pass, one fails) — not
+integration → that's the **repair loop (PA.4c)**'s job. Cost: reconcile's serial boss pass pushed
+wall ~1498→1914 s — exactly what the parallel pairwise-reconcile (above) would recover.
+
 Only the **triage** is serial, and it is deliberately *light* (a component map, not a full design).
 The expensive **design thinking is parallel** — exactly where packing wins, and where the per-token
 sampling cost is amortized across lanes.
