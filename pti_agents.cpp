@@ -43,23 +43,23 @@ static double now_sec() {
 
 // quiet llama/ggml logging: only WARN+ passes (--verbose restores)
 static bool g_verbose_logs = false;
-static bool g_no_think     = false;   // --no-think: force a closed empty <think></think> after the
-                                      // generation prompt so boss+workers skip reasoning (faster, esp. the plan)
 static char g_out_path[512] = {};     // --out: write final artifact to this file
 static bool g_no_gather    = false;   // --no-gather: skip gather phase, print pieces separately
 static bool g_tools        = false;   // --tools: let workers emit <function=...> tool calls (write_file/run)
 static bool g_allow_run    = false;   // --allow-run: permit the `run` verb (sandboxed shell exec); implies --tools
 static char g_work_dir[512] = "pti_work";  // --work-dir: sandbox dir for write_file / run
 static bool g_mtp          = false;   // --mtp: per-lane MTP drafting (PA.3) — doubles n_seq_max
-// Qwen3.6 recommended sampling (model card) — resolved by mode in main(). NEVER greedy in
-// thinking mode (Qwen: greedy → repetition/degradation). --mtp is the one greedy path.
-static float    g_temp     = -1.0f;   // -1 = auto by mode; -t overrides
-static float    g_top_p    = 0.95f;
-static int      g_top_k    = 20;
-static float    g_min_p    = 0.0f;
-static float    g_presence = 0.0f;
+// Qwen3.6 recommended sampling (model card), PER ROLE. Default: boss reasons (thinking), workers
+// implement a clear spec without reasoning (faster). NEVER greedy in thinking mode (Qwen:
+// greedy → repetition/degradation). --mtp is the one greedy path. Resolved in main().
+struct SParams { float temp; float top_p; float min_p; float presence; int top_k; };
+static SParams  g_boss_sp     = {0.6f, 0.95f, 0.0f, 0.0f, 20};   // boss: thinking/coding
+static SParams  g_worker_sp   = {0.7f, 0.80f, 0.0f, 1.5f, 20};   // workers: instruct (no-think)
+static bool     g_boss_think   = true;    // boss plans/gathers with reasoning
+static bool     g_worker_think = false;   // workers implement from the spec without reasoning
+static float    g_temp     = -1.0f;   // -t: override temperature for both roles
 static uint32_t g_seed     = 42;      // base seed; lane L uses g_seed + L (per-stream streams)
-static bool     g_general  = false;   // --general: thinking-general temps (1.0) vs coding (0.6)
+static bool     g_general  = false;   // --general: boss uses thinking-general temps (1.0) vs coding (0.6)
 static bool     g_greedy   = false;   // resolved: true under --mtp (greedy speculative decode)
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
@@ -302,16 +302,22 @@ static llama_token mtp_feed1(llama_batch *mb, llama_seq_id seq,
 }
 
 // ───────────────────────── Qwen sampling (model-card defaults) ───────────────
+// Qwen3.6 model-card params for a role given (thinking?, general?).
+static SParams qwen_params(bool think, bool general) {
+    if (!think)  return { 0.7f, 0.80f, 0.0f, 1.5f, 20 };   // instruct / non-thinking
+    if (general) return { 1.0f, 0.95f, 0.0f, 0.0f, 20 };   // thinking — general
+    return             { 0.6f, 0.95f, 0.0f, 0.0f, 20 };    // thinking — precise coding
+}
 // One chain per lane (per-lane seed → independent reproducible streams; penalties
 // keep per-lane history). Order: penalties → top_k → top_p → min_p → temp → dist.
-static llama_sampler *make_sampler(uint32_t seed) {
+static llama_sampler *make_sampler(uint32_t seed, const SParams &sp) {
     llama_sampler *s = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (g_presence > 0.0f)   // instruct mode / quantized-repetition guard (Qwen: presence 1.5)
-        llama_sampler_chain_add(s, llama_sampler_init_penalties(1024, 1.0f, 0.0f, g_presence));
-    llama_sampler_chain_add(s, llama_sampler_init_top_k(g_top_k));
-    llama_sampler_chain_add(s, llama_sampler_init_top_p(g_top_p, 1));
-    llama_sampler_chain_add(s, llama_sampler_init_min_p(g_min_p, 1));
-    llama_sampler_chain_add(s, llama_sampler_init_temp(g_temp));
+    if (sp.presence > 0.0f)  // instruct mode / quantized-repetition guard (Qwen: presence 1.5)
+        llama_sampler_chain_add(s, llama_sampler_init_penalties(1024, 1.0f, 0.0f, sp.presence));
+    llama_sampler_chain_add(s, llama_sampler_init_top_k(sp.top_k));
+    llama_sampler_chain_add(s, llama_sampler_init_top_p(sp.top_p, 1));
+    llama_sampler_chain_add(s, llama_sampler_init_min_p(sp.min_p, 1));
+    llama_sampler_chain_add(s, llama_sampler_init_temp(sp.temp));
     llama_sampler_chain_add(s, llama_sampler_init_dist(seed));
     return s;
 }
@@ -370,7 +376,7 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
     }
     // per-lane Qwen samplers (null when greedy / --mtp); seed g_seed+L → independent streams
     std::vector<llama_sampler *> smpl(n_lanes, nullptr);
-    if (!g_greedy) for (int L = 0; L < n_lanes; L++) smpl[L] = make_sampler(g_seed + (uint32_t)L);
+    if (!g_greedy) for (int L = 0; L < n_lanes; L++) smpl[L] = make_sampler(g_seed + (uint32_t)L, g_worker_sp);
 
     auto start_lane = [&](int L, int item) -> bool {
         std::vector<llama_token> full(items[item].size() + 16, 0);
@@ -801,7 +807,7 @@ static std::string boss_generate(const std::string &prompt, int max_tok) {
         if (llama_decode(G.ctx, batch) != 0) { llama_batch_free(batch); return "[prefill failed]"; }
         last_idx = nb - 1;
     }
-    llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed);   // boss plan sampler (Qwen)
+    llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed, g_boss_sp);   // boss plan sampler (Qwen)
     llama_token tok = pick(s, last_idx);
     llama_pos pos = n;
     std::string out;
@@ -910,7 +916,7 @@ static std::string build_lane_prompt(const WorkOrder &wo, const Piece &p) {
     if (!p.language.empty()) user += " (" + p.language + ")";
     user += ": " + p.instruction + "\n\nSpec:\n" + p.blueprint;
     std::string s = apply_chat_template({ {"system", build_worker_system(wo)}, {"user", user} }, /*add_ass=*/true);
-    if (g_no_think) s += "<think>\n\n</think>\n\n";   // skip worker reasoning
+    if (!g_worker_think) s += "<think>\n\n</think>\n\n";   // workers implement from spec, no reasoning
     return s;
 }
 
@@ -1024,7 +1030,7 @@ static std::string run_gather_phase(llama_seq_id boss_seq,
     // than continuing raw text (matches boss_generate / the worker prompts).
     std::string prompt = apply_chat_template(
         { {"system", GATHER_SYSTEM}, {"user", gather_content} }, /*add_ass=*/true);
-    if (g_no_think) prompt += "<think>\n\n</think>\n\n";
+    if (!g_boss_think) prompt += "<think>\n\n</think>\n\n";   // gather is a boss-role turn
 
     std::vector<llama_token> gt(prompt.size() + 16, 0);
     int gn = llama_tokenize(G.vocab, prompt.c_str(), (int32_t)prompt.size(),
@@ -1038,7 +1044,7 @@ static std::string run_gather_phase(llama_seq_id boss_seq,
         return "[gather inject failed]";
     }
 
-    llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed);   // gather sampler (Qwen)
+    llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed, g_boss_sp);   // gather sampler (Qwen)
     llama_token tok = pick(s, gn - 1);
     llama_pos pos = (llama_pos)gn;
     std::string out;
@@ -1416,9 +1422,10 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
     std::vector<Lane> lanes(nW + 1);
     for (int i = 0; i <= nW; i++) { lanes[i] = Lane{ i, -1, false, false, "", 0, 0, 0 }; }
     lanes[BOSS].is_boss = true;
-    // per-lane Qwen samplers (boss lane + workers); seed g_seed+L → independent streams
+    // per-lane Qwen samplers; boss lane uses boss params, workers use worker params
     std::vector<llama_sampler *> smpl(nW + 1, nullptr);
-    if (!g_greedy) for (int i = 0; i <= nW; i++) smpl[i] = make_sampler(g_seed + (uint32_t)i);
+    if (!g_greedy) for (int i = 0; i <= nW; i++)
+        smpl[i] = make_sampler(g_seed + (uint32_t)i, i == BOSS ? g_boss_sp : g_worker_sp);
 
     std::vector<QItem> queue;
     std::vector<std::string> outv;
@@ -1444,7 +1451,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
     // prefill boss prompt into seq BOSS
     G.tmpl = llama_model_chat_template(G.model, nullptr);
     std::string bprompt = apply_chat_template({ {"system", BOSS_PROMPT}, {"user", task} });
-    if (g_no_think) bprompt += "<think>\n\n</think>\n\n";
+    if (!g_boss_think) bprompt += "<think>\n\n</think>\n\n";   // boss plan (streaming) — boss role
     {
         std::vector<llama_token> bt(bprompt.size() + 16);
         int bn = llama_tokenize(G.vocab, bprompt.c_str(), (int32_t)bprompt.size(), bt.data(), (int32_t)bt.size(), true, true);
@@ -1501,7 +1508,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
         user += ": " + q.instruction + "\n\nSpec:\n" + q.blueprint;
         std::string full = apply_chat_template({ {"system",
             worker_preamble_text() + "\n\nShared interface (rely on these):\n" + shared}, {"user", user} }, true);
-        if (g_no_think) full += "<think>\n\n</think>\n\n";
+        if (!g_worker_think) full += "<think>\n\n</think>\n\n";   // streaming worker — no reasoning
         std::vector<llama_token> ft(full.size() + 16);
         int fn = llama_tokenize(G.vocab, full.c_str(), (int32_t)full.size(), ft.data(), (int32_t)ft.size(), true, true);
         if (fn <= 0) return false;
@@ -1619,7 +1626,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--plan-only")) plan_only = true;
         else if (!strcmp(argv[i], "--kv-q8"))    kv_q8 = true;
         else if (!strcmp(argv[i], "--kv-f16"))   kv_q8 = false;   // opt into f16: reproducible (byte-identical) runs
-        else if (!strcmp(argv[i], "--no-think")) g_no_think = true;
+        else if (!strcmp(argv[i], "--no-think")) { g_boss_think = false; g_worker_think = false; }  // all instruct
+        else if (!strcmp(argv[i], "--all-think")) g_worker_think = true;   // workers reason too (slower)
         else if (!strcmp(argv[i], "--no-stream")) no_stream = true;
         else if (!strcmp(argv[i], "--text"))     show_text = true;
         else if (!strcmp(argv[i], "--out")     && i+1 < argc) strncpy(g_out_path, argv[++i], sizeof(g_out_path)-1);
@@ -1634,7 +1642,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
         else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--all-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
@@ -1666,20 +1674,16 @@ int main(int argc, char **argv) {
     if (g_mtp) {
         g_greedy = true;
         fprintf(stderr, "[sampling] --mtp → greedy (MTP is greedy speculative decode)\n");
-    } else if (g_no_think) {                    // instruct / non-thinking
-        if (g_temp < 0) g_temp = 0.7f;
-        g_top_p = 0.80f; g_top_k = 20; g_min_p = 0.0f; g_presence = 1.5f;
-    } else if (g_general) {                      // thinking — general tasks
-        if (g_temp < 0) g_temp = 1.0f;
-        g_top_p = 0.95f; g_top_k = 20; g_min_p = 0.0f; g_presence = 0.0f;
-    } else {                                     // thinking — precise coding (default for this tool)
-        if (g_temp < 0) g_temp = 0.6f;
-        g_top_p = 0.95f; g_top_k = 20; g_min_p = 0.0f; g_presence = 0.0f;
+    } else {
+        g_boss_sp   = qwen_params(g_boss_think,   g_general);   // boss: think (coding/general) or instruct
+        g_worker_sp = qwen_params(g_worker_think, false);       // workers: think/coding or instruct
+        if (g_temp >= 0) { g_boss_sp.temp = g_temp; g_worker_sp.temp = g_temp; }   // -t overrides both
+        fprintf(stderr, "[sampling] boss %s temp %.2f top_p %.2f presence %.1f | workers %s temp %.2f top_p %.2f presence %.1f (seed %u)\n",
+                g_boss_think ? (g_general ? "think/general" : "think/coding") : "instruct",
+                g_boss_sp.temp, g_boss_sp.top_p, g_boss_sp.presence,
+                g_worker_think ? "think/coding" : "instruct",
+                g_worker_sp.temp, g_worker_sp.top_p, g_worker_sp.presence, g_seed);
     }
-    if (!g_greedy)
-        fprintf(stderr, "[sampling] %s: temp %.2f top_p %.2f top_k %d min_p %.2f presence %.1f (seed %u)\n",
-                g_no_think ? "instruct" : g_general ? "thinking/general" : "thinking/coding",
-                g_temp, g_top_p, g_top_k, g_min_p, g_presence, g_seed);
 
     if (g_mtp && !no_stream) {    // PA.3 MTP v1 lives in the pool path; streaming MTP is a follow-up
         fprintf(stderr, "[note] --mtp is pool-path only (v1); forcing --no-stream\n");
@@ -1716,7 +1720,7 @@ int main(int argc, char **argv) {
         G.tmpl = llama_model_chat_template(G.model, nullptr);
         std::vector<Msg> msgs = {{"system", BOSS_PROMPT}, {"user", task}};
         std::string prompt = apply_chat_template(msgs);
-        if (g_no_think) prompt += "<think>\n\n</think>\n\n";   // skip the boss's plan reasoning (kills the plan tax)
+        if (!g_boss_think) prompt += "<think>\n\n</think>\n\n";   // boss plan (non-stream) — boss role
         fprintf(stderr, "\n══ PA.1 PLAN — boss decomposing ══\n  task: %s\n\n", task);
         double t0 = now_sec();
         int plan_cap = n_ctx / (n_streams + 1) - 768;  // full seq budget (n_seq_max=n_streams+1 w/ base) — it needs
