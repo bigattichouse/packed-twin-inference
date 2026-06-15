@@ -1045,7 +1045,9 @@ static std::string run_gather_phase(llama_seq_id boss_seq,
     }
 
     llama_sampler *s = g_greedy ? nullptr : make_sampler(g_seed, g_boss_sp);   // gather sampler (Qwen)
-    llama_token tok = pick(s, gn - 1);
+    // inject() prefills in PREFILL_CHUNK batches → the last token's logits live at the end of the
+    // final batch, NOT at global index gn-1. Use -1 (last output); gn-1 overflows for gn>chunk.
+    llama_token tok = pick(s, -1);
     llama_pos pos = (llama_pos)gn;
     std::string out;
 
