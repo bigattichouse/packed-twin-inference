@@ -870,12 +870,13 @@ static const char *BOSS_PROMPT =
 static std::string boss_system_text() {
     std::string p = BOSS_PROMPT;
     if (g_tools)
-        p += "\n\nTOOLS / FILES MODE: workers write REAL files to disk. Plan a clean DIRECTORY "
-             "STRUCTURE (e.g. src/ for modules, test/ for tests) and state it in the shared block. "
-             "EACH piece must produce its module file AND a matching test file (<name>.test.js, "
-             "console.assert, process.exit(1) on failure). Split by module — never one giant file. "
-             "Write the entry point (e.g. index.html) as its own piece wiring the modules. After all "
-             "pieces finish, a VERIFIER runs every test file; the job is DONE only when the tests pass.";
+        p += "\n\nTOOLS / FILES MODE: workers write REAL files to disk, exactly ONE file per piece. "
+             "Plan a clean DIRECTORY STRUCTURE (state it in the shared block, e.g. src/ for modules). "
+             "Emit one piece per MODULE (e.g. src/bird.js) plus a piece for the entry point "
+             "(index.html). Do NOT write tests yourself: after the modules are built, the harness "
+             "auto-generates a unit test for each module (given your file + the shared design) and a "
+             "VERIFIER runs them — the job is DONE only when the tests pass. So make modules small, "
+             "focused, and TESTABLE, with clear exports declared in the shared interface.";
     return p;
 }
 
@@ -1250,16 +1251,73 @@ static void finish_gather(const WorkOrder &wo,
     write_artifact(artifact);
 }
 
-// PA.4: files-on-disk finalize + the "test verifier". Replaces the merge-gather when --tools:
-// store each worker's files (create_file), then run EVERY *.test.js as the verifier — the run is
-// "done" only when they pass. No code re-emission (that stripped tests / drifted code, §3.2).
-static void finalize_verify(const std::vector<std::pair<std::string,std::string>> &worker_results) {
-    namespace fs = std::filesystem;
-    fprintf(stderr, "\n══ PA.4 STORE — writing worker files to %s ══\n", g_work_dir);
-    run_worker_tools(worker_results);                    // create_file → real files on disk
+// PA.4: build a "write a test for this module" task — given file X (the written module) and
+// design Y (the shared interface). The harness runs these as a second pool so each module gets a
+// real test that sees the actual code (user's model: "given file X and design Y, build a test").
+static std::string build_test_task(const std::string &relpath, const std::string &content,
+                                   const std::string &shared) {
+    std::filesystem::path p(relpath);
+    std::string base = p.filename().string();
+    size_t dot = base.rfind(".js"); if (dot != std::string::npos) base = base.substr(0, dot);
+    std::string testpath = "test/" + base + ".test.js";
+    std::string user =
+        "Write a Node.js unit test for the module below.\n\nModule file (" + relpath + "):\n```js\n"
+        + content + "\n```\n\nShared design / interface:\n" + shared +
+        "\n\nThe test MUST: require the module (e.g. const m = require('../" + relpath + "')), exercise "
+        "its exported behavior with console.assert, print a line per check, and call process.exit(1) on "
+        "ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
+        "\nOutput only the create_file tool call.";
+    std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
+    if (!g_worker_think) s += "<think>\n\n</think>\n\n";   // test-writers are instruct lanes
+    return s;
+}
 
-    // collect every *.test.js under the work dir (recursive — boss may use subdirs)
-    std::vector<std::string> tests; std::error_code ec;
+// PA.4: files-on-disk finalize + the "test verifier" (replaces merge-gather under --tools).
+//   1) STORE modules to disk; 2) TEST-GEN: a test task per module (given its file + the design),
+//   run as a second pool; 3) STORE tests; 4) VERIFY: run every *.test.js (done only when green).
+static void finalize_verify(const WorkOrder &wo,
+                            const std::vector<std::pair<std::string,std::string>> &worker_results,
+                            int n_lanes, int max_new) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fprintf(stderr, "\n══ PA.4 STORE — writing module files to %s ══\n", g_work_dir);
+    run_worker_tools(worker_results);                    // modules → disk
+
+    // ── TEST-GEN: one test task per module (*.js, not *.test.js) ──
+    std::vector<std::string> mods;
+    for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        std::string n = it->path().filename().string();
+        if (n.size() >= 3 && n.substr(n.size()-3) == ".js" &&
+            !(n.size() >= 8 && n.substr(n.size()-8) == ".test.js")) mods.push_back(it->path().string());
+    }
+    std::sort(mods.begin(), mods.end());
+    if (!mods.empty()) {
+        fprintf(stderr, "\n══ PA.4 TEST-GEN — writing a test per module (given file + design): %d module(s) ══\n", (int)mods.size());
+        std::vector<std::string> items, ids;
+        for (auto &m : mods) {
+            std::string rel = fs::relative(m, g_work_dir, ec).string();
+            std::string content; FILE *f = fopen(m.c_str(), "r");
+            if (f) { char b[8192]; size_t k; while ((k = fread(b,1,sizeof(b),f)) > 0) content.append(b,k); fclose(f); }
+            items.push_back(build_test_task(rel, content, wo.shared));
+            ids.push_back(rel);
+        }
+        std::vector<std::string> touts;
+        run_pool(items, n_lanes, max_new, &touts, "");   // test-writer lanes
+        std::vector<std::pair<std::string,std::string>> test_results;
+        for (size_t i = 0; i < ids.size() && i < touts.size(); i++) {
+            std::string body = touts[i]; size_t th = body.find("</think>");
+            if (th != std::string::npos) body = body.substr(th + 8);
+            test_results.push_back({ ids[i], trim(body) });
+        }
+        fprintf(stderr, "\n══ PA.4 STORE — writing test files ══\n");
+        run_worker_tools(test_results);
+    }
+
+    // ── VERIFY: run every *.test.js ──
+    std::vector<std::string> tests;
     for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) break;
@@ -1269,12 +1327,8 @@ static void finalize_verify(const std::vector<std::pair<std::string,std::string>
         }
     }
     std::sort(tests.begin(), tests.end());
-
     fprintf(stderr, "\n══ PA.4 VERIFY — test verifier: %d test file(s) ══\n", (int)tests.size());
-    if (tests.empty()) {
-        fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify (boss/workers wrote no tests)\n");
-        return;
-    }
+    if (tests.empty()) { fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify\n"); return; }
     int passed = 0;
     for (auto &t : tests) {
         std::string rel = fs::relative(t, g_work_dir, ec).string();
@@ -1818,7 +1872,7 @@ int main(int argc, char **argv) {
                     worker_results.push_back({ wo.pieces[i].id, body });
                 }
             }
-            if (g_tools) finalize_verify(worker_results);   // PA.4: files on disk + run the test verifier (no merge)
+            if (g_tools) finalize_verify(wo, worker_results, n_streams, max_new);  // PA.4: store modules → gen+run tests → verify
             else         finish_gather(wo, worker_results, boss_self_output, n_streams);  // legacy single-blob merge
         } else {
             for (size_t i = 0; i < wo.pieces.size() && i < outputs.size(); i++) {
