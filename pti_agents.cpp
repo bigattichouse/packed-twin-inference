@@ -1753,6 +1753,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mtp-test")) mtp_test = true;
         else if ((!strcmp(argv[i], "-t") || !strcmp(argv[i], "--temp")) && i+1 < argc) g_temp = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
+        else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
         else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
         else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--all-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
@@ -1784,9 +1785,10 @@ int main(int argc, char **argv) {
 
     // ── Qwen3.6 recommended sampling (model card), keyed by mode; -t overrides temp ──
     // Qwen: NEVER greedy in thinking mode (repetition/degradation). --mtp is the lone greedy path.
-    if (g_mtp) {
+    if (g_mtp || g_greedy) {
         g_greedy = true;
-        fprintf(stderr, "[sampling] --mtp → greedy (MTP is greedy speculative decode)\n");
+        fprintf(stderr, "[sampling] greedy (%s) — diagnostic/reference, not the product\n",
+                g_mtp ? "--mtp speculative" : "--greedy");
     } else {
         g_boss_sp   = qwen_params(g_boss_think,   g_general);   // boss: think (coding/general) or instruct
         g_worker_sp = qwen_params(g_worker_think, false);       // workers: think/coding or instruct
