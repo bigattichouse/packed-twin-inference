@@ -11,3 +11,4 @@ libpti_cuda.so
 pti_llama
 pti_mtp
 pti_4seq
+validate/

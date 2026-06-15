@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <filesystem>
 #include <regex>
 #include <string>
@@ -864,6 +865,20 @@ static const char *BOSS_PROMPT =
     "the piece you expect to be the most code (the most involved component) first, so the longest\n"
     "job starts earliest and the lanes finish together (less idle tail). Emit the envelope only.";
 
+// Boss system prompt + a tools-mode addendum (files on disk, dir structure, per-module tests,
+// the final verifier). Used wherever the boss is prompted.
+static std::string boss_system_text() {
+    std::string p = BOSS_PROMPT;
+    if (g_tools)
+        p += "\n\nTOOLS / FILES MODE: workers write REAL files to disk. Plan a clean DIRECTORY "
+             "STRUCTURE (e.g. src/ for modules, test/ for tests) and state it in the shared block. "
+             "EACH piece must produce its module file AND a matching test file (<name>.test.js, "
+             "console.assert, process.exit(1) on failure). Split by module — never one giant file. "
+             "Write the entry point (e.g. index.html) as its own piece wiring the modules. After all "
+             "pieces finish, a VERIFIER runs every test file; the job is DONE only when the tests pass.";
+    return p;
+}
+
 // lean worker preamble — the framework lives in the boss, NOT here (design §3/§5.2)
 static const char *WORKER_PREAMBLE =
     "You implement ONE piece of a larger program. You are given a frozen shared interface and\n"
@@ -878,15 +893,14 @@ static const char *WORKER_PREAMBLE =
 static std::string worker_preamble_text() {
     std::string p = WORKER_PREAMBLE;
     if (g_tools) {
-        p += "\n\nYou MAY call tools to act on the filesystem. Emit calls in EXACTLY this XML "
-             "format (the tool NAME is the tag; each parameter is a nested tag):\n"
-             "<create_file>\n<path>relative/path.ext</path>\n<content>\n"
-             "...the full file contents...\n</content>\n</create_file>\n"
-             "- create_file — write your implementation (and its tests) to a file. RELATIVE paths only.";
-        if (g_allow_run)
-            p += "\n<execute_bash>\n<command>npm test</command>\n</execute_bash>\n"
-                 "- execute_bash — run a quick check or your tests; the output is captured and shown to the coordinator.";
-        p += "\nUse the tools to write your files, then also output the code inline as usual.";
+        p += "\n\nYou MUST save your work to files with this tool (the tool NAME is the tag; each "
+             "parameter is a nested tag):\n"
+             "<create_file>\n<path>relative/path.ext</path>\n<content>\n...full file...\n</content>\n</create_file>\n"
+             "- Write your module to its file, using the exact path/folders the shared interface specifies.\n"
+             "- ALSO write a matching test file (e.g. <name>.test.js) with console.assert checks that call "
+             "process.exit(1) on ANY failure — it must be runnable as `node <name>.test.js` and exit "
+             "non-zero when it fails. A VERIFIER runs every test file at the end; your code must pass.\n"
+             "Emit one create_file per file (module, then its test). RELATIVE paths only.";
     }
     return p;
 }
@@ -1236,6 +1250,49 @@ static void finish_gather(const WorkOrder &wo,
     write_artifact(artifact);
 }
 
+// PA.4: files-on-disk finalize + the "test verifier". Replaces the merge-gather when --tools:
+// store each worker's files (create_file), then run EVERY *.test.js as the verifier — the run is
+// "done" only when they pass. No code re-emission (that stripped tests / drifted code, §3.2).
+static void finalize_verify(const std::vector<std::pair<std::string,std::string>> &worker_results) {
+    namespace fs = std::filesystem;
+    fprintf(stderr, "\n══ PA.4 STORE — writing worker files to %s ══\n", g_work_dir);
+    run_worker_tools(worker_results);                    // create_file → real files on disk
+
+    // collect every *.test.js under the work dir (recursive — boss may use subdirs)
+    std::vector<std::string> tests; std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (it->is_regular_file(ec)) {
+            std::string n = it->path().filename().string();
+            if (n.size() >= 8 && n.substr(n.size() - 8) == ".test.js") tests.push_back(it->path().string());
+        }
+    }
+    std::sort(tests.begin(), tests.end());
+
+    fprintf(stderr, "\n══ PA.4 VERIFY — test verifier: %d test file(s) ══\n", (int)tests.size());
+    if (tests.empty()) {
+        fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify (boss/workers wrote no tests)\n");
+        return;
+    }
+    int passed = 0;
+    for (auto &t : tests) {
+        std::string rel = fs::relative(t, g_work_dir, ec).string();
+        std::string cmd = "cd '" + std::string(g_work_dir) + "' && timeout 30 node '" + rel + "' 2>&1";
+        FILE *pp = popen(cmd.c_str(), "r");
+        std::string out; if (pp) { char b[4096]; size_t k; while ((k = fread(b,1,sizeof(b),pp)) > 0) out.append(b,k); }
+        int rc = pp ? pclose(pp) : -1; int code = (pp && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
+        bool ok = (code == 0);
+        passed += ok ? 1 : 0;
+        std::string tail = ok ? "" : ("  (exit " + std::to_string(code) + ")");
+        fprintf(stderr, "  %s %s%s\n", ok ? "[PASS]" : "[FAIL]", rel.c_str(), tail.c_str());
+        if (!ok && !out.empty()) { if (out.size() > 400) out = out.substr(0,400) + "..."; fprintf(stderr, "      %s\n", out.c_str()); }
+    }
+    fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — %s ══\n",
+            passed, (int)tests.size(),
+            passed == (int)tests.size() ? "DONE (all green)" : "NOT all passing (repair loop = PA.4c)");
+}
+
 // Self-test for gather text utilities (GPU-free, like --parse-test)
 static int gather_self_test() {
     fprintf(stderr, "── PA.1c gather self-test ──\n");
@@ -1452,7 +1509,7 @@ static void run_pipeline(const std::string &task, int max_new, int n_lanes) {
 
     // prefill boss prompt into seq BOSS
     G.tmpl = llama_model_chat_template(G.model, nullptr);
-    std::string bprompt = apply_chat_template({ {"system", BOSS_PROMPT}, {"user", task} });
+    std::string bprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", task} });
     if (!g_boss_think) bprompt += "<think>\n\n</think>\n\n";   // boss plan (streaming) — boss role
     {
         std::vector<llama_token> bt(bprompt.size() + 16);
@@ -1720,7 +1777,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         G.tmpl = llama_model_chat_template(G.model, nullptr);
-        std::vector<Msg> msgs = {{"system", BOSS_PROMPT}, {"user", task}};
+        std::vector<Msg> msgs = {{"system", boss_system_text()}, {"user", task}};
         std::string prompt = apply_chat_template(msgs);
         if (!g_boss_think) prompt += "<think>\n\n</think>\n\n";   // boss plan (non-stream) — boss role
         fprintf(stderr, "\n══ PA.1 PLAN — boss decomposing ══\n  task: %s\n\n", task);
@@ -1761,7 +1818,8 @@ int main(int argc, char **argv) {
                     worker_results.push_back({ wo.pieces[i].id, body });
                 }
             }
-            finish_gather(wo, worker_results, boss_self_output, n_streams);
+            if (g_tools) finalize_verify(worker_results);   // PA.4: files on disk + run the test verifier (no merge)
+            else         finish_gather(wo, worker_results, boss_self_output, n_streams);  // legacy single-blob merge
         } else {
             for (size_t i = 0; i < wo.pieces.size() && i < outputs.size(); i++) {
                 std::string body = outputs[i];
