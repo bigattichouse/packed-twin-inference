@@ -18,6 +18,7 @@
  */
 
 #include "../llama.cpp/include/llama.h"
+#include "../llama.cpp/src/llama-ext.h"   // pre-norm hidden access for MTP (PA.3)
 
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +50,7 @@ static bool g_no_gather    = false;   // --no-gather: skip gather phase, print p
 static bool g_tools        = false;   // --tools: let workers emit <function=...> tool calls (write_file/run)
 static bool g_allow_run    = false;   // --allow-run: permit the `run` verb (sandboxed shell exec); implies --tools
 static char g_work_dir[512] = "pti_work";  // --work-dir: sandbox dir for write_file / run
+static bool g_mtp          = false;   // --mtp: per-lane MTP drafting (PA.3) — doubles n_seq_max
 static enum ggml_log_level g_last_lvl = GGML_LOG_LEVEL_NONE;
 static void pti_log_cb(enum ggml_log_level level, const char *text, void *) {
     if (g_verbose_logs) { fputs(text, stderr); return; }
@@ -96,12 +98,14 @@ struct Stream {
 };
 
 struct Globals {
-    llama_model       *model = nullptr;
-    const llama_vocab *vocab = nullptr;
-    llama_context     *ctx   = nullptr;
-    llama_memory_t     mem   = nullptr;
+    llama_model       *model   = nullptr;
+    const llama_vocab *vocab   = nullptr;
+    llama_context     *ctx     = nullptr;
+    llama_memory_t     mem     = nullptr;
     int32_t            n_vocab = 0;
-    const char        *tmpl  = nullptr;   // chat template (PA.1 boss prompting)
+    const char        *tmpl    = nullptr;   // chat template (PA.1 boss prompting)
+    llama_context     *ctx_mtp = nullptr;   // PA.3: nextn-head draft context (--mtp)
+    int32_t            n_embd  = 0;         // model hidden size (MTP embd feed)
 } G;
 
 static std::string tok_str(llama_token t) {
@@ -218,10 +222,80 @@ static int run_streams(std::vector<Stream> &streams, int max_new, bool packed,
     return total;
 }
 
+// ───────────────────────── PA.3: per-lane MTP drafting ───────────────────────
+// Pure bookkeeping (model-free, unit-tested via --mtp-test). See spec/PA3_MTP_DESIGN.md.
+
+// Per-lane sequence layout when --mtp is on (else: lanes 0..n-1, base n).
+static int mtp_ckpt_seq(int lane, int n_lanes) { return n_lanes + lane; }  // checkpoint of lane L
+static int mtp_base_seq(int n_lanes)           { return 2 * n_lanes; }     // prefix-cache seq
+static int mtp_seqmax(int n_lanes, bool mtp_on){ return mtp_on ? 2 * n_lanes + 1 : n_lanes + 1; }
+
+// Verdict of verifying one packed MTP step for a lane: how many tokens were emitted
+// (e), how many drafts accepted (acc), whether it was a full accept, whether to stop.
+struct MtpVerdict { int e; int acc; bool full; bool stop; };
+
+// a0 = real next token (argmax at tok_last); a1 = next-next (argmax at draft slot,
+// only meaningful on a full accept). EOG short-circuits before consuming the draft.
+static MtpVerdict mtp_verify(bool has_draft, llama_token draft,
+                             llama_token a0, bool a0_eog,
+                             llama_token a1, bool a1_eog) {
+    (void)a1;
+    MtpVerdict v{1, 0, false, false};
+    if (a0_eog) { v.stop = true; return v; }      // emitted a0 (EOG) — never draft past it
+    if (has_draft && a0 == draft) {               // draft matched the real next token
+        v.e = 2; v.acc = 1; v.full = true;
+        if (a1_eog) v.stop = true;
+    }
+    return v;
+}
+
+// ───────────────────────── PA.3: MTP draft context + feed ────────────────────
+// Create the nextn-head draft context (one MTP seq per lane). Returns false if the
+// model has no nextn head (caller runs greedy). Mirrors pti_lookup M7.1.
+static bool setup_mtp(int n_lanes) {
+    llama_set_embeddings_pre_norm(G.ctx, true, false);    // expose pre-norm hidden on main ctx
+    llama_context_params mp = llama_context_default_params();
+    mp.n_ctx     = llama_n_ctx(G.ctx);
+    mp.n_batch   = PREFILL_CHUNK;
+    mp.n_seq_max = n_lanes;
+    mp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    mp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    G.ctx_mtp = llama_init_from_model(G.model, mp);
+    if (G.ctx_mtp) {
+        llama_set_embeddings_pre_norm(G.ctx_mtp, true, true);
+        fprintf(stderr, "MTP draft context: active (%d lanes)\n", n_lanes);
+        return true;
+    }
+    fprintf(stderr, "MTP draft context: UNAVAILABLE (no nextn head?) — running greedy\n");
+    return false;
+}
+
+// Feed one (emitted token, its pre-norm hidden from the MAIN ctx) pair into the MTP
+// context at (seq, pos); argmax of the nextn logits = draft for pos+1. Last-pair-only
+// (n=1), matching pti_lookup. Returns -1 on failure. `mb` must be embd-capable.
+static llama_token mtp_feed1(llama_batch *mb, llama_seq_id seq,
+                             llama_token tok, int h_idx, llama_pos pos) {
+    if (!G.ctx_mtp) return -1;
+    const float *h = llama_get_embeddings_pre_norm_ith(G.ctx, h_idx);
+    if (!h) return -1;
+    mb->n_tokens     = 1;
+    mb->token[0]     = tok;
+    mb->pos[0]       = pos;
+    mb->n_seq_id[0]  = 1;
+    mb->seq_id[0][0] = seq;
+    mb->logits[0]    = 1;
+    memcpy(mb->embd, h, (size_t)G.n_embd * sizeof(float));
+    if (llama_decode(G.ctx_mtp, *mb) != 0) return -1;
+    const float *logits = llama_get_logits_ith(G.ctx_mtp, 0);
+    if (!logits) return -1;
+    return (llama_token)argmax_f(logits, G.n_vocab);
+}
+
 // ───────────────────────── PA.2: work-pool ───────────────────────────────────
 // M items over n_lanes; a lane that finishes (EOG or cap) is refilled from the
 // queue (seq_rm + prefill the next item), keeping the batch full while backlog
-// lasts. The pooled fix for the PA.1b straggler.
+// lasts. The pooled fix for the PA.1b straggler. With --mtp (PA.3) each lane also
+// carries a nextn draft, verified in the same batch, with per-lane SSM rollback.
 static void run_pool(const std::vector<std::string> &items, int n_lanes, int max_new,
                      std::vector<std::string> *out_opt = nullptr, const std::string &prefix = "") {
     int M = (int)items.size();
@@ -234,7 +308,9 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
 
     // ── PA.2.1: cache the common prefix (preamble+shared) once in a base seq; each lane is a
     //    seq_cp clone of it + a small delta-prefill of just the item (the M7.5b base cache).
-    const llama_seq_id BASE = n_lanes;                 // base seq (needs n_seq_max >= n_lanes+1)
+    // seq layout: working lanes 0..n_lanes-1; with --mtp, checkpoints n_lanes..2n-1,
+    // base 2n (mtp_seqmax). Without --mtp, base = n_lanes (the original layout).
+    const llama_seq_id BASE = g_mtp ? (llama_seq_id)mtp_base_seq(n_lanes) : (llama_seq_id)n_lanes;
     std::vector<llama_token> prefix_toks; int prefix_len = 0;
     bool use_cache = !prefix.empty();
     if (use_cache) {
@@ -248,6 +324,18 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
             Stream base_st; base_st.prompt_toks = prefix_toks; int li = 0;
             if (!prefill_stream(base_st, BASE, batch, &li)) use_cache = false;   // cache the starter once
         }
+    }
+
+    // ── PA.3 MTP per-lane state ──────────────────────────────────────────────
+    bool mtp_on = g_mtp && G.ctx_mtp;
+    std::vector<llama_token> cand(n_lanes, -1);        // current draft per lane (-1 = none)
+    llama_batch mtp_batch = {};
+    llama_memory_t mem_mtp = nullptr;
+    long n_fire = 0, n_acc = 0;                        // MTP stats
+    if (mtp_on) {
+        mtp_batch = llama_batch_init(8, G.n_embd, 1);  // embd-capable, 1 pair/feed
+        mtp_batch.token = (llama_token *)malloc(8 * sizeof(llama_token));
+        mem_mtp = llama_get_memory(G.ctx_mtp);
     }
 
     auto start_lane = [&](int L, int item) -> bool {
@@ -279,6 +367,12 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
         lanes[L].live     = !llama_vocab_is_eog(G.vocab, lanes[L].tok_last);
         lane_item[L]      = item;
         total++;
+        if (mtp_on) {                                   // seed this lane's draft from the prefill hidden
+            llama_memory_seq_rm(mem_mtp, L, 0, -1);     // fresh MTP cache for the (re)started lane
+            cand[L] = lanes[L].live
+                    ? mtp_feed1(&mtp_batch, L, lanes[L].tok_last, last_idx, lanes[L].pos)
+                    : -1;
+        }
         fprintf(stderr, "  → item %d → lane %d (%s)\n", item, L, cached ? "cloned+delta" : "full prefill");
         return true;
     };
@@ -288,7 +382,93 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
     double prefill0 = now_sec() - t0;
 
     double t1 = now_sec();
-    for (;;) {
+    if (mtp_on) {
+      // ── PA.3 packed MTP loop: per-lane draft + batched verify + SSM rollback ──
+      struct Slot { int lane, tok_idx, draft_idx; bool draft; llama_token tok_old; llama_pos p0; };
+      for (;;) {
+        std::vector<int> ord;
+        for (int L = 0; L < n_lanes; L++)
+            if (lanes[L].live && lanes[L].n_gen < max_new) ord.push_back(L);
+        if (ord.empty()) break;
+
+        // refresh each lane's checkpoint S(pos) and build the [tok_last, draft?] batch
+        batch_clear(&batch);
+        std::vector<Slot> slots;
+        for (int L : ord) {
+            llama_seq_id cseq = (llama_seq_id)mtp_ckpt_seq(L, n_lanes);
+            llama_memory_seq_rm(G.mem, cseq, 0, -1);
+            llama_memory_seq_cp(G.mem, L, cseq, 0, -1);          // checkpoint = S(pos)
+            Slot s; s.lane = L; s.tok_old = lanes[L].tok_last; s.p0 = lanes[L].pos;
+            s.draft = (cand[L] != -1);
+            s.tok_idx = batch.n_tokens;
+            batch_add(&batch, lanes[L].tok_last, lanes[L].pos, L, true);
+            if (s.draft) { s.draft_idx = batch.n_tokens;
+                batch_add(&batch, cand[L], lanes[L].pos + 1, L, true); }
+            else s.draft_idx = -1;
+            slots.push_back(s);
+        }
+        if (llama_decode(G.ctx, batch) != 0) { fprintf(stderr, "pool(mtp) decode failed\n"); break; }
+
+        // verify + emit; queue MTP feeds (read pre-norm BEFORE any rebuild decode)
+        struct Feed { llama_seq_id seq; llama_token tok; int h_idx; llama_pos pos; int lane; };
+        std::vector<Feed>  feeds;
+        std::vector<int>   finished;
+        std::vector<Slot>  rebuild;
+        for (auto &s : slots) {
+            int L = s.lane;
+            llama_token a0 = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, s.tok_idx), G.n_vocab);
+            bool a0_eog = llama_vocab_is_eog(G.vocab, a0);
+            llama_token a1 = 0; bool a1_eog = false;
+            if (s.draft && a0 == cand[L]) {
+                a1 = (llama_token)argmax_f(llama_get_logits_ith(G.ctx, s.draft_idx), G.n_vocab);
+                a1_eog = llama_vocab_is_eog(G.vocab, a1);
+            }
+            MtpVerdict v = mtp_verify(s.draft, cand[L], a0, a0_eog, a1, a1_eog);
+            if (s.draft) { n_fire++; n_acc += v.acc; }
+
+            if (!a0_eog) lanes[L].text += tok_str(a0);
+            lanes[L].n_gen++; total++;
+            llama_token last_emit = a0; int last_h = s.tok_idx;
+            if (v.full) {
+                if (!a1_eog) lanes[L].text += tok_str(a1);
+                lanes[L].n_gen++; total++;
+                last_emit = a1; last_h = s.draft_idx;
+            }
+            lanes[L].pos += v.e; lanes[L].tok_last = last_emit;
+
+            bool done = v.stop || lanes[L].n_gen >= max_new;
+            if (!done) feeds.push_back({ (llama_seq_id)L, last_emit, last_h, lanes[L].pos, L });
+            if (done) {
+                out[lane_item[L]] = lanes[L].text;
+                fprintf(stderr, "  ✓ item %d done (%d tok)\n", lane_item[L], lanes[L].n_gen);
+                lanes[L].live = false; finished.push_back(L);
+            } else if (!v.full) {
+                rebuild.push_back(s);                              // missed → needs rollback
+            }
+        }
+
+        // next drafts (uses the main decode's pre-norm hidden — must precede rebuild)
+        for (auto &f : feeds) cand[f.lane] = mtp_feed1(&mtp_batch, f.seq, f.tok, f.h_idx, f.pos);
+
+        // rollback missed lanes to S(p0) and re-consume tok_old → S(p0+1)
+        if (!rebuild.empty()) {
+            batch_clear(&batch);
+            for (auto &s : rebuild) {
+                llama_seq_id cseq = (llama_seq_id)mtp_ckpt_seq(s.lane, n_lanes);
+                llama_memory_seq_rm(G.mem, s.lane, 0, -1);
+                llama_memory_seq_cp(G.mem, cseq, s.lane, 0, -1);  // restore S(p0)
+                batch_add(&batch, s.tok_old, s.p0, s.lane, false);
+            }
+            if (llama_decode(G.ctx, batch) != 0) { fprintf(stderr, "pool(mtp) rebuild failed\n"); break; }
+        }
+
+        for (int L : finished) {                                  // refill from the queue, else idle
+            if (next < M) { start_lane(L, next++); refills++; }
+            else { lane_item[L] = -1; cand[L] = -1; }
+        }
+      }
+    } else {
+      for (;;) {
         batch_clear(&batch);
         std::vector<int> ord;
         for (int L = 0; L < n_lanes; L++)
@@ -316,8 +496,10 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
             if (next < M) { start_lane(L, next++); refills++; }
             else lane_item[L] = -1;
         }
+      }
     }
     double wall = now_sec() - t1;
+    if (mtp_on) { free(mtp_batch.token); mtp_batch.token = nullptr; llama_batch_free(mtp_batch); }
     llama_batch_free(batch);
 
     double agg = wall > 0 ? total / wall : 0.0;
@@ -327,6 +509,8 @@ static void run_pool(const std::vector<std::string> &items, int n_lanes, int max
     if (use_cache) fprintf(stderr, "  prefix cache: %d tok cloned per lane (delta-prefill only the item)\n", prefix_len);
     fprintf(stderr, "  %d tok in %.1fs decode (+%.1fs initial prefill)\n", total, wall, prefill0);
     fprintf(stderr, "  aggregate  : %.1f tok/s = %.2fx vs 19.3 baseline\n", agg, agg / 19.3);
+    if (mtp_on) fprintf(stderr, "  MTP drafts : %ld fired, %ld accepted (%.0f%%)\n",
+                        n_fire, n_acc, n_fire ? 100.0 * n_acc / n_fire : 0.0);
     fprintf(stderr, "  sequential ≈ %.0fs for the same %d tok; pool did it in %.1fs\n",
             total / 19.3, total, wall);
     fprintf(stderr, "════════════════════════════════════════════════\n");
@@ -1155,6 +1339,24 @@ static int gather_self_test() {
     return fail > 0 ? 3 : 0;
 }
 
+// GPU-free self-test for the MTP bookkeeping (helpers defined above run_pool).
+static int mtp_self_test() {
+    fprintf(stderr, "── PA.3 MTP self-test ──\n");
+    int fail = 0;
+    auto chk = [&](const char *name, bool ok){
+        fprintf(stderr, "  %s: %s\n", name, ok ? "PASS" : "FAIL"); if (!ok) fail++; };
+    { MtpVerdict v = mtp_verify(true,  7, 7, false, 9, false); chk("M1 full accept", v.e==2 && v.acc==1 && v.full && !v.stop); }
+    { MtpVerdict v = mtp_verify(true,  7, 5, false, 0, false); chk("M2 miss",        v.e==1 && v.acc==0 && !v.full && !v.stop); }
+    { MtpVerdict v = mtp_verify(false,-1, 5, false, 0, false); chk("M3 no draft",    v.e==1 && v.acc==0 && !v.full); }
+    { MtpVerdict v = mtp_verify(true,  7, 7, true,  9, false); chk("M4 a0 eog",      v.e==1 && v.stop); }
+    { MtpVerdict v = mtp_verify(true,  7, 7, false, 9, true ); chk("M5 a1 eog",      v.e==2 && v.full && v.stop); }
+    chk("M6 ckpt seq", mtp_ckpt_seq(0,4)==4 && mtp_ckpt_seq(3,4)==7);
+    chk("M7 base seq", mtp_base_seq(4)==8);
+    chk("M8 seqmax",   mtp_seqmax(4,true)==9 && mtp_seqmax(4,false)==5);
+    fprintf(stderr, "  %s (%d/8 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 8 - fail);
+    return fail > 0 ? 4 : 0;
+}
+
 // ───────────────────────── PA.3: streaming decomposition ─────────────────────
 // Boss (lane nW) plans WHILE workers (lanes 0..nW-1) execute. Each <<<PIECE>>>…
 // <<</PIECE>>> the boss closes is parsed from its live stream and enqueued; a free
@@ -1355,6 +1557,7 @@ int main(int argc, char **argv) {
     bool  show_text = false;
     bool  parse_test = false;
     bool  gather_test = false;
+    bool  mtp_test = false;
     int   pool_items = 0;
     bool  plan_only  = false;
     bool  kv_q8      = true;    // Q8 KV default: byte-exactness is a spec-dec artifact, not needed for agents (~2x context)
@@ -1380,11 +1583,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tools")) g_tools = true;
         else if (!strcmp(argv[i], "--allow-run")) { g_allow_run = true; g_tools = true; }  // run implies tools
         else if (!strcmp(argv[i], "--work-dir") && i+1 < argc) strncpy(g_work_dir, argv[++i], sizeof(g_work_dir)-1);
+        else if (!strcmp(argv[i], "--mtp"))      g_mtp = true;            // PA.3 per-lane MTP drafting
+        else if (!strcmp(argv[i], "--mtp-test")) mtp_test = true;
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
-        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
+        else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
     }
     if (parse_test)  return parse_self_test();   // PA.1a: GPU-free envelope parser check
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
+    if (mtp_test)    return mtp_self_test();     // PA.3: GPU-free MTP bookkeeping self-test
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
@@ -1407,10 +1613,17 @@ int main(int argc, char **argv) {
     G.vocab   = llama_model_get_vocab(G.model);
     G.n_vocab = llama_vocab_n_tokens(G.vocab);
 
+    if (g_mtp && !no_stream) {    // PA.3 MTP v1 lives in the pool path; streaming MTP is a follow-up
+        fprintf(stderr, "[note] --mtp is pool-path only (v1); forcing --no-stream\n");
+        no_stream = true;
+    }
+
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t)n_ctx;
     cp.n_batch = PREFILL_CHUNK;
-    cp.n_seq_max = (uint32_t)n_streams + (task[0] ? 1u : 0u);  // pipeline reserves a base seq for the prefix cache (PA.2.1)
+    // --mtp reserves a checkpoint seq per lane (2N) + base (mtp_seqmax); else N + base.
+    cp.n_seq_max = (uint32_t)(g_mtp ? mtp_seqmax(n_streams, true)
+                                    : n_streams + (task[0] ? 1 : 0));
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.kv_unified      = false;   // M7.2 exactness: unified KV flips fp near-ties by batch shape
     if (kv_q8) {                  // ~2x context; trades byte-determinism (M7.2: Q8 KV is batch-shape-dependent under FA)
@@ -1420,6 +1633,10 @@ int main(int argc, char **argv) {
     G.ctx = llama_init_from_model(G.model, cp);
     if (!G.ctx) { fprintf(stderr, "context failed\n"); return 1; }
     G.mem = llama_get_memory(G.ctx);
+    if (g_mtp) {                  // PA.3: spin up the nextn-head draft context (falls back if absent)
+        G.n_embd = llama_model_n_embd(G.model);
+        if (!setup_mtp(n_streams)) g_mtp = false;
+    }
 
     // ── PA.1 pipeline (PA.1a = PLAN phase): boss decomposes the task ──────────
     if (task[0]) {
@@ -1479,6 +1696,7 @@ int main(int argc, char **argv) {
                 printf("\n───── item %s ─────\n%s\n", wo.pieces[i].id.c_str(), trim(body).c_str());
             }
         }
+        if (G.ctx_mtp) llama_free(G.ctx_mtp);
         llama_free(G.ctx);
         llama_model_free(G.model);
         llama_backend_free();
