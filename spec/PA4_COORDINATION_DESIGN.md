@@ -59,6 +59,33 @@ already detected today (EOG / `max_new`); PA.4 promotes it from a stderr line to
 
 ---
 
+## 2.1 Worker file lifecycle — craft → write → store → done → next (PA.5 timing change)
+
+User's model (2026-06-15): *"workers should be able to save their own files, so other workers can
+edit them if there's a problem. craft, write, store, done … next work item."*
+
+Today (PA.5 v1) tool calls execute **post-completion, in gather** — so files only appear at the very
+end, too late for one worker to edit another's. PA.4 moves execution **per-lane, on DONE**:
+
+```
+worker:  craft (generate) → emit create_file → DONE
+harness: store file to shared work-dir → (verify, §3) → Board update → refill lane with next item
+```
+
+So files **accumulate on disk during the run**. That is precisely what lets another worker **edit**
+them: an amend item (§3) targets file X; the harness reads X's *current* contents off disk, injects
+them + the test error into the amend prompt; any free lane pops it and rewrites X via `create_file`
+(overwrite). The **work-dir (files) + the Board (statuses) together are the blackboard** — workers
+coordinate through saved files, the boss/harness through the Board.
+
+Implementation: in the pool loop's `finished`-lane handling, run that lane's tool calls *before*
+refilling it (instead of batching all tool calls in `finish_gather`). A small `read_file` helper (or
+just harness-side disk read) supplies the current contents for amend items. Gather then *verifies
+and assembles* real files rather than re-emitting and flattening them (which is what stripped the
+tests in the single-file run).
+
+---
+
 ## 3. Verify → repair loop (the test agent)
 
 After a worker's files land (`create_file`, executed in the tool pass), the harness runs that
@@ -79,6 +106,33 @@ piece's test (`execute_bash`, e.g. `node bird.test.js`), captures pass/fail + ou
 - **v1**: the *harness* runs tests + writes the Board (simplest, deterministic).
 - **v2**: a dedicated **critic lane** that runs/reads tests and posts amend requests to the boss
   queue — a real agent role. (§8.4 boss-queue.)
+
+---
+
+## 3.2 Gather → finalize/verify (often nothing to do)
+
+User's question (2026-06-15): *"so gather shouldn't really happen in this new world?"* — correct.
+
+In the file-per-worker world the **text-merge gather is redundant and should not run**: the
+deliverable is the files on disk, which the workers already wrote. Re-emitting a merged blob is both
+*expensive* (a full boss generation **with thinking** — one of packed's two big serial costs, the
+other being the plan) and *lossy* — the single-file run's gather **stripped every test** and drifted
+the code to TypeScript.
+
+Gather collapses into a cheap **finalize/verify** bookend (matches §8.3 "boss verifies the assembled
+tree and runs the smoke test"):
+- ensure the entry point exists (`index.html`) — authored as its own small piece by a worker, or a
+  short boss glue file, **never** a re-emit of everything;
+- run the **full test suite** on the assembled tree (one `execute_bash`) → record on the Board;
+- emit the **Board summary** to the user (pass/fail per module, repairs spent).
+
+No code regeneration. `--out` becomes "point at the work-dir" (or a zip), not "the boss's merged
+blob". The legacy merge-gather (PA.1c) stays available only for the genuine single-blob mode (and
+even there, prefer *one worker writes the entry file that includes the others* over a boss merge).
+
+This is also a **performance** result: deleting the gather-regeneration removes one of packed's two
+big serial costs (plan-think + gather-think) on top of the correctness win — directly narrowing the
+wall-clock gap with the single model in the multi-file regime.
 
 ---
 
