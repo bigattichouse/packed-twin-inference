@@ -160,6 +160,27 @@ The boss emits **intents**; the harness applies them to the Board (boss never wr
 budget); **boss-driven coordination is v2** (`--boss-coord`). This keeps the first cut deterministic
 and testable; the boss-as-coordinator layer rides on top once the mechanics are proven.
 
+### 4.1 PA.4d — escalate to the boss on repair-budget exhaustion (user, 2026-06-15)
+
+Two-level repair hierarchy:
+- **L1 worker repair** (PA.4c): amend the *module*, N rounds — cheap, parallel.
+- **L2 boss arbiter** (PA.4d): when L1 hits `--repair-budget`, instead of a flat `GIVEN UP`, hand the
+  boss the **original plan + interface contract + the failing module + its test + the error/attempt
+  history** and let it **decide**: *quit* (accept/drop the piece, report) or *try something different*
+  — re-spec the module, **fix the TEST**, or re-approach.
+
+**Why it matters (measured 2026-06-15):** the full-arc run gave up 2/3 on `renderer` — but the
+"failure" was a **bug in the test**, not the module: the arc spy used `originalArc.apply(this, ...args)`
+(spread → apply's 2nd arg becomes a number → `CreateListFromArrayLike`). L1 repair is *module-only*,
+so it could never fix it. The boss arbiter — seeing the correct module + the buggy test + the error —
+can fix the test (or accept). This is the authority/context a worker lacks (§8.2 GUIDE/KILL/RESPEC,
+§10 single voice). Cost is bounded: workers grind cheaply in parallel; the serial boss pass fires
+**only on exhaustion** (rare).
+
+Sketch: on `GIVEN_UP`, build a boss-arbiter turn `{goal, contract, module, test, errors, "L1 tried N×"}`
+→ boss emits per-piece `KILL` (accept/drop) or a corrected file (module **or** test) via `create_file`
+→ one more verify. Optionally a small L2 budget so it can't loop.
+
 ---
 
 ## 5. Boss reports to the user — the live board
@@ -234,10 +255,12 @@ One structure, three consumers (§1): harness writes, boss decides, user watches
 ## 10. Build order
 
 - **PA.4a** — Board + event transitions + live checklist render. Workers→DONE→✓ (visibility only).
-- **PA.4b** — test agent verify: run each piece's test, mark ✓/⚠ on the Board.
-- **PA.4c** — amend re-queue + repair budget (the closed loop). *This is the headline.*
-- **PA.4d** (v2) — boss reads the Board snapshot + emits intents (`REQUEUE`/`RESPEC`/`GIVE_UP`);
-  dedicated `--critic` lane; the movable-boss-lock (§8.4).
+- **PA.4b** — test agent verify: run each piece's test, mark ✓/⚠ on the Board. **DONE (2026-06-15).**
+- **PA.4c** — amend re-queue + repair budget (the closed loop). **DONE (2026-06-15)** — wired into
+  `finalize_verify`; ran 2 rounds on the full-arc flappy test (mechanism ✓), but module-only repair
+  can't fix a buggy *test* (§4.1).
+- **PA.4d** (next) — **escalate to boss on budget exhaustion (§4.1):** boss arbiter fixes the test /
+  re-specs / accepts. Then boss-reads-Board intents, a `--critic` lane, and the movable-boss-lock (§8.4).
 
 **Out of scope (v1)**: boss-intent coordination (PA.4d), the movable-boss-lock, streaming-path
 (`run_pipeline`) coordination. v1 = harness-driven verify/repair on the pool path + the live Board.
