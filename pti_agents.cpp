@@ -722,6 +722,8 @@ static WorkOrder parse_work_order(const std::string &text) {
         if (p.id.empty()) { wo.error = "a piece is missing id="; return wo; }
     std::vector<std::string> seen;
     for (auto &p : wo.pieces) for (auto &e : p.exports) {
+        std::string el = e; for (auto &c : el) c = (char)tolower((unsigned char)c);
+        if (el.empty() || el == "none") continue;   // sentinel: piece exports nothing (index.html, *.test.js)
         for (auto &s : seen) if (s == e) { wo.error = "export collision: " + e; return wo; }
         seen.push_back(e);
     }
@@ -773,7 +775,17 @@ static int parse_self_test() {
     fprintf(stderr, "── PA.1a work-order envelope parse self-test ──\n");
     WorkOrder wo = parse_work_order(SAMPLE_ENVELOPE);
     print_work_order(wo);
-    return wo.ok ? 0 : 2;
+    // Regression: the "none" sentinel (index.html, *.test.js) must NOT count as an export collision.
+    const char *NONE_ENV =
+        "<<<PLAN strategy=file lang=js>>>\nshared:\n<blueprint>\nx\n</blueprint>\n"
+        "<<<PIECE id=bird exports=Bird>>>\ninstruction: src/bird.js\n<blueprint>b</blueprint>\n<<</PIECE>>>\n"
+        "<<<PIECE id=index exports=none>>>\ninstruction: index.html\n<blueprint>i</blueprint>\n<<</PIECE>>>\n"
+        "<<<PIECE id=style exports=none>>>\ninstruction: style.css\n<blueprint>s</blueprint>\n<<</PIECE>>>\n"
+        "<<<END>>>\n";
+    WorkOrder w2 = parse_work_order(NONE_ENV);
+    fprintf(stderr, "  none-sentinel: %s (%s)\n", w2.ok ? "PASS" : "FAIL",
+            w2.ok ? "no false collision" : w2.error.c_str());
+    return (wo.ok && w2.ok) ? 0 : 2;
 }
 
 // ── boss prompting (PA.1 PLAN phase) ─────────────────────────────────────────
@@ -1565,9 +1577,10 @@ static void finalize_verify(const WorkOrder &wo,
 // IMPLEMENT pool (modules, reading blueprints) → test-gen + verify. Parallelizes
 // the design thinking (the serial plan tax). See spec/PA6_PIPELINE_DESIGN.md.
 static const char *TRIAGE_PROMPT =
-    "You are the COORDINATOR. Make a BRIEF component MAP for a multi-file project — you are NOT "
-    "designing or coding; separate DESIGNER agents will write each component's blueprint and "
-    "IMPLEMENTERS will code them. Emit ONLY this envelope:\n\n"
+    "You are the COORDINATOR. You ASSIGN work to other agents — you do NOT build code or tests "
+    "yourself. Separate DESIGNER agents write each component's blueprint, IMPLEMENTER agents write the "
+    "code, and the harness generates the tests. Your only job here: a BRIEF component MAP for a "
+    "multi-file project — names, responsibilities, exports, paths. Emit ONLY this envelope:\n\n"
     "<<<PLAN strategy=file lang=LANG>>>\n"
     "shared:\n<blueprint>\n  one or two lines: how the components connect (the goal); deps: []\n</blueprint>\n"
     "<<<PIECE id=NAME exports=SYM,...>>>\n"
@@ -1577,7 +1590,10 @@ static const char *TRIAGE_PROMPT =
     "(one PIECE per component; short lowercase ids like bird, pipes, renderer, engine; include an "
     "index.html piece with id=index)\n"
     "<<<END>>>\n\n"
-    "Keep it to names + one-line responsibilities + exports + paths. Do NOT write specs or code.";
+    "Keep it to names + one-line responsibilities + exports + paths. Do NOT write specs or code.\n"
+    "Do NOT create test pieces (no *.test ids, no NAME.test.js paths) EVEN IF the task asks for tests — "
+    "the harness writes one unit test per module automatically after the modules are built. List ONLY "
+    "the real source modules + the index. Use exports=none for pieces that export nothing (e.g. index).";
 
 static std::string read_file_str(const std::string &path) {
     std::string s; FILE *f = fopen(path.c_str(), "r");
@@ -1665,6 +1681,22 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
     WorkOrder wo = parse_work_order(plan);
     print_work_order(wo);
     if (!wo.ok || wo.pieces.empty()) { fprintf(stderr, "PA.6 triage parse failed: %s\n", wo.error.c_str()); return; }
+
+    // The harness owns test generation (the test-gen stage). Drop any test pieces the triage emitted
+    // anyway, so implementers never write *.test.js (which would duplicate/clash with test-gen).
+    {
+        size_t before = wo.pieces.size();
+        auto is_test = [](const Piece &p) {
+            std::string id = p.id; for (auto &c : id) c = (char)tolower((unsigned char)c);
+            if (id.size() >= 5 && id.substr(id.size()-5) == ".test") return true;
+            std::string in = p.instruction; for (auto &c : in) c = (char)tolower((unsigned char)c);
+            return in.find(".test.js") != std::string::npos;
+        };
+        wo.pieces.erase(std::remove_if(wo.pieces.begin(), wo.pieces.end(), is_test), wo.pieces.end());
+        if (wo.pieces.size() != before)
+            fprintf(stderr, "  (dropped %zu test piece(s) — harness generates tests after build)\n", before - wo.pieces.size());
+        if (wo.pieces.empty()) { fprintf(stderr, "PA.6 triage produced only test pieces — nothing to build\n"); return; }
+    }
     std::string goal = build_goal_blueprint(wo);
 
     // ── DESIGN pool (parallel, THINKING) → design/<id>.blueprint ──
