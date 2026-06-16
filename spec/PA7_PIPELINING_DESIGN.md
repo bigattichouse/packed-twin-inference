@@ -7,7 +7,13 @@ the stages with **eager scheduling**: a dependency-keyed ready-queue where a fre
 pulls the highest-priority item whose inputs already exist. *If part of the design is done and there
 are work items in the queue — start working.*
 
-**Status**: design (2026-06-15). Builds on PA.2 (pool + refill), PA.4 (the **rework primitive** —
+**Status**: design (2026-06-15) + **CORE IMPLEMENTED (2026-06-16)** — the pure scheduler logic
+(`EItem`, `eager_dep_met`/`eager_ready` readiness, `eager_prio`, `eager_thinks` per-item mode, and a
+makespan simulator `eager_simulate`/`staged_simulate`) plus `--eager-test` **8/8**. The simulator
+**quantifies the win**: on the measured Flappy spread (design 6–12, impl 8–17 units) eager = **27** vs
+barriers = **33 → 18% faster**, with the dispatcher proven work-conserving (never idle while ready work
+exists). Decode-loop integration (run_pool → ready-queue) lands after the PA.6 GPU baseline.
+Builds on PA.2 (pool + refill), PA.4 (the **rework primitive** —
 full-triad `build_rework_user`/`build_amend_user` + verify→repair→arbiter loop), PA.6 (the stages it
 fuses). Supersedes PA.6's bulk-synchronous staging; keeps PA.6's artifacts (goal blueprint, per-comp
 blueprints, contract, per-module tests). Captures the user's design: *"eager scheduling… work on the

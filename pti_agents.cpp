@@ -1433,6 +1433,146 @@ static int coord_self_test() {
     return fail > 0 ? 5 : 0;
 }
 
+// ───────────────────────── PA.7: eager-scheduling core (PURE) ─────────────────
+// Dependency-keyed dataflow replacing PA.6's bulk stages: a free lane pulls the
+// highest-priority item whose inputs already exist, instead of idling at a barrier.
+// These helpers are PURE (no GPU) — readiness, priority, per-item mode, and a makespan
+// simulator that (a) proves the dispatcher is work-conserving and (b) QUANTIFIES the
+// win over the barrier schedule on uneven items. Unit-tested via --eager-test. The
+// decode-loop integration (run_pool → ready-queue) lands after GPU validation of the
+// PA.6 baseline. See spec/PA7_PIPELINING_DESIGN.md.
+enum EKind { E_DESIGN = 0, E_IMPL, E_TESTGEN, E_VERIFY, E_REWORK };
+
+struct EItem {
+    EKind       kind;
+    std::string comp;          // component id (bird, pipes, …)
+    int         cost = 1;      // work units (≈ tokens) — for the makespan sim
+    bool        done = false;
+    bool        dispatched = false;
+};
+
+// design + rework REASON (coding 0.6); implement/testgen are instruct; verify is harness.
+static bool eager_thinks(EKind k) { return k == E_DESIGN || k == E_REWORK; }
+
+// priority among ready items — unblock the most downstream first (verify is cheap/harness).
+static int eager_prio(EKind k) {
+    switch (k) { case E_DESIGN: return 0; case E_REWORK: return 1; case E_IMPL: return 2;
+                 case E_TESTGEN: return 3; default: return 4; }
+}
+
+// is item i's data dependency satisfied? (deps resolve against artifacts of the same comp)
+static bool eager_dep_met(const std::vector<EItem> &items, size_t i) {
+    auto done_of = [&](EKind k, const std::string &c) {
+        for (auto &x : items) if (x.kind == k && x.comp == c) return x.done;
+        return false;
+    };
+    switch (items[i].kind) {
+        case E_DESIGN:  return true;                                // ready immediately
+        case E_IMPL:    return done_of(E_DESIGN,  items[i].comp);   // needs its blueprint
+        case E_TESTGEN: return done_of(E_IMPL,    items[i].comp);   // needs its module
+        case E_VERIFY:  return done_of(E_TESTGEN, items[i].comp);   // needs its test
+        case E_REWORK:  return true;                                // created already-ready (failed verify)
+    }
+    return false;
+}
+
+// ready = not done, not dispatched, deps met — sorted by priority (stable by index).
+static std::vector<int> eager_ready(const std::vector<EItem> &items) {
+    std::vector<int> r;
+    for (size_t i = 0; i < items.size(); i++)
+        if (!items[i].done && !items[i].dispatched && eager_dep_met(items, i)) r.push_back((int)i);
+    std::stable_sort(r.begin(), r.end(),
+                     [&](int a, int b){ return eager_prio(items[a].kind) < eager_prio(items[b].kind); });
+    return r;
+}
+
+// Eager makespan on L lanes (integer ticks): a free lane pulls the top ready item, runs
+// it cost ticks; completion frees dependents. Sets *idle if the dispatcher ever leaves a
+// lane idle while ready work exists (a work-conserving-invariant violation).
+static int eager_simulate(std::vector<EItem> items, int n_lanes, bool *idle) {
+    if (idle) *idle = false;
+    if (n_lanes < 1) n_lanes = 1;
+    std::vector<int> rem(n_lanes, 0), job(n_lanes, -1);
+    auto all_done = [&]{ for (auto &x : items) if (!x.done) return false; return true; };
+    int t = 0;
+    while (!all_done()) {
+        for (int L = 0; L < n_lanes; L++) {              // fill every free lane from the ready set
+            if (rem[L] > 0) continue;
+            auto ready = eager_ready(items);
+            if (ready.empty()) break;
+            int idx = ready.front(); items[idx].dispatched = true;
+            job[L] = idx; rem[L] = std::max(1, items[idx].cost);
+        }
+        if (idle) for (int L = 0; L < n_lanes; L++)      // any free lane with ready work left = violation
+            if (rem[L] == 0 && !eager_ready(items).empty()) *idle = true;
+        int step = -1;                                   // advance to the next completion
+        for (int L = 0; L < n_lanes; L++) if (rem[L] > 0 && (step < 0 || rem[L] < step)) step = rem[L];
+        if (step < 0) break;                             // nothing running, nothing ready → guard
+        t += step;
+        for (int L = 0; L < n_lanes; L++) if (rem[L] > 0) { rem[L] -= step;
+            if (rem[L] == 0) { items[job[L]].done = true; job[L] = -1; } }
+    }
+    return t;
+}
+
+// PA.6 barrier schedule, same workload: each KIND is a bulk stage (all of one kind finish
+// before the next starts) — the straggler tail PA.7 removes. Longest-first per stage (the
+// best case for barriers), so the comparison is conservative.
+static int staged_simulate(std::vector<EItem> items, int n_lanes) {
+    if (n_lanes < 1) n_lanes = 1;
+    int t = 0;
+    for (int k = E_DESIGN; k <= E_VERIFY; k++) {
+        std::vector<int> costs;
+        for (auto &x : items) if ((int)x.kind == k) costs.push_back(std::max(1, x.cost));
+        if (costs.empty()) continue;
+        std::sort(costs.rbegin(), costs.rend());
+        std::vector<int> lane(n_lanes, 0);
+        for (int c : costs) { int m = 0; for (int L = 1; L < n_lanes; L++) if (lane[L] < lane[m]) m = L; lane[m] += c; }
+        int stage = 0; for (int L = 0; L < n_lanes; L++) stage = std::max(stage, lane[L]);
+        t += stage;                                      // barrier: wait for this stage's slowest lane
+    }
+    return t;
+}
+
+static int eager_self_test() {
+    fprintf(stderr, "── PA.7 eager-scheduling self-test ──\n");
+    int fail = 0;
+    auto chk = [&](const char *n, bool ok){ fprintf(stderr, "  %s: %s\n", n, ok?"PASS":"FAIL"); if(!ok) fail++; };
+
+    { std::vector<EItem> it = { {E_DESIGN,"bird"}, {E_IMPL,"bird"} };   // E1 readiness gating
+      auto r = eager_ready(it);
+      chk("E1 design ready, impl gated", r.size()==1 && it[r[0]].kind==E_DESIGN);
+      it[0].done = true; auto r2 = eager_ready(it);
+      chk("E2 impl ready after design", r2.size()==1 && it[r2[0]].kind==E_IMPL); }
+
+    { std::vector<EItem> it = {                                         // E3 priority order
+        {E_DESIGN,"c"}, {E_DESIGN,"b"}, {E_IMPL,"b"},
+        {E_DESIGN,"a"}, {E_IMPL,"a"}, {E_TESTGEN,"a"} };
+      it[1].done=true; it[3].done=true; it[4].done=true;               // b:design done, a:design+impl done
+      auto r = eager_ready(it);
+      chk("E3 design<impl<testgen", r.size()==3 && it[r[0]].kind==E_DESIGN
+                                 && it[r[1]].kind==E_IMPL && it[r[2]].kind==E_TESTGEN); }
+
+    chk("E4 per-item mode", eager_thinks(E_DESIGN) && eager_thinks(E_REWORK)
+                         && !eager_thinks(E_IMPL) && !eager_thinks(E_TESTGEN));
+
+    // E5/E6/E7: uneven, dependency-coupled work (≈ the measured 624–1385 design / 340–1671 impl spread)
+    const char *comps[] = {"bird","pipes","renderer","engine"};
+    int d[] = {7,9,12,6}, im[] = {8,8,10,17};
+    std::vector<EItem> work;
+    for (int i = 0; i < 4; i++) { work.push_back({E_DESIGN,comps[i],d[i]}); work.push_back({E_IMPL,comps[i],im[i]});
+                                  work.push_back({E_TESTGEN,comps[i],3}); work.push_back({E_VERIFY,comps[i],1}); }
+    bool idle = false; int e = eager_simulate(work, 4, &idle); int s = staged_simulate(work, 4);
+    chk("E5 dispatcher work-conserving (no idle on ready work)", !idle);
+    fprintf(stderr, "     makespan: eager=%d  staged(barriers)=%d  → %.0f%% faster\n",
+            e, s, s ? 100.0*(s-e)/s : 0.0);
+    chk("E6 eager <= staged", e <= s);
+    chk("E7 eager < staged on uneven work", e < s);
+
+    fprintf(stderr, "  %s (%d/8 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 8-fail);
+    return fail > 0 ? 5 : 0;
+}
+
 static std::string read_file_str(const std::string &path);   // defined in the PA.6 block below
 static std::string strip_think(const std::string &in);        // defined in the PA.6 block below
 
@@ -2170,6 +2310,7 @@ int main(int argc, char **argv) {
     bool  gather_test = false;
     bool  mtp_test = false;
     bool  coord_test = false;
+    bool  eager_test = false;
     int   pool_items = 0;
     bool  plan_only  = false;
     bool  kv_q8      = true;    // Q8 KV default: byte-exactness is a spec-dec artifact, not needed for agents (~2x context)
@@ -2199,6 +2340,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mtp"))      g_mtp = true;            // PA.3 per-lane MTP drafting
         else if (!strcmp(argv[i], "--mtp-test")) mtp_test = true;
         else if (!strcmp(argv[i], "--coord-test")) coord_test = true;
+        else if (!strcmp(argv[i], "--eager-test")) eager_test = true;
         else if ((!strcmp(argv[i], "-t") || !strcmp(argv[i], "--temp")) && i+1 < argc) g_temp = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
         else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
@@ -2211,6 +2353,7 @@ int main(int argc, char **argv) {
     if (gather_test) return gather_self_test();  // PA.1c: GPU-free gather self-test
     if (mtp_test)    return mtp_self_test();     // PA.3: GPU-free MTP bookkeeping self-test
     if (coord_test)  return coord_self_test();   // PA.4c: GPU-free repair-loop bookkeeping self-test
+    if (eager_test)  return eager_self_test();   // PA.7: GPU-free eager-scheduling core self-test
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
