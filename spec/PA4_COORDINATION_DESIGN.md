@@ -268,6 +268,13 @@ blind, incomplete canvas mock to recognizing it needed a real DOM/canvas — but
   test-gen each repair round** (`gen_tests_for(untested)`), bounded by `--repair-budget`; if it still
   can't get a test, it ends in `GIVEN UP`, reported — never green-by-omission. Test-gen is now a
   reusable harness job, fired both initially and on demand during repair.
+- **Implementer tests are allowed, but in the PROPER place; test-gen fills only the gaps (user,
+  2026-06-16).** The scale run showed implementers writing `*.test.js` **into `src/`** (same-dir
+  `require`), duplicating the harness's `test/` tests. Implementers may write a first-pass test (it
+  gets reviewed by verify), but `impl_user` now directs it to **`test/<comp>.test.js`** (`require('../src/<comp>')`),
+  never inside `src/`. And the **initial** test-gen now generates **only for modules that still lack a
+  test** (same "fill the gaps" rule as repair) — so implementer-written tests are kept and reviewed,
+  not overwritten or duplicated.
 
 ---
 

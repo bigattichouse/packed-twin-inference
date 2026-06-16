@@ -1680,8 +1680,17 @@ static void finalize_verify(const WorkOrder &wo,
         run_worker_tools(trs);
     };
     if (!mods.empty()) {
-        fprintf(stderr, "\n══ PA.4 TEST-GEN — a test per module (goal + spec + collaborators): %d module(s) ══\n", (int)mods.size());
-        gen_tests_for(mods, mods);
+        // Implementers may have already written tests (now to test/, the proper place). Only GENERATE
+        // for modules still lacking a test — keep theirs (verify reviews them), fill the gaps, no dup.
+        std::vector<std::string> untested0;
+        for (auto &m : mods) {
+            std::string comp = fs::path(m).filename().string();
+            { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
+            if (!fs::exists(std::string(g_work_dir) + "/test/" + comp + ".test.js", ec)) untested0.push_back(m);
+        }
+        fprintf(stderr, "\n══ PA.4 TEST-GEN — %d module(s); %d already tested, generating %d ══\n",
+                (int)mods.size(), (int)(mods.size() - untested0.size()), (int)untested0.size());
+        gen_tests_for(untested0, mods);
     }
 
     // ── VERIFY + REPAIR (PA.4c): run all tests; on failure amend the module & re-verify ──
@@ -1924,8 +1933,10 @@ static std::string impl_shared(const std::string &goal) {
 static std::string impl_user(const Piece &p) {
     return "You are the IMPLEMENTER for component '" + p.id + "'. Its blueprint is '" + p.id +
            ".blueprint' in the blueprints above; implement it EXACTLY, integrating through the other "
-           "components' interfaces above and obeying the CONTRACT. Save it with create_file at the path "
-           "its blueprint/assignment specifies (e.g. src/" + p.id + ".js).";
+           "components' interfaces above and obeying the CONTRACT. Save the MODULE with create_file at the "
+           "path its blueprint/assignment specifies (e.g. src/" + p.id + ".js). If you also write a test, "
+           "put it in the PROPER place: create_file at test/" + p.id + ".test.js (require the module via "
+           "require('../src/" + p.id + "')) — NEVER a *.test.js inside src/.";
 }
 
 // RECONCILE: the boss unifies the parallel (possibly-conflicting) blueprints into ONE
