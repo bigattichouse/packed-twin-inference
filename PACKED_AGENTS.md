@@ -113,10 +113,13 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   checkpoint-seq rollback). **MEASURED net-slower on packed** — doubling `n_seq_max` taxes every lane's
   SSM state more than spec-dec saves; kept as an opt-in + diagnostic. `--mtp-test` 8/8. See
   `spec/PA3_MTP_DESIGN.md`.
-- **PA.4** ✓ *(2026-06-15)* — coordination as a **verify→repair loop**, not just Q&A: harness test-gen →
-  run tests → L1 worker amend → **L2 boss arbiter** re-queues rework on budget exhaustion. Fresh
-  sessions; **full-triad rework** (goal/contract + blueprint + module + test + error); repair lanes
-  think. `--coord-test` 10/10. See `spec/PA4_COORDINATION_DESIGN.md`.
+- **PA.4** ✓ *(2026-06-15/16)* — coordination as a **verify→repair loop**, not just Q&A: harness
+  test-gen → run tests → L1 worker amend → **L2 boss arbiter** (re-queues rework via a **work-order**,
+  not a bespoke format — the boss reliably emits PLAN/PIECE). Fresh sessions get the **full triad +
+  collaborator code** (goal/contract + blueprint + module + test + error + the modules it calls); repair
+  lanes think; **escalate to the boss early** when L1 stalls; the **designer dictates libraries**
+  (contract pins deps = CommonJS, no jsdom/jest); **untested modules re-queue test-gen** (no silent
+  pass). `--coord-test` 12/12. See `spec/PA4_COORDINATION_DESIGN.md`.
 - **PA.5** ✓ *v1 (2026-06-14)* — worker tool-calls: nanocoder-style `<create_file>` /
   `<execute_bash>` (`--tools` / `--allow-run`), sandboxed to `--work-dir`. create_file verified
   end-to-end (workers wrote stack.js + test.js; the generated tests pass).
@@ -124,7 +127,9 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   (blueprints) → **reconcile** (interface contract) → parallel **implement** → test-gen → verify →
   repair. Parallelizes the serial plan-think (the ~80%-of-wall cost); reconcile lifted verify 1/3→2/3.
   GPU end-to-end validating. See `spec/PA6_PIPELINE_DESIGN.md`.
-- **PA.7** *(designed 2026-06-15)* — **eager scheduling**: dissolve the stage barriers into an
-  artifact-gated ready-queue (idle lanes pull the next ready item across stages); **reconcile becomes
-  the first rework pass** (contract-diff → rework, same primitive as post-test repair). `--eager-test`
-  planned. See `spec/PA7_PIPELINING_DESIGN.md`.
+- **PA.7** *(core built 2026-06-16; integration pending)* — **eager scheduling**: dissolve the stage
+  barriers into an artifact-gated ready-queue (idle lanes pull the next ready item across stages);
+  **reconcile becomes the first rework pass**; **active retrieval** (`read_file`/`abandon`, NOT_FOUND →
+  re-queue) gates discovered deps. Pure scheduler + makespan sim (`--eager-test` 8/8: **eager 18% <
+  barriers** on the measured spread) and active-tool primitives (`--gather-test` T5–T8) are in; the
+  `run_pool` mid-stream loop + ready-queue orchestration are next. See `spec/PA7_PIPELINING_DESIGN.md`.

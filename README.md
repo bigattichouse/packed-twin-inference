@@ -156,13 +156,20 @@ table above. Open items, in value order:
    in VRAM, lanes add only KV). Now a full autonomous arc on the `--tools --no-stream` path:
    - **PA.0–PA.2** plan → parallel → gather to `--out` (2026-06-14).
    - **PA.3** MTP spec-dec (behind `--mtp`; net-slower on packed — `spec/PA3_MTP_DESIGN.md`).
-   - **PA.4** coordination: test-gen → verify → repair → boss arbiter, with **full-triad rework**
-     (goal/contract + blueprint + module + test); fresh sessions, thinking repair lanes.
+   - **PA.4** coordination: test-gen → verify → L1 repair → boss arbiter (work-order rework). Fresh
+     sessions get the **full triad + collaborator code** (goal/contract + blueprint + module + test +
+     the modules it calls); thinking repair lanes; escalate to the boss early when L1 stalls; the
+     **designer dictates libraries** (contract pins deps/CommonJS); untested modules re-queue test-gen.
    - **PA.5** tool calls (`create_file`/`execute_bash`, nanocoder convention).
    - **PA.6** staged pipeline: triage → parallel design → reconcile (contract) → implement →
      test-gen → verify → repair (`spec/PA6_PIPELINE_DESIGN.md`); GPU end-to-end validating.
-   - **PA.7** *(designed)* **eager scheduling**: dissolve the stage barriers — artifact-gated
-     ready-queue, reconcile becomes the first rework pass (`spec/PA7_PIPELINING_DESIGN.md`).
+   - **PA.7** *(core built; integration pending)* **eager scheduling**: dissolve the stage barriers —
+     artifact-gated ready-queue, reconcile = the first rework pass. Pure scheduler + makespan sim
+     (`--eager-test`, **eager 18% < barriers** on the measured spread) and active-retrieval primitives
+     (`read_file`/`abandon`, `--gather-test`) are in; the run_pool mid-stream loop is next.
+     (`spec/PA7_PIPELINING_DESIGN.md`)
+   - Harnesses: `flappy_validate.sh` (greenfield, coupled — packed's worst case) and
+     `scale_validate.sh` (many independent modules — packed's sweet spot).
 
    Design: `PACKED_AGENTS.md` → `spec/PACKED_AGENTS_DESIGN.md` → the per-milestone `spec/PA*.md`.
 
