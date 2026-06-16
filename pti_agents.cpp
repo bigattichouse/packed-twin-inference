@@ -1300,6 +1300,38 @@ static RepairAction repair_verdict(int round, int budget, int n_failed) {
     if (round >= budget) return RA_GIVEUP;
     return RA_REPAIR;
 }
+// PA.4d: parse the boss arbiter's rework requests — <<<REWORK file=PATH>>> guidance <<<END>>>
+static std::vector<std::pair<std::string,std::string>> parse_rework(const std::string &text) {
+    std::vector<std::pair<std::string,std::string>> out;
+    const std::string open = "<<<REWORK file=";
+    size_t pos = 0;
+    while (true) {
+        size_t o = text.find(open, pos); if (o == std::string::npos) break;
+        size_t fe = text.find(">>>", o); if (fe == std::string::npos) break;
+        std::string file = trim(text.substr(o + open.size(), fe - (o + open.size())));
+        size_t end = text.find("<<<END>>>", fe); if (end == std::string::npos) break;
+        std::string guide = trim(text.substr(fe + 3, end - (fe + 3)));
+        if (!file.empty() && file.find("..") == std::string::npos) out.push_back({ file, guide });
+        pos = end + 9;
+    }
+    return out;
+}
+// PA.4d arbiter prompt (boss): decide rework on L1-exhausted failures — the boss DELEGATES via REWORK.
+static std::string build_arbiter_user(const std::string &contract, const std::string &failblock) {
+    return "Worker-level repair exhausted its budget on the failures below and gave up. As the "
+           "COORDINATOR, decide the rework. IMPORTANT: the MODULE may be correct and the TEST may be "
+           "BUGGY — judge which file is actually wrong. You DELEGATE (parallel workers do the fix): emit "
+           "one rework request per file to rewrite —\n<<<REWORK file=relative/path>>>\nwhat is wrong and "
+           "how to fix it\n<<<END>>>\n(module OR test). Emit none to accept the failures as-is.\n\n"
+           "Interface contract:\n" + contract + "\n\nFailing pieces (module, test, error):\n" + failblock;
+}
+// PA.4d rework task (worker): rewrite one file per the boss's guidance.
+static std::string build_rework_user(const std::string &file, const std::string &current, const std::string &guidance) {
+    return "Rewrite the file '" + file + "' to fix the problem.\n\nCurrent contents:\n```\n" + current +
+           "\n```\n\nWhat to fix:\n" + guidance + "\n\nRe-emit the COMPLETE corrected file via create_file at "
+           + file + ". Output only the tool call.";
+}
+
 // GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
 static int coord_self_test() {
     fprintf(stderr, "── PA.4c coord self-test ──\n");
@@ -1315,11 +1347,15 @@ static int coord_self_test() {
     chk("R4 verdict done",   repair_verdict(0,3,0) == RA_DONE);
     chk("R5 verdict repair", repair_verdict(0,3,2) == RA_REPAIR);
     chk("R6 verdict giveup", repair_verdict(3,3,2) == RA_GIVEUP);
-    fprintf(stderr, "  %s (%d/6 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 6-fail);
+    { auto rw = parse_rework("noise <<<REWORK file=test/a.test.js>>>\nfix the arc spy\n<<<END>>> tail");
+      chk("R7 parse_rework", rw.size()==1 && rw[0].first=="test/a.test.js" && rw[0].second=="fix the arc spy"); }
+    { auto rw = parse_rework("no markers here"); chk("R8 parse_rework empty", rw.empty()); }
+    fprintf(stderr, "  %s (%d/8 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 8-fail);
     return fail > 0 ? 5 : 0;
 }
 
 static std::string read_file_str(const std::string &path);   // defined in the PA.6 block below
+static std::string strip_think(const std::string &in);        // defined in the PA.6 block below
 
 // PA.4: files-on-disk finalize + the "test verifier" (replaces merge-gather under --tools).
 //   1) STORE modules to disk; 2) TEST-GEN: a test task per module (given its file + the design),
@@ -1399,6 +1435,7 @@ static void finalize_verify(const WorkOrder &wo,
         return mods;
     };
 
+    bool arbiter_done = false;   // PA.4d: boss arbiter escalates once on L1 budget exhaustion
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
         fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s) ══\n", round ? " (re-check)" : "", (int)res.size());
@@ -1411,7 +1448,42 @@ static void finalize_verify(const WorkOrder &wo,
         }
         RepairAction act = repair_verdict(round, g_repair_budget, (int)fails.size());
         if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
-        if (act == RA_GIVEUP) { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d repair round(s) ══\n", passed, (int)res.size(), g_repair_budget); break; }
+        if (act == RA_GIVEUP) {
+            if (!arbiter_done && !fails.empty()) {   // PA.4d: escalate to the boss once; it re-queues rework
+                arbiter_done = true;
+                fprintf(stderr, "\n══ PA.4d ARBITER — escalating %d failure(s) to the boss ══\n", (int)fails.size());
+                std::string contract = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
+                std::vector<std::string> mods = list_modules(); std::string fb;
+                for (auto &r : fails) {
+                    std::string testfn = std::filesystem::path(r.rel).filename().string();
+                    std::string modpath = module_for_test(testfn, mods);
+                    std::string modrel = modpath.empty() ? std::string("(none)") : fs::relative(modpath, g_work_dir, ec).string();
+                    fb += "\n--- test " + r.rel + "  (module " + modrel + ") ---\n";
+                    if (!modpath.empty()) fb += "MODULE " + modrel + ":\n" + read_file_str(modpath) + "\n";
+                    fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\nERROR:\n" + r.out + "\n";
+                }
+                std::string aprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", build_arbiter_user(contract, fb)} });
+                auto reworks = parse_rework(strip_think(boss_generate(aprompt, 2048)));   // boss judges (thinks)
+                fprintf(stderr, "  boss requested %d rework item(s)\n", (int)reworks.size());
+                if (!reworks.empty()) {
+                    std::vector<std::string> ritems, rids;
+                    for (auto &rw : reworks) {
+                        std::string u = build_rework_user(rw.first, read_file_str(std::string(g_work_dir) + "/" + rw.first), rw.second);
+                        std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", u} }, true);
+                        if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
+                        ritems.push_back(sp); rids.push_back(rw.first);
+                    }
+                    std::vector<std::string> routs; run_pool(ritems, n_lanes, max_new, &routs, "");
+                    std::vector<std::pair<std::string,std::string>> rres;
+                    for (size_t i = 0; i < rids.size() && i < routs.size(); i++) rres.push_back({ rids[i], strip_think(routs[i]) });
+                    run_worker_tools(rres);
+                    continue;   // re-verify after the boss-directed rework
+                }
+            }
+            fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d round(s)%s ══\n",
+                    passed, (int)res.size(), g_repair_budget, arbiter_done ? " + boss arbiter" : "");
+            break;
+        }
 
         // RA_REPAIR: amend each failing module (given its file + the test + the error), then re-verify
         fprintf(stderr, "\n══ PA.4c REPAIR round %d/%d — amending %d failing module(s) ══\n", round+1, g_repair_budget, (int)fails.size());
