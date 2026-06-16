@@ -87,6 +87,43 @@ viable precisely because PA.4 hardened rework (full-triad context, thinking lane
 
 ---
 
+## 3.1 Active retrieval + DISCOVERED dependencies (user, 2026-06-16)
+
+Static injection is a guessing game — measured 2026-06-16, three failures in a row were a fresh
+worker missing context (repair lacked spec+test → §4.2; test-gen lacked goal+spec → §4.2; then
+**test-gen lacked the *collaborator code*** — `engine.test.js` had to mock the canvas API that
+`renderer.js` actually calls, but the test-writer never saw `renderer.js`, so it mocked blind and
+rework whack-a-moled one missing method at a time). The robust fix is to let the worker **fetch what
+it decides it needs**, two layers:
+
+- **Passive (PA.7a, now):** the harness injects the **collaborator modules** a component references
+  (not just its own code) into test-gen / rework. Cheap (reuses read-file→inject), solves the
+  integration-mock class. Still a *guess* about what to include → prune by the dep graph at scale.
+- **Active (PA.7b, next):** a `read_file` / grep **tool the worker calls mid-stream** ("read
+  `renderer.js` to see what I must mock"); the harness returns the content and the lane continues.
+  Pulls *exactly* what's needed — the real agent loop. Needs the **mid-stream tool round-trip** (a
+  lane that pauses, gets a result, resumes; in the packed batch = re-feed one lane while others
+  decode). This is PA.5-v2 / the "live tool loop."
+
+**`NOT_FOUND` is a dynamic dependency (the key semantic).** In eager mode a worker may read a file
+that **doesn't exist yet** (its producer hasn't run). The read-tool returns *"not built yet,"* and
+the worker **abandons + re-pushes itself as blocked**: *"Original task: <task>. Waiting on
+`renderer.js`."* The scheduler gates the re-pushed item on that file and makes it ready the moment the
+file appears. This turns §2's **static** dep table into a **discovered-at-runtime** graph — the worker
+finds a dependency we never modelled and gates itself on it (same "worker pushes work onto the queue"
+primitive as worker-self-split). Anti-runaway: cap re-push depth + total blocked-requeues per item.
+
+**Automate the re-push via an `abandon` tool (user, 2026-06-16).** The worker doesn't reconstruct
+anything — the **harness already holds the dispatch prompt** for every in-flight item. So the worker
+just calls `abandon(reason)` (e.g. *"waiting on renderer.js"*); the harness **re-enqueues the held
+prompt with the reason appended** (*"…Previously abandoned: waiting on renderer.js — now available
+below:"*) and gates it on the named file (from the `read` NOT_FOUND, or parsed from the reason). So
+the PA.7b worker toolset is: `create_file`, `execute_bash`, **`read_file`** (→ content or NOT_FOUND),
+and **`abandon(reason)`** (→ harness-automated blocked re-push). No prompt-reconstruction by the model;
+the harness owns continuity.
+
+---
+
 ## 4. The one real engine change — per-item lane mode
 
 Today the think/instruct mode + sampler is set **per stage**, globally (`g_worker_think`,

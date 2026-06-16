@@ -1269,7 +1269,8 @@ static void finish_gather(const WorkOrder &wo,
 // the project goal/contract ("we're building THIS") + this component's blueprint ("here is your
 // part + the spec around it") + the actual code. Tests target the spec, not just the code as-written.
 static std::string build_test_task(const std::string &relpath, const std::string &content,
-                                   const std::string &goal, const std::string &blueprint) {
+                                   const std::string &goal, const std::string &blueprint,
+                                   const std::string &collaborators) {
     std::filesystem::path p(relpath);
     std::string base = p.filename().string();
     size_t dot = base.rfind(".js"); if (dot != std::string::npos) base = base.substr(0, dot);
@@ -1280,8 +1281,12 @@ static std::string build_test_task(const std::string &relpath, const std::string
         "\n\nYour part: write a Node.js unit test for the '" + base + "' module. Test it against its "
         "SPEC (below), not merely whatever the current code happens to do.\n\nSpec / blueprint for '"
         + base + "':\n" + (blueprint.empty() ? "(none on disk)" : blueprint) +
-        "\n\nModule file (" + relpath + "):\n```js\n" + content +
-        "\n```\n\nThe test MUST: require the module (e.g. const m = require('../" + relpath + "')), exercise "
+        "\n\nModule file (" + relpath + "):\n```js\n" + content + "\n```\n" +
+        (collaborators.empty() ? "" :
+            "\nCollaborator modules this one interacts with — so your stubs/mocks match the methods "
+            "they ACTUALLY call (e.g. a fake canvas must implement every ctx.* method the real code uses):\n"
+            + collaborators) +
+        "\nThe test MUST: require the module (e.g. const m = require('../" + relpath + "')), exercise "
         "its exported behavior with console.assert, print a line per check, and call process.exit(1) on "
         "ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
         "\nOutput only the create_file tool call.";
@@ -1305,11 +1310,13 @@ static std::string module_for_test(const std::string &test_filename,
 // Gives the worker the full context (it's a fresh session): SPEC + module + test + error.
 static std::string build_amend_user(const std::string &base, const std::string &modpath,
                                     const std::string &modcontent, const std::string &testcontent,
-                                    const std::string &error, const std::string &spec) {
+                                    const std::string &error, const std::string &spec,
+                                    const std::string &collaborators) {
     return "Component '" + base + "' FAILED its test. Fix the MODULE so the test passes (do not change "
            "the test).\n\nSpec / blueprint for '" + base + "':\n" + (spec.empty() ? "(none)" : spec) +
            "\n\nModule (" + modpath + "):\n```\n" + modcontent + "\n```\n\nTest:\n```\n" + testcontent +
            "\n```\n\nTest output / error:\n" + error +
+           (collaborators.empty() ? "" : "\n\nCollaborator modules it interacts with:\n" + collaborators) +
            "\n\nRe-emit the corrected module via create_file at " + modpath + ". Output only the tool call.";
 }
 // Repair scheduler verdict given the round, the budget, and how many tests still fail.
@@ -1383,12 +1390,16 @@ static std::string build_arbiter_user(const std::string &contract, const std::st
 // spec + module + test + error + the boss's guidance.
 static std::string build_rework_user(const std::string &target, const std::string &spec,
                                      const std::string &modcontent, const std::string &testcontent,
-                                     const std::string &error, const std::string &guidance) {
+                                     const std::string &error, const std::string &guidance,
+                                     const std::string &collaborators) {
     return "A test is failing. Study the FULL context below, then rewrite ONLY '" + target + "' to fix it.\n\n"
            "Spec / blueprint:\n" + (spec.empty() ? "(none)" : spec) +
            "\n\nModule:\n```\n" + (modcontent.empty() ? "(none)" : modcontent) +
            "\n```\n\nTest:\n```\n" + (testcontent.empty() ? "(none)" : testcontent) +
            "\n```\n\nTest output / error:\n" + error +
+           (collaborators.empty() ? "" :
+               "\n\nCollaborator modules it interacts with — match their ACTUAL calls (e.g. a fake canvas "
+               "must implement every ctx.* method the real code uses):\n" + collaborators) +
            "\n\nCoordinator's guidance:\n" + guidance +
            "\n\nRe-emit the COMPLETE corrected '" + target + "' via create_file at " + target + ". Output only the tool call.";
 }
@@ -1402,22 +1413,24 @@ static int coord_self_test() {
       chk("R1 module_for_test",  module_for_test("bird.test.js", m) == "src/bird.js"); }
     { std::vector<std::string> m={"src/bird.js"};
       chk("R2 no-match empty",   module_for_test("zzz.test.js", m).empty()); }
-    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR","SPEC");
+    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR","SPEC","COLLAB");
       chk("R3 amend has parts",  u.find("src/bird.js")!=std::string::npos && u.find("CODE")!=std::string::npos
                               && u.find("TEST")!=std::string::npos && u.find("ERR")!=std::string::npos
-                              && u.find("SPEC")!=std::string::npos); }
+                              && u.find("SPEC")!=std::string::npos && u.find("COLLAB")!=std::string::npos); }
     chk("R4 verdict done",   repair_verdict(0,3,0) == RA_DONE);
     chk("R5 verdict repair", repair_verdict(0,3,2) == RA_REPAIR);
     chk("R6 verdict giveup", repair_verdict(3,3,2) == RA_GIVEUP);
     { auto rw = parse_rework("noise <<<REWORK file=test/a.test.js>>>\nfix the arc spy\n<<<END>>> tail");
       chk("R7 parse_rework", rw.size()==1 && rw[0].first=="test/a.test.js" && rw[0].second=="fix the arc spy"); }
     { auto rw = parse_rework("no markers here"); chk("R8 parse_rework empty", rw.empty()); }
-    { std::string u = build_rework_user("src/bird.js","SPEC","MODC","TESTC","ERRC","GUIDE");   // fresh worker: full triad
+    { std::string u = build_rework_user("src/bird.js","SPEC","MODC","TESTC","ERRC","GUIDE","COLLAB");  // full triad + collaborators
       chk("R9 rework full ctx", u.find("src/bird.js")!=std::string::npos && u.find("SPEC")!=std::string::npos
                              && u.find("MODC")!=std::string::npos && u.find("TESTC")!=std::string::npos
-                             && u.find("ERRC")!=std::string::npos && u.find("GUIDE")!=std::string::npos); }
-    { std::string u = build_test_task("src/bird.js","CODEX","GOALX","BPX");   // test-maker: goal + spec + code
+                             && u.find("ERRC")!=std::string::npos && u.find("GUIDE")!=std::string::npos
+                             && u.find("COLLAB")!=std::string::npos); }
+    { std::string u = build_test_task("src/bird.js","CODEX","GOALX","BPX","COLLABZ");   // goal + spec + code + collaborators
       chk("R10 testgen ctx", u.find("GOALX")!=std::string::npos && u.find("BPX")!=std::string::npos
+                          && u.find("COLLABZ")!=std::string::npos
                           && u.find("CODEX")!=std::string::npos); }
     // R11/R12: the boss emits a WORK-ORDER (PLAN/PIECE), not REWORK markers — map pieces → rework items.
     { std::string plan =
@@ -1587,6 +1600,26 @@ static void finalize_verify(const WorkOrder &wo,
     fprintf(stderr, "\n══ PA.4 STORE — writing module files to %s ══\n", g_work_dir);
     run_worker_tools(worker_results);                    // modules → disk
 
+    // PA.7a: collaborator code — sibling modules whose basename `own` references (require/usage),
+    // so test/repair workers see the methods the real collaborators CALL (e.g. the canvas API a
+    // renderer uses → a complete mock, no whack-a-mole). Passive injection; the active read-tool
+    // (PA.7b) is the unbounded version. See spec/PA7_PIPELINING_DESIGN.md §3.1.
+    auto collab_for = [&](const std::string &own_content, const std::string &own_path,
+                          const std::vector<std::string> &allmods) {
+        std::string lc = own_content; std::transform(lc.begin(), lc.end(), lc.begin(), ::tolower);
+        std::string out;
+        for (auto &other : allmods) {
+            if (other == own_path) continue;
+            std::string obase = fs::path(other).filename().string();
+            size_t j = obase.rfind(".js"); if (j != std::string::npos) obase = obase.substr(0, j);
+            if (obase.empty()) continue;
+            std::string lb = obase; std::transform(lb.begin(), lb.end(), lb.begin(), ::tolower);
+            if (lc.find(lb) != std::string::npos)        // own code names this sibling → it's a collaborator
+                out += "// " + fs::relative(other, g_work_dir, ec).string() + "\n```js\n" + read_file_str(other) + "\n```\n";
+        }
+        return out;
+    };
+
     // ── TEST-GEN: one test task per module (*.js, not *.test.js) ──
     std::vector<std::string> mods;
     for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
@@ -1611,7 +1644,7 @@ static void finalize_verify(const WorkOrder &wo,
             std::string comp = fs::path(rel).filename().string();
             { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
             std::string bp = read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
-            items.push_back(build_test_task(rel, content, goal_ctx, bp));
+            items.push_back(build_test_task(rel, content, goal_ctx, bp, collab_for(content, m, mods)));
             ids.push_back(rel);
         }
         std::vector<std::string> touts;
@@ -1712,7 +1745,8 @@ static void finalize_verify(const WorkOrder &wo,
                             size_t s = tb.find(".test.js"); if (s != std::string::npos) tb = tb.substr(0, s);
                             if (tb == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
                         }
-                        std::string u = build_rework_user(tgt, spec, modc, testc, err, rw.second);
+                        std::string u = build_rework_user(tgt, spec, modc, testc, err, rw.second,
+                                                          collab_for(modc, modpath, mods));
                         std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", u} }, true);
                         if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
                         ritems.push_back(sp); rids.push_back(tgt);
@@ -1739,8 +1773,10 @@ static void finalize_verify(const WorkOrder &wo,
             std::string base = testfn; size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
             std::string modrel = fs::relative(modpath, g_work_dir, ec).string();
             std::string spec = read_file_str(std::string(g_work_dir) + "/design/" + base + ".blueprint");
-            std::string user = build_amend_user(base, modrel, read_file_str(modpath),
-                                                read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out, spec);
+            std::string modcontent = read_file_str(modpath);
+            std::string user = build_amend_user(base, modrel, modcontent,
+                                                read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out, spec,
+                                                collab_for(modcontent, modpath, mods));
             std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
             if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
             aitems.push_back(sp); aids.push_back(modrel);
