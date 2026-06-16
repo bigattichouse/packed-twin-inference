@@ -152,16 +152,25 @@ are 13 of them → **prefill dominates the wall** and decode-aggregate tok/s cra
 stragglers (flappy) and NOT scheduling (PA.7) — it's **prefill bloat from re-sending the shared
 prefix N times.**
 
-**Fix — wire PA.2.1 prefix caching into the staged pools (likely a bigger wall win than PA.7).** The
-mechanism already exists (`POSITIVE_RESULTS` §PA.2.1 / memory): prefill the shared prefix **once** into
-a base seq, `seq_cp`-clone it per lane, and **delta-prefill only the per-item part** (the blueprint).
-`run_pipeline_staged` just never passes a shared prefix to `run_pool` (it passes `""`). Hoist the
-common prefix (goal + contract, identical across a stage's items) and pass it. This attacks the
-dominant cost at scale; eager scheduling (PA.7) then recovers the residual straggler tail on top.
+**Fix — wire PA.2.1 prefix caching into the staged pools — IMPLEMENTED 2026-06-16.** The mechanism
+already existed (`POSITIVE_RESULTS` §PA.2.1): prefill the shared prefix **once** into a base seq,
+`seq_cp`-clone it per lane, and **delta-prefill only the per-item part**. `run_pipeline_staged` simply
+never passed a shared prefix (`""`). Fix: the **shared content moves into the SYSTEM turn** so it is a
+literal token-prefix of every item (`stage_prefix()`/`stage_item()` share identical system text), and
+each stage passes it to `run_pool`:
+- **design** — prefix = `goal`; delta = the per-component assignment.
+- **implement** — prefix = `goal` + contract + **ALL blueprints** (read once, not re-sent per item —
+  this was the 0.22× case); delta = a tiny "implement component X" user.
+- **test-gen** — prefix = goal/contract; delta = blueprint + module + collaborators (`build_test_task`
+  → `test_user`).
 
-**Revised priority:** prefix-cache the staged pipeline **first**, then PA.7 eager scheduling. (And the
-"sweet spot" claim is retracted until prefill is fixed — at scale, packed is currently *prefill-bound*,
-not decode-bound.)
+**SMOKE-CONFIRMED on GPU** (3-module task): design / implement / test-gen / test-gen-repair all log
+`cloned+delta` (cache hit) instead of `full prefill`. A full re-run of `scale_validate.sh` will give
+the new wall/aggregate numbers.
+
+**Revised priority (done):** prefix-cache landed; **PA.7 eager scheduling is next** (recovers the
+residual straggler tail on top). The "sweet spot" claim stays retracted until the scale re-run with
+caching reports.
 
 ---
 
