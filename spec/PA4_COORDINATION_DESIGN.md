@@ -250,6 +250,25 @@ number of failing tests, it escalates to the boss arbiter immediately instead of
 rounds (`no_progress` → `RA_GIVEUP`). Combined with §4.2 collaborator injection, the boss's rework
 then gets the context L1 lacked.
 
+### 4.4 Designer dictates libraries; untested modules re-queue test-gen (user, 2026-06-16 — IMPLEMENTED)
+
+The 2nd flappy run (2/3) showed §4.2 collaborator injection *working* — the engine test went from a
+blind, incomplete canvas mock to recognizing it needed a real DOM/canvas — but it **over-reached**:
+`import { JSDOM } from 'jsdom'` (not installed) + ESM `import` (violating the CommonJS contract). And
+`pipes` got a module but **no test**, which the verifier passed over silently. Two fixes:
+
+- **The designer DICTATES the libraries when the task didn't (user).** Nothing forbade `jsdom`, so the
+  test-writer invented a dependency. Reconcile now pins a **DEPENDENCY POLICY** in the contract's TECH
+  DECISIONS: if the task didn't name libraries, the designer chooses — default **zero external
+  packages**; tests use only Node built-ins + `console.assert`, **CommonJS `require`** (not `import`),
+  **no `jsdom`/`jest`**, collaborators stubbed directly. `build_test_task` reinforces the same. One
+  authoritative decision flows to every implementer and test, instead of each worker guessing.
+- **Untested modules trigger test-gen jobs in the repair phase (user).** A module with no
+  `test/<comp>.test.js` is now counted as an open *issue* (not a silent pass) and **re-queued for
+  test-gen each repair round** (`gen_tests_for(untested)`), bounded by `--repair-budget`; if it still
+  can't get a test, it ends in `GIVEN UP`, reported — never green-by-omission. Test-gen is now a
+  reusable harness job, fired both initially and on demand during repair.
+
 ---
 
 ## 5. Boss reports to the user — the live board

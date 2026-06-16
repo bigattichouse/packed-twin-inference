@@ -1315,9 +1315,11 @@ static std::string build_test_task(const std::string &relpath, const std::string
             "\nCollaborator modules this one interacts with — so your stubs/mocks match the methods "
             "they ACTUALLY call (e.g. a fake canvas must implement every ctx.* method the real code uses):\n"
             + collaborators) +
-        "\nThe test MUST: require the module (e.g. const m = require('../" + relpath + "')), exercise "
-        "its exported behavior with console.assert, print a line per check, and call process.exit(1) on "
-        "ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
+        "\nThe test MUST: use **CommonJS** `require` (NOT `import`) — e.g. const m = require('../" + relpath +
+        "'); use ONLY Node built-ins + `console.assert` (NO external packages — do NOT require/import "
+        "`jsdom`, `jest`, `canvas`, etc.; **stub collaborators directly**, e.g. `eng.renderer = { clear(){} }`); "
+        "follow any TECH DECISIONS in the contract above; print a line per check; and call process.exit(1) "
+        "on ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
         "\nOutput only the create_file tool call.";
     std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
     if (!g_worker_think) s += "<think>\n\n</think>\n\n";   // test-writers are instruct lanes
@@ -1660,32 +1662,32 @@ static void finalize_verify(const WorkOrder &wo,
             !(n.size() >= 8 && n.substr(n.size()-8) == ".test.js")) mods.push_back(it->path().string());
     }
     std::sort(mods.begin(), mods.end());
-    if (!mods.empty()) {
-        fprintf(stderr, "\n══ PA.4 TEST-GEN — writing a test per module (given goal + spec + file): %d module(s) ══\n", (int)mods.size());
-        // The project goal/contract: the reconciled INTERFACE.md if present, else the triage shared block.
-        std::string contract = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
-        std::string goal_ctx = contract.empty() ? wo.shared : contract;
+    // The project goal/contract: the reconciled INTERFACE.md if present, else the triage shared block.
+    std::string contract0 = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
+    std::string goal_ctx = contract0.empty() ? wo.shared : contract0;
+    // Generate + store a test per TARGET module — reused for the initial pass AND for untested modules
+    // discovered in the repair phase (user, 2026-06-16: "untested modules trigger test job requests").
+    auto gen_tests_for = [&](const std::vector<std::string> &targets, const std::vector<std::string> &allmods) {
+        if (targets.empty()) return;
         std::vector<std::string> items, ids;
-        for (auto &m : mods) {
+        for (auto &m : targets) {
             std::string rel = fs::relative(m, g_work_dir, ec).string();
-            std::string content; FILE *f = fopen(m.c_str(), "r");
-            if (f) { char b[8192]; size_t k; while ((k = fread(b,1,sizeof(b),f)) > 0) content.append(b,k); fclose(f); }
+            std::string content = read_file_str(m);
             std::string comp = fs::path(rel).filename().string();
             { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
             std::string bp = read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
-            items.push_back(build_test_task(rel, content, goal_ctx, bp, collab_for(content, m, mods)));
+            items.push_back(build_test_task(rel, content, goal_ctx, bp, collab_for(content, m, allmods)));
             ids.push_back(rel);
         }
         std::vector<std::string> touts;
         run_pool(items, n_lanes, max_new, &touts, "");   // test-writer lanes
-        std::vector<std::pair<std::string,std::string>> test_results;
-        for (size_t i = 0; i < ids.size() && i < touts.size(); i++) {
-            std::string body = touts[i]; size_t th = body.find("</think>");
-            if (th != std::string::npos) body = body.substr(th + 8);
-            test_results.push_back({ ids[i], trim(body) });
-        }
-        fprintf(stderr, "\n══ PA.4 STORE — writing test files ══\n");
-        run_worker_tools(test_results);
+        std::vector<std::pair<std::string,std::string>> trs;
+        for (size_t i = 0; i < ids.size() && i < touts.size(); i++) trs.push_back({ ids[i], strip_think(touts[i]) });
+        run_worker_tools(trs);
+    };
+    if (!mods.empty()) {
+        fprintf(stderr, "\n══ PA.4 TEST-GEN — a test per module (goal + spec + collaborators): %d module(s) ══\n", (int)mods.size());
+        gen_tests_for(mods, mods);
     }
 
     // ── VERIFY + REPAIR (PA.4c): run all tests; on failure amend the module & re-verify ──
@@ -1731,22 +1733,32 @@ static void finalize_verify(const WorkOrder &wo,
     int  prev_failed = -1;       // PA.4 #4: escalate sooner when an L1 round stops making progress
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
-        fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s) ══\n", round ? " (re-check)" : "", (int)res.size());
-        if (res.empty()) { fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify\n"); break; }
+        // PA.4 (user 2026-06-16): a module with NO test must not pass silently — count it + re-queue test-gen.
+        std::vector<std::string> curmods = list_modules(), untested;
+        for (auto &m : curmods) {
+            std::string comp = fs::path(m).filename().string();
+            { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
+            if (!fs::exists(std::string(g_work_dir) + "/test/" + comp + ".test.js", ec)) untested.push_back(m);
+        }
+        fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s), %d untested module(s) ══\n",
+                round ? " (re-check)" : "", (int)res.size(), (int)untested.size());
+        if (res.empty() && untested.empty()) { fprintf(stderr, "  ⚠ NO modules/tests — cannot verify\n"); break; }
         int passed = 0; std::vector<TestRes> fails;
         for (auto &r : res) {
             if (r.ok) { passed++; fprintf(stderr, "  [PASS] %s\n", r.rel.c_str()); }
             else { fails.push_back(r); fprintf(stderr, "  [FAIL] %s\n", r.rel.c_str());
                    std::string o = r.out; if (o.size() > 300) o = o.substr(0,300) + "..."; if (!o.empty()) fprintf(stderr, "      %s\n", o.c_str()); }
         }
-        RepairAction act = repair_verdict(round, g_repair_budget, (int)fails.size());
-        bool no_progress = (prev_failed >= 0 && (int)fails.size() >= prev_failed);   // last L1 round didn't help
+        for (auto &m : untested) fprintf(stderr, "  [UNTESTED] %s\n", fs::relative(m, g_work_dir, ec).string().c_str());
+        int issues = (int)fails.size() + (int)untested.size();
+        RepairAction act = repair_verdict(round, g_repair_budget, issues);
+        bool no_progress = (prev_failed >= 0 && issues >= prev_failed && untested.empty());  // stalled AMENDs (not mid test-gen)
         if (act == RA_REPAIR && no_progress) {   // PA.4 #4: L1 isn't reducing failures → hand to the boss now
-            fprintf(stderr, "  (L1 made no progress (%d→%d failing) — escalating to the boss early)\n",
-                    prev_failed, (int)fails.size());
+            fprintf(stderr, "  (L1 made no progress (%d→%d issues) — escalating to the boss early)\n",
+                    prev_failed, issues);
             act = RA_GIVEUP;
         }
-        prev_failed = (int)fails.size();
+        prev_failed = issues;
         if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
         if (act == RA_GIVEUP) {
             if (!arbiter_done && !fails.empty()) {   // PA.4d: escalate to the boss once; it re-queues rework
@@ -1798,6 +1810,14 @@ static void finalize_verify(const WorkOrder &wo,
             fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d round(s)%s ══\n",
                     passed, (int)res.size(), g_repair_budget, arbiter_done ? " + boss arbiter" : "");
             break;
+        }
+
+        // RA_REPAIR: first FILL missing tests (untested modules → re-queued test-gen jobs), then amend.
+        if (!untested.empty()) {
+            fprintf(stderr, "\n══ PA.4 TEST-GEN (repair) round %d/%d — %d untested module(s) ══\n",
+                    round+1, g_repair_budget, (int)untested.size());
+            gen_tests_for(untested, curmods);
+            continue;   // re-verify with the new tests
         }
 
         // RA_REPAIR: amend each failing module (given its file + the test + the error), then re-verify
@@ -1917,7 +1937,12 @@ static std::string build_reconcile_user(const std::string &goal, const std::stri
            "exported name + method signatures (names, params, returns). Pin the GLOBAL decisions all "
            "files share: (1) MODULE SYSTEM = CommonJS (module.exports / require) so `node <file>.test.js` "
            "works; (2) how components are instantiated/wired; (3) who handles input and who owns score; "
-           "(4) the canvas/context convention. Output the contract as concise markdown — no preamble, no code.";
+           "(4) the canvas/context convention. (5) DEPENDENCY POLICY — **you, the designer, DICTATE the "
+           "libraries** if the task did not name them: default to ZERO external packages. Tests run with "
+           "plain `node` and use ONLY Node built-ins + `console.assert` — NO jsdom, jest, or any npm "
+           "package; collaborators are stubbed directly (e.g. `engine.renderer = { clear(){} }`). Put this "
+           "as a TECH DECISIONS section at the TOP of the contract so every implementer and test follows "
+           "it. Output the contract as concise markdown — no preamble, no code.";
 }
 
 // strip a leading <think>…</think> from a worker output
