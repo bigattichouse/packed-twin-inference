@@ -177,9 +177,22 @@ can fix the test (or accept). This is the authority/context a worker lacks (§8.
 §10 single voice). Cost is bounded: workers grind cheaply in parallel; the serial boss pass fires
 **only on exhaustion** (rare).
 
-Sketch: on `GIVEN_UP`, build a boss-arbiter turn `{goal, contract, module, test, errors, "L1 tried N×"}`
-→ boss emits per-piece `KILL` (accept/drop) or a corrected file (module **or** test) via `create_file`
-→ one more verify. Optionally a small L2 budget so it can't loop.
+**The boss decides and DELEGATES — it pushes rework back onto the queue (user, 2026-06-15).** The
+arbiter doesn't fix things itself; it emits **rework requests** that the harness enqueues onto the
+worker queue, and the **parallel pool** does the work — the §8.4 blackboard fully realized (boss
+produces items, workers pop them). The arbiter's verbs are queue ops:
+- `REWORK file=<path>: <guidance>` — re-queue a task to rewrite that file (module **or** test);
+- `RESPEC <comp>: <new spec>` — re-design then re-implement the component;
+- `SPLIT <comp> → <a,b,…>` — break an oversized piece into new pieces (boss-driven version of the
+  "worker self-split" idea);
+- `KILL <comp>` — accept/drop it and report.
+
+Flow: on `GIVEN_UP`, build the arbiter turn `{goal, contract, failing module+test, error/attempt
+history}` → boss emits rework items → harness **enqueues** them → pool runs (parallel) → re-verify →
+possibly escalate again, bounded by an **overall L2 budget** so it can't loop forever. This unifies
+repair with the queue: L1 is the harness auto-amending the module; L2 is the boss requeuing *any*
+rework (fix the test, re-spec, split, or quit). It also fixes today's blocker — the boss requeues
+"fix test/renderer.test.js: the arc spy spreads `...args` into apply" and the pool corrects it.
 
 ---
 
