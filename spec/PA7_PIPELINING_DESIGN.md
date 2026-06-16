@@ -122,6 +122,18 @@ the PA.7b worker toolset is: `create_file`, `execute_bash`, **`read_file`** (→
 and **`abandon(reason)`** (→ harness-automated blocked re-push). No prompt-reconstruction by the model;
 the harness owns continuity.
 
+**abandon vs require vs wait (user, 2026-06-16) — re-queue, never suspend.** Three semantics for "I
+need a file that isn't there yet": *abandon* (drop + re-queue fresh, gated on X — partial work lost),
+*require* (same, but declared early so little is wasted — abandon with a typed dep), *wait/suspend*
+(pause the lane, preserve progress, resume when X appears). **We choose abandon/require, not wait**,
+for two card-specific reasons: (1) **lane occupancy** — a `wait`ing lane sits idle holding a KV slot,
+exactly what eager scheduling removes; an abandoned item frees its lane immediately for other ready
+work and returns when X exists (abandon is eager-aligned, wait is anti-eager). (2) **SSM state** —
+suspend/resume must preserve and restore a lane's *recurrent* state mid-generation (the hybrid-SSM
+rollback hazard the MTP checkpoint machinery exists for); `abandon` re-decodes fresh, so there is no
+state to preserve — SSM-safe for free. So the model is **require → abandon → re-queue, never wait**;
+suspend/resume is reconsidered only if re-generation waste ever outweighs the checkpoint cost.
+
 ---
 
 ## 4. The one real engine change — per-item lane mode

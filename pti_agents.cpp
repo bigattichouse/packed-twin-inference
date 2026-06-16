@@ -1699,6 +1699,7 @@ static void finalize_verify(const WorkOrder &wo,
     if (!g_greedy) { g_worker_think = true; g_worker_sp = qwen_params(true, false); }
 
     bool arbiter_done = false;   // PA.4d: boss arbiter escalates once on L1 budget exhaustion
+    int  prev_failed = -1;       // PA.4 #4: escalate sooner when an L1 round stops making progress
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
         fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s) ══\n", round ? " (re-check)" : "", (int)res.size());
@@ -1710,6 +1711,13 @@ static void finalize_verify(const WorkOrder &wo,
                    std::string o = r.out; if (o.size() > 300) o = o.substr(0,300) + "..."; if (!o.empty()) fprintf(stderr, "      %s\n", o.c_str()); }
         }
         RepairAction act = repair_verdict(round, g_repair_budget, (int)fails.size());
+        bool no_progress = (prev_failed >= 0 && (int)fails.size() >= prev_failed);   // last L1 round didn't help
+        if (act == RA_REPAIR && no_progress) {   // PA.4 #4: L1 isn't reducing failures → hand to the boss now
+            fprintf(stderr, "  (L1 made no progress (%d→%d failing) — escalating to the boss early)\n",
+                    prev_failed, (int)fails.size());
+            act = RA_GIVEUP;
+        }
+        prev_failed = (int)fails.size();
         if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
         if (act == RA_GIVEUP) {
             if (!arbiter_done && !fails.empty()) {   // PA.4d: escalate to the boss once; it re-queues rework

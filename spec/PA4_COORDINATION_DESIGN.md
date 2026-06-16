@@ -241,8 +241,14 @@ PLAN/PIECE work-order (one PIECE per file to rewrite, path in `exports=`, fix in
 target a TEST file), and `reworks_from_plan()` maps each PIECE → `(target, guidance)` via the existing
 `parse_work_order` (path-like tokens from `exports`/instruction; dedup; `..` rejected). This unifies on
 **"the boss always emits work-orders; the harness turns pieces into queue items"** — the same model as
-PA.7 eager scheduling. Covered GPU-free by `--coord-test` R11/R12. (Secondary, not yet done: escalate
-to L2 *sooner* when an L1 round doesn't change the pass count, so budget isn't burned on test bugs.)
+PA.7 eager scheduling. Covered GPU-free by `--coord-test` R11/R12.
+
+**Escalate to L2 early when L1 stalls (IMPLEMENTED 2026-06-16).** L1 (module-amend) can't fix *test*
+bugs, so on the 2/4 run it burned the full budget rewriting correct modules before the arbiter fired.
+Now the loop tracks the failing count across rounds: if an L1 repair round does **not reduce** the
+number of failing tests, it escalates to the boss arbiter immediately instead of spending more L1
+rounds (`no_progress` → `RA_GIVEUP`). Combined with §4.2 collaborator injection, the boss's rework
+then gets the context L1 lacked.
 
 ---
 
