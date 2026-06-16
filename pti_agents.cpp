@@ -1293,23 +1293,19 @@ static void finish_gather(const WorkOrder &wo,
     write_artifact(artifact);
 }
 
-// PA.4: build a "write a test for this module" task — given file X (the written module) and
-// design Y. The test-maker is a fresh session, so it gets the SAME context an implementer had:
-// the project goal/contract ("we're building THIS") + this component's blueprint ("here is your
-// part + the spec around it") + the actual code. Tests target the spec, not just the code as-written.
-static std::string build_test_task(const std::string &relpath, const std::string &content,
-                                   const std::string &goal, const std::string &blueprint,
-                                   const std::string &collaborators) {
+// PA.4: the per-item USER turn of a "write a test for this module" task — given file X (the written
+// module) + its blueprint + the collaborator code it calls. The shared project goal/contract lives in
+// the stage_prefix (system turn, cached once); this is just the per-module delta. Tests target the
+// spec, not just the code as-written.
+static std::string test_user(const std::string &relpath, const std::string &content,
+                             const std::string &blueprint, const std::string &collaborators) {
     std::filesystem::path p(relpath);
     std::string base = p.filename().string();
     size_t dot = base.rfind(".js"); if (dot != std::string::npos) base = base.substr(0, dot);
     std::string testpath = "test/" + base + ".test.js";
-    std::string user =
-        "We are building THIS project — goal + interface contract:\n"
-        + (goal.empty() ? "(no goal supplied)" : goal) +
-        "\n\nYour part: write a Node.js unit test for the '" + base + "' module. Test it against its "
-        "SPEC (below), not merely whatever the current code happens to do.\n\nSpec / blueprint for '"
-        + base + "':\n" + (blueprint.empty() ? "(none on disk)" : blueprint) +
+    return "Write a Node.js unit test for the '" + base + "' module — test it against its SPEC (below), "
+        "not merely whatever the current code happens to do. (The project goal + interface contract are "
+        "above.)\n\nSpec / blueprint for '" + base + "':\n" + (blueprint.empty() ? "(none on disk)" : blueprint) +
         "\n\nModule file (" + relpath + "):\n```js\n" + content + "\n```\n" +
         (collaborators.empty() ? "" :
             "\nCollaborator modules this one interacts with — so your stubs/mocks match the methods "
@@ -1321,9 +1317,6 @@ static std::string build_test_task(const std::string &relpath, const std::string
         "follow any TECH DECISIONS in the contract above; print a line per check; and call process.exit(1) "
         "on ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
         "\nOutput only the create_file tool call.";
-    std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
-    if (!g_worker_think) s += "<think>\n\n</think>\n\n";   // test-writers are instruct lanes
-    return s;
 }
 
 // ───────────────────────── PA.4c: verify→repair helpers ──────────────────────
@@ -1459,9 +1452,8 @@ static int coord_self_test() {
                              && u.find("MODC")!=std::string::npos && u.find("TESTC")!=std::string::npos
                              && u.find("ERRC")!=std::string::npos && u.find("GUIDE")!=std::string::npos
                              && u.find("COLLAB")!=std::string::npos); }
-    { std::string u = build_test_task("src/bird.js","CODEX","GOALX","BPX","COLLABZ");   // goal + spec + code + collaborators
-      chk("R10 testgen ctx", u.find("GOALX")!=std::string::npos && u.find("BPX")!=std::string::npos
-                          && u.find("COLLABZ")!=std::string::npos
+    { std::string u = test_user("src/bird.js","CODEX","BPX","COLLABZ");   // per-item delta: spec + code + collaborators
+      chk("R10 testgen ctx", u.find("BPX")!=std::string::npos && u.find("COLLABZ")!=std::string::npos
                           && u.find("CODEX")!=std::string::npos); }
     // R11/R12: the boss emits a WORK-ORDER (PLAN/PIECE), not REWORK markers — map pieces → rework items.
     { std::string plan =
@@ -1619,6 +1611,8 @@ static int eager_self_test() {
 
 static std::string read_file_str(const std::string &path);   // defined in the PA.6 block below
 static std::string strip_think(const std::string &in);        // defined in the PA.6 block below
+static std::string stage_prefix(const std::string &shared);                       // PA.2.1 cached starter (system turn)
+static std::string stage_item(const std::string &shared, const std::string &user); // PA.2.1 item = prefix + per-item delta
 
 // PA.4: files-on-disk finalize + the "test verifier" (replaces merge-gather under --tools).
 //   1) STORE modules to disk; 2) TEST-GEN: a test task per module (given its file + the design),
@@ -1676,11 +1670,11 @@ static void finalize_verify(const WorkOrder &wo,
             std::string comp = fs::path(rel).filename().string();
             { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
             std::string bp = read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
-            items.push_back(build_test_task(rel, content, goal_ctx, bp, collab_for(content, m, allmods)));
+            items.push_back(stage_item(goal_ctx, test_user(rel, content, bp, collab_for(content, m, allmods))));
             ids.push_back(rel);
         }
         std::vector<std::string> touts;
-        run_pool(items, n_lanes, max_new, &touts, "");   // test-writer lanes
+        run_pool(items, n_lanes, max_new, &touts, stage_prefix(goal_ctx));   // PA.2.1: cache goal/contract once
         std::vector<std::pair<std::string,std::string>> trs;
         for (size_t i = 0; i < ids.size() && i < touts.size(); i++) trs.push_back({ ids[i], strip_think(touts[i]) });
         run_worker_tools(trs);
@@ -1891,39 +1885,47 @@ static std::string build_goal_blueprint(const WorkOrder &wo) {
 }
 
 // DESIGN task: one designer per component → design/<id>.blueprint (run with g_worker_think=true)
-static std::string build_design_task(const Piece &p, const std::string &goal) {
-    std::string exp; for (size_t i = 0; i < p.exports.size(); i++) exp += (i ? "," : "") + p.exports[i];
-    std::string user =
-        "You are the DESIGNER for component '" + p.id + "'.\n\n" + goal +
-        "\nYour component '" + p.id + "': " + p.instruction + "\nExports: " + exp + "\n\n"
-        "Write a concise BLUEPRINT for '" + p.id + "': its exported API (names, params, types), behavior, "
-        "key edge cases, and how it interacts with the other components above. Precise prose/pseudocode, "
-        "NOT full code. Save it with create_file at path design/" + p.id + ".blueprint";
-    std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
+// ── PA.6 + PA.2.1 prefix caching: the SHARED context (goal/contract/blueprints) goes in the SYSTEM
+// turn so it is a literal token-prefix of every item in a stage → run_pool prefills it ONCE and
+// delta-prefills only the per-item user turn (PA6 §6.1: per-item full-prefill was the scale bottleneck).
+// stage_prefix() and stage_item() MUST share identical system text. ─────────────────────────────────
+static std::string stage_prefix(const std::string &shared) {        // the cached starter (system only)
+    return apply_chat_template({ {"system", worker_preamble_text() + std::string("\n\n") + shared} }, /*add_ass=*/false);
+}
+static std::string stage_item(const std::string &shared, const std::string &user) {
+    std::string s = apply_chat_template({ {"system", worker_preamble_text() + std::string("\n\n") + shared},
+                                          {"user", user} }, /*add_ass=*/true);
     if (!g_worker_think) s += "<think>\n\n</think>\n\n";
     return s;
 }
 
-// IMPLEMENT task: one implementer per component → its module, given its blueprint + siblings (read-file→inject)
-static std::string build_impl_task(const Piece &p, const std::string &goal) {
+// DESIGN: `goal` is the shared prefix; the per-component assignment is the (small) delta.
+static std::string design_user(const Piece &p) {
+    std::string exp; for (size_t i = 0; i < p.exports.size(); i++) exp += (i ? "," : "") + p.exports[i];
+    return "You are the DESIGNER for component '" + p.id + "' (the project goal + components are above).\n"
+           "Your component '" + p.id + "': " + p.instruction + "\nExports: " + exp + "\n\n"
+           "Write a concise BLUEPRINT for '" + p.id + "': its exported API (names, params, types), behavior, "
+           "key edge cases, and how it interacts with the other components above. Precise prose/pseudocode, "
+           "NOT full code. Save it with create_file at path design/" + p.id + ".blueprint";
+}
+
+// IMPLEMENT: goal+contract+ALL blueprints are the shared prefix (read once); the per-item delta is tiny.
+static std::string impl_shared(const std::string &goal) {
     namespace fs = std::filesystem; std::error_code ec;
-    std::string own = read_file_str(std::string(g_work_dir) + "/design/" + p.id + ".blueprint");
-    std::string sibs, ddir = std::string(g_work_dir) + "/design";
+    std::string bps, ddir = std::string(g_work_dir) + "/design";
     for (auto it = fs::directory_iterator(ddir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
         if (!it->is_regular_file(ec)) continue;
         std::string n = it->path().filename().string();
-        if (n == p.id + ".blueprint") continue;
-        sibs += "--- " + n + " ---\n" + read_file_str(it->path().string()) + "\n";
+        if (n == "INTERFACE.md") continue;   // already folded into `goal`
+        bps += "--- " + n + " ---\n" + read_file_str(it->path().string()) + "\n";
     }
-    std::string user =
-        "You are the IMPLEMENTER for component '" + p.id + "'.\n\n" + goal +
-        "\nYour component's blueprint:\n" + (own.empty() ? ("(design missing) " + p.instruction) : own) +
-        "\n\nOther components' interfaces (integrate via these):\n" + (sibs.empty() ? "(none)" : sibs) +
-        "\nImplement '" + p.id + "' exactly per its blueprint, integrating through the interfaces above. "
-        "Save it with create_file at the file path its blueprint/assignment specifies.";
-    std::string s = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
-    if (!g_worker_think) s += "<think>\n\n</think>\n\n";
-    return s;
+    return goal + "\n\nALL COMPONENT BLUEPRINTS (integrate via these):\n" + (bps.empty() ? "(none)" : bps);
+}
+static std::string impl_user(const Piece &p) {
+    return "You are the IMPLEMENTER for component '" + p.id + "'. Its blueprint is '" + p.id +
+           ".blueprint' in the blueprints above; implement it EXACTLY, integrating through the other "
+           "components' interfaces above and obeying the CONTRACT. Save it with create_file at the path "
+           "its blueprint/assignment specifies (e.g. src/" + p.id + ".js).";
 }
 
 // RECONCILE: the boss unifies the parallel (possibly-conflicting) blueprints into ONE
@@ -1986,9 +1988,9 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
     bool sv_wt = g_worker_think; SParams sv_sp = g_worker_sp;
     g_worker_think = true; g_worker_sp = qwen_params(true, false);   // designers reason (coding 0.6)
     std::vector<std::string> ditems, dids;
-    for (auto &p : wo.pieces) { ditems.push_back(build_design_task(p, goal)); dids.push_back(p.id); }
+    for (auto &p : wo.pieces) { ditems.push_back(stage_item(goal, design_user(p))); dids.push_back(p.id); }
     fprintf(stderr, "\n══ PA.6 DESIGN — %d designers (parallel, thinking) ══\n", (int)ditems.size());
-    std::vector<std::string> douts; run_pool(ditems, n_lanes, max_new, &douts, "");
+    std::vector<std::string> douts; run_pool(ditems, n_lanes, max_new, &douts, stage_prefix(goal));  // PA.2.1: cache goal once
     std::vector<std::pair<std::string,std::string>> dres;
     for (size_t i = 0; i < dids.size() && i < douts.size(); i++) dres.push_back({ dids[i], strip_think(douts[i]) });
     fprintf(stderr, "\n══ PA.6 STORE — design blueprints ══\n");
@@ -2021,9 +2023,10 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
 
     // ── IMPLEMENT pool (parallel, instruct) → modules, reading the contract + blueprints ──
     std::vector<std::string> iitems, iids;
-    for (auto &p : wo.pieces) { iitems.push_back(build_impl_task(p, goal)); iids.push_back(p.id); }
+    std::string ishared = impl_shared(goal);   // goal+contract+ALL blueprints → cached once (PA.2.1)
+    for (auto &p : wo.pieces) { iitems.push_back(stage_item(ishared, impl_user(p))); iids.push_back(p.id); }
     fprintf(stderr, "\n══ PA.6 IMPLEMENT — %d implementers (parallel) ══\n", (int)iitems.size());
-    std::vector<std::string> iouts; run_pool(iitems, n_lanes, max_new, &iouts, "");
+    std::vector<std::string> iouts; run_pool(iitems, n_lanes, max_new, &iouts, stage_prefix(ishared));
     std::vector<std::pair<std::string,std::string>> ires;
     for (size_t i = 0; i < iids.size() && i < iouts.size(); i++) ires.push_back({ iids[i], strip_think(iouts[i]) });
 
