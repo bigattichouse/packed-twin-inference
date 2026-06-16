@@ -162,7 +162,9 @@ table above. Open items, in value order:
      **designer dictates libraries** (contract pins deps/CommonJS); untested modules re-queue test-gen.
    - **PA.5** tool calls (`create_file`/`execute_bash`, nanocoder convention).
    - **PA.6** staged pipeline: triage → parallel design → reconcile (contract) → implement →
-     test-gen → verify → repair (`spec/PA6_PIPELINE_DESIGN.md`); GPU end-to-end validating.
+     test-gen → verify → repair (`spec/PA6_PIPELINE_DESIGN.md`); **prefix-cached pools** (shared
+     goal/contract/blueprints prefill once per stage, delta-prefill per item — fixes the scale
+     prefill bottleneck, smoke-confirmed); GPU end-to-end validating.
    - **PA.7** *(core built; integration pending)* **eager scheduling**: dissolve the stage barriers —
      artifact-gated ready-queue, reconcile = the first rework pass. Pure scheduler + makespan sim
      (`--eager-test`, **eager 18% < barriers** on the measured spread) and active-retrieval primitives

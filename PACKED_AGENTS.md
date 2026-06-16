@@ -123,10 +123,12 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
 - **PA.5** ✓ *v1 (2026-06-14)* — worker tool-calls: nanocoder-style `<create_file>` /
   `<execute_bash>` (`--tools` / `--allow-run`), sandboxed to `--work-dir`. create_file verified
   end-to-end (workers wrote stack.js + test.js; the generated tests pass).
-- **PA.6** ✓ *(2026-06-15)* — staged pipeline (`--tools --no-stream`): triage → parallel **design**
+- **PA.6** ✓ *(2026-06-15/16)* — staged pipeline (`--tools --no-stream`): triage → parallel **design**
   (blueprints) → **reconcile** (interface contract) → parallel **implement** → test-gen → verify →
   repair. Parallelizes the serial plan-think (the ~80%-of-wall cost); reconcile lifted verify 1/3→2/3.
-  GPU end-to-end validating. See `spec/PA6_PIPELINE_DESIGN.md`.
+  **Prefix-cached pools (§6.1):** the shared goal/contract/blueprints prefill **once** per stage
+  (`stage_prefix` → `run_pool`), delta-prefill per item — fixes the scale prefill bottleneck (the
+  108-min/0.22× run); smoke-confirmed `cloned+delta` all stages. See `spec/PA6_PIPELINE_DESIGN.md`.
 - **PA.7** *(core built 2026-06-16; integration pending)* — **eager scheduling**: dissolve the stage
   barriers into an artifact-gated ready-queue (idle lanes pull the next ready item across stages);
   **reconcile becomes the first rework pass**; **active retrieval** (`read_file`/`abandon`, NOT_FOUND →
