@@ -150,12 +150,21 @@ table above. Open items, in value order:
    usable, MTP active) at the cost of cross-mode byte-identity
 4. ~~Sampled verification~~ — **done** (M7.4): speculation active at any temperature;
    τ=0.25 code edit keeps the full 2.0×, seeded runs reproduce byte-for-byte
-5. **Packed agents** *(new direction)* — the same packed-batch economics run *cooperating*
-   agents, not just drafts: a boss decomposes a coding task for three workers, all four
-   streams in one context, one batched decode per step. The plan → parallel → **gather**
-   pipeline is built (PA.0–PA.2 + gather to `--out`, 2026-06-14); PA.0 substrate measured
-   **1.95× aggregate** (4 streams; one model in VRAM, lanes add only KV). Design:
-   `PACKED_AGENTS.md` → `spec/PACKED_AGENTS_DESIGN.md`.
+5. **Packed agents** *(active direction)* — the same packed-batch economics run *cooperating*
+   agents, not just drafts: a boss decomposes a coding task, workers build in parallel, one
+   batched decode per step. PA.0 substrate measured **1.95× aggregate** (4 streams; one model
+   in VRAM, lanes add only KV). Now a full autonomous arc on the `--tools --no-stream` path:
+   - **PA.0–PA.2** plan → parallel → gather to `--out` (2026-06-14).
+   - **PA.3** MTP spec-dec (behind `--mtp`; net-slower on packed — `spec/PA3_MTP_DESIGN.md`).
+   - **PA.4** coordination: test-gen → verify → repair → boss arbiter, with **full-triad rework**
+     (goal/contract + blueprint + module + test); fresh sessions, thinking repair lanes.
+   - **PA.5** tool calls (`create_file`/`execute_bash`, nanocoder convention).
+   - **PA.6** staged pipeline: triage → parallel design → reconcile (contract) → implement →
+     test-gen → verify → repair (`spec/PA6_PIPELINE_DESIGN.md`); GPU end-to-end validating.
+   - **PA.7** *(designed)* **eager scheduling**: dissolve the stage barriers — artifact-gated
+     ready-queue, reconcile becomes the first rework pass (`spec/PA7_PIPELINING_DESIGN.md`).
+
+   Design: `PACKED_AGENTS.md` → `spec/PACKED_AGENTS_DESIGN.md` → the per-milestone `spec/PA*.md`.
 
 Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kernel
 (the only path past the current verify-cost curve; major project).
@@ -167,7 +176,7 @@ Declined/parked: twin aggregate serving (2-user throughput), flat-Q8 custom kern
 | `pti_lookup.cpp` | the algorithm — CLI with `--baseline/--mtp/--sabotage/-t` audit modes |
 | `pti_server.cpp` | OpenAI-compatible server, `--mode base/mtp/pti`, any temperature |
 | `pti_chat.cpp` | interactive chat (llama-cli equivalent): live `/mode`, `/temp`, per-turn stats |
-| `pti_agents.cpp` | packed-agents binary (PA.0–PA.2 + gather): boss plan → parallel lanes → merge to `--out` |
+| `pti_agents.cpp` | packed-agents binary (PA.0–PA.6): boss triage → parallel design/implement → reconcile → test-gen → verify → repair; `--tools --no-stream` staged pipeline + gather to `--out` |
 | `pti-cli.sh`, `llama-server-pti.sh` | launch scripts |
 | `llama.cpp-patch/`, `llama.cpp-files/` | the one (optional) llama.cpp patch + mirrored files |
 | `pti_kbatch_bench.cpp`, `pti_mtp_probe.cpp`, `pti_q6k_bench.hip` | the measurements behind the design |
