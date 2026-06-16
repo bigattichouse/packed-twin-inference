@@ -144,6 +144,7 @@ diagnostic/bench reference + the MTP path; sampling is the product.
 | Implementer can't find a sibling interface | harness injects sibling blueprints (read-file→inject); blueprint is required output of design |
 | Sampling stays slow | §6 measure+optimize; do not drop sampling |
 | More moving parts | reuse PA.2 pool for every stage; blueprints/tests/modules are all just files |
+| **Triage builds instead of assigns** (emits `*.test` pieces → implementers write `src/*.test.js` that clash with the harness test-gen; also `exports=none` false-collides) | **the COORDINATOR assigns work, it does NOT build code or tests itself** (user, 2026-06-15): triage prompt says so + forbids test pieces; harness drops any `.test` piece anyway; collision check skips the `none` sentinel (index.html, `*.test.js`). Tests are owned by the test-gen stage (§4.2), not the triage |
 
 ---
 
