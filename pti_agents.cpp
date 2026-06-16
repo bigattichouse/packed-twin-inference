@@ -1126,7 +1126,9 @@ static std::string tc_param(const ToolCall &c, const std::string &k) {
 // Parse <tool>...<param>value</param>...</tool> for the KNOWN tool names only (so a
 // stray <div> etc. in worker code is never mistaken for a tool call).
 static std::vector<ToolCall> parse_tool_calls(const std::string &text) {
-    static const char *TOOLS[] = { "create_file", "execute_bash" };
+    // create_file/execute_bash (PA.5) + read_file/abandon (PA.7b active retrieval — parsed now,
+    // handled by the mid-stream loop when that lands; harmless until a prompt offers them).
+    static const char *TOOLS[] = { "create_file", "execute_bash", "read_file", "abandon" };
     std::vector<ToolCall> calls;
     for (const char *tool : TOOLS) {
         std::string open = std::string("<") + tool + ">", close = std::string("</") + tool + ">";
@@ -1160,6 +1162,33 @@ static std::vector<ToolCall> parse_tool_calls(const std::string &text) {
         }
     }
     return calls;
+}
+
+// ── PA.7b active-retrieval primitives (pure; the mid-stream loop wires them later) ────────────────
+// A worker's read_file → the file's content, or a NOT_FOUND sentinel when it isn't built yet (eager
+// mode: its producer hasn't run). NOT_FOUND is the signal to abandon + re-queue gated on that file.
+static const char *PA7_NOTFOUND = "NOT_FOUND";
+static std::string resolve_read(const std::string &work_dir, const std::string &rel) {
+    if (rel.empty() || rel.find("..") != std::string::npos)
+        return std::string(PA7_NOTFOUND) + ": invalid path";
+    std::string full = work_dir + "/" + rel;
+    FILE *f = fopen(full.c_str(), "r");
+    if (!f) return std::string(PA7_NOTFOUND) + ": " + rel + " (not built yet)";
+    std::string s; char b[8192]; size_t k; while ((k = fread(b,1,sizeof(b),f)) > 0) s.append(b,k); fclose(f);
+    return s;
+}
+static bool pa7_is_notfound(const std::string &r) { return r.rfind(PA7_NOTFOUND, 0) == 0; }
+
+// Re-queue a worker that called abandon(reason): the harness holds the original dispatch prompt and
+// re-enqueues it with the reason appended (+ the awaited file's content once it exists). The model
+// reconstructs nothing — the harness owns continuity. (require → abandon → re-queue, never wait.)
+static std::string build_blocked_requeue(const std::string &orig_prompt, const std::string &reason,
+                                         const std::string &resolved) {
+    std::string out = orig_prompt + "\n\n[Earlier you abandoned this task: " + trim(reason) + "]";
+    if (!resolved.empty() && !pa7_is_notfound(resolved))
+        out += "\nThe file you were waiting on is now available:\n```\n" + resolved + "\n```\n"
+               "Complete the task now.";
+    return out;
 }
 
 // Destructive-command guard for execute_bash — mirrors nanocoder's blocklist.
@@ -2123,8 +2152,40 @@ static int gather_self_test() {
         fprintf(stderr, "  T4 dangerous-cmd guard: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) fail++;
     }
+    // ── PA.7b active-retrieval primitives ──
+    // T5: parse read_file → path
+    {
+        auto calls = parse_tool_calls("<read_file><path>src/renderer.js</path></read_file>");
+        bool ok = calls.size()==1 && calls[0].name=="read_file" && tc_param(calls[0],"path")=="src/renderer.js";
+        fprintf(stderr, "  T5 parse read_file: %s\n", ok ? "PASS" : "FAIL"); if (!ok) fail++;
+    }
+    // T6: parse abandon → reason
+    {
+        auto calls = parse_tool_calls("<abandon><reason>waiting on src/renderer.js</reason></abandon>");
+        bool ok = calls.size()==1 && calls[0].name=="abandon" && tc_param(calls[0],"reason")=="waiting on src/renderer.js";
+        fprintf(stderr, "  T6 parse abandon: %s\n", ok ? "PASS" : "FAIL"); if (!ok) fail++;
+    }
+    // T7: resolve_read → content for existing, NOT_FOUND for missing / unsafe
+    {
+        std::string p = "/tmp/_pa7_read_test.js"; FILE *f = fopen(p.c_str(), "w");
+        if (f) { fputs("module.exports={};", f); fclose(f); }
+        bool ok = resolve_read("/tmp", "_pa7_read_test.js") == "module.exports={};"
+               && pa7_is_notfound(resolve_read("/tmp", "_pa7_nope.js"))
+               && pa7_is_notfound(resolve_read("/tmp", "../etc/passwd"));
+        remove(p.c_str());
+        fprintf(stderr, "  T7 resolve_read: %s\n", ok ? "PASS" : "FAIL"); if (!ok) fail++;
+    }
+    // T8: build_blocked_requeue keeps the original prompt + reason, injects content once available
+    {
+        std::string q1 = build_blocked_requeue("ORIGTASK", "need renderer.js", "");
+        std::string q2 = build_blocked_requeue("ORIGTASK", "need renderer.js", "CTXCODE");
+        bool ok = q1.find("ORIGTASK")!=std::string::npos && q1.find("need renderer.js")!=std::string::npos
+               && q1.find("CTXCODE")==std::string::npos
+               && q2.find("CTXCODE")!=std::string::npos;
+        fprintf(stderr, "  T8 build_blocked_requeue: %s\n", ok ? "PASS" : "FAIL"); if (!ok) fail++;
+    }
 
-    fprintf(stderr, "  %s (%d/14 passed)\n", fail == 0 ? "ALL PASS" : "SOME FAILED", 14 - fail);
+    fprintf(stderr, "  %s (%d/18 passed)\n", fail == 0 ? "ALL PASS" : "SOME FAILED", 18 - fail);
     return fail > 0 ? 3 : 0;
 }
 

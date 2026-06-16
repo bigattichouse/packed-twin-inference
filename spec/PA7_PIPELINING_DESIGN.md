@@ -104,6 +104,10 @@ it decides it needs**, two layers:
   Pulls *exactly* what's needed — the real agent loop. Needs the **mid-stream tool round-trip** (a
   lane that pauses, gets a result, resumes; in the packed batch = re-feed one lane while others
   decode). This is PA.5-v2 / the "live tool loop."
+  **Primitives IMPLEMENTED (2026-06-16, GPU-free):** `parse_tool_calls` now recognizes `read_file`
+  + `abandon`; `resolve_read` (→ content or `NOT_FOUND`); `build_blocked_requeue` (held prompt +
+  reason + content-once-available). `--gather-test` T5–T8. Remaining = the mid-stream loop in
+  `run_pool` (re-feed a lane on a tool call; on `abandon`, free the lane + re-queue gated on the file).
 
 **`NOT_FOUND` is a dynamic dependency (the key semantic).** In eager mode a worker may read a file
 that **doesn't exist yet** (its producer hasn't run). The read-tool returns *"not built yet,"* and
