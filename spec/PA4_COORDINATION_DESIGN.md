@@ -6,9 +6,12 @@ a shared **Board** (the blackboard) and reports progress to the user as a **live
 packed team's payoff is not raw speed — it's **autonomously verified, test-passing, multi-file
 output** that a one-shot model cannot self-correct.
 
-**Status**: design. Builds on PA.2 (pool + refill queue), PA.5 (`--tools`: `create_file`/
-`execute_bash`), PA.1c (gather). Realizes design §8.2 (bidirectional coordination), §8.4 (two
-queues / blackboard), §10 (boss = single voice to the user).
+**Status**: §3 verify/repair (PA.4c), §4.1 boss arbiter (PA.4d), and §4.2 fresh-session full-context
+enrichment **IMPLEMENTED (2026-06-15)** — `finalize_verify` (test-gen → verify → L1 amend → L2 boss
+re-queue), GPU-free `--coord-test` 10/10 green; GPU end-to-end (3/3) pending. §1/§2 Board live-checklist
+still design. Builds on PA.2 (pool + refill queue), PA.5 (`--tools`: `create_file`/`execute_bash`),
+PA.1c (gather). Realizes design §8.2 (bidirectional coordination), §8.4 (two queues / blackboard),
+§10 (boss = single voice to the user).
 
 This doc captures the user's design (2026-06-15): tool calls that *run tests and amend files*; a
 *test agent that finds a problem and pushes it back to be amended*; workers *report DONE so the
@@ -194,6 +197,28 @@ repair with the queue: L1 is the harness auto-amending the module; L2 is the bos
 rework (fix the test, re-spec, split, or quit). It also fixes today's blocker — the boss requeues
 "fix test/renderer.test.js: the arc spy spreads `...args` into apply" and the pool corrects it.
 
+### 4.2 Every fresh worker gets the FULL triad — "we're building THIS, here's your part" (user, 2026-06-15) — IMPLEMENTED
+
+Each worker/arbiter/repair lane is a **fresh session** (`run_pool`'s `start_lane` does `seq_rm(L)` —
+no infection from prior work). Isolation buys parallelism, but it means a lane knows **only what the
+harness injects**. The first PA.4d arbiter run *correctly* targeted the test, yet the rework didn't
+land — the fresh worker saw only the file + a one-line guidance, not enough to fix anything. Fix:
+inject the same context an implementer had, so every repair/test lane has *goal → my part → code*:
+
+- **L1 worker amend** (`build_amend_user`): module + test + error **+ `design/<comp>.blueprint` (spec)**.
+- **L2 boss rework** (`build_rework_user`): target + **spec** + module + test + **the matching error** +
+  the boss's guidance — the full triad, derived per rework file (component ← target name, spec ←
+  blueprint, test+error ← the failing `fails` entry).
+- **Test-gen** (`build_test_task`): was the worst-contextualized lane — it saw only its module + the
+  *thin triage* `shared` line. Now it gets **the project goal/contract (reconciled `INTERFACE.md`, else
+  triage shared) + this component's `blueprint` + the code**, and is told to test against the **spec,
+  not just the code as-written** ("we're building THIS; your part is `<comp>`; here is its spec").
+
+**Repair/rework lanes THINK** (coding 0.6), like designers — debugging a failing test is precise
+reasoning, not mechanical transcription. The verify→repair loop saves/sets `g_worker_think=true`,
+`g_worker_sp=qwen_params(true,false)` for its duration and restores after (mirrors the design pool).
+Covered GPU-free by `--coord-test` R3/R9/R10 (amend/rework/test-gen all carry their full context).
+
 ---
 
 ## 5. Boss reports to the user — the live board
@@ -256,6 +281,8 @@ One structure, three consumers (§1): harness writes, boss decides, user watches
 | C6 | `build_amend_prompt` | file + error | contains `<<<CURRENT_FILE`, `<<<TEST_OUTPUT`, the error text |
 | C7 | `render_board` | mixed statuses | `[✓]/[~]/[ ]/[⚠]` lines, repair counts |
 | C8 | boss intent parse (v2) | `<<<REQUEUE w1: hint>>>` | {action=REQUEUE, id=w1, hint} |
+| **R9** | `build_rework_user` (§4.2) | target+spec+module+test+error+guidance | all six present (fresh worker full triad) |
+| **R10** | `build_test_task` (§4.2) | goal/contract + blueprint + module | all three present (test the spec) |
 
 ### 9.2 Integration (GPU)
 

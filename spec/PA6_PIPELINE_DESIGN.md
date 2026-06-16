@@ -42,7 +42,8 @@ RECONCILE     (boss, serial-bounded) unify the blueprints → design/INTERFACE.m
         ↓   harness seeds each lane with the goal blueprint + the CONTRACT (+ blueprints)
 IMPLEMENT pool (parallel, instruct)  each writes src/<comp>.js against the CONTRACT
         ↓
-TEST-GEN pool (parallel)             a test per module (given the file + its blueprint)  [PA.4b]
+TEST-GEN pool (parallel)             a test per module (given the goal/CONTRACT + its blueprint + the
+                                     file; tests the SPEC, not just the code-as-written)  [PA.4b/4.2]
         ↓
 VERIFY → done when green; failures → repair loop  [PA.4c]
 ```

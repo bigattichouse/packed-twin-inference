@@ -1253,18 +1253,23 @@ static void finish_gather(const WorkOrder &wo,
 }
 
 // PA.4: build a "write a test for this module" task — given file X (the written module) and
-// design Y (the shared interface). The harness runs these as a second pool so each module gets a
-// real test that sees the actual code (user's model: "given file X and design Y, build a test").
+// design Y. The test-maker is a fresh session, so it gets the SAME context an implementer had:
+// the project goal/contract ("we're building THIS") + this component's blueprint ("here is your
+// part + the spec around it") + the actual code. Tests target the spec, not just the code as-written.
 static std::string build_test_task(const std::string &relpath, const std::string &content,
-                                   const std::string &shared) {
+                                   const std::string &goal, const std::string &blueprint) {
     std::filesystem::path p(relpath);
     std::string base = p.filename().string();
     size_t dot = base.rfind(".js"); if (dot != std::string::npos) base = base.substr(0, dot);
     std::string testpath = "test/" + base + ".test.js";
     std::string user =
-        "Write a Node.js unit test for the module below.\n\nModule file (" + relpath + "):\n```js\n"
-        + content + "\n```\n\nShared design / interface:\n" + shared +
-        "\n\nThe test MUST: require the module (e.g. const m = require('../" + relpath + "')), exercise "
+        "We are building THIS project — goal + interface contract:\n"
+        + (goal.empty() ? "(no goal supplied)" : goal) +
+        "\n\nYour part: write a Node.js unit test for the '" + base + "' module. Test it against its "
+        "SPEC (below), not merely whatever the current code happens to do.\n\nSpec / blueprint for '"
+        + base + "':\n" + (blueprint.empty() ? "(none on disk)" : blueprint) +
+        "\n\nModule file (" + relpath + "):\n```js\n" + content +
+        "\n```\n\nThe test MUST: require the module (e.g. const m = require('../" + relpath + "')), exercise "
         "its exported behavior with console.assert, print a line per check, and call process.exit(1) on "
         "ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
         "\nOutput only the create_file tool call.";
@@ -1285,12 +1290,14 @@ static std::string module_for_test(const std::string &test_filename,
     return "";
 }
 // Amend instruction (user turn) for a failing module — fix the code so its test passes.
+// Gives the worker the full context (it's a fresh session): SPEC + module + test + error.
 static std::string build_amend_user(const std::string &base, const std::string &modpath,
                                     const std::string &modcontent, const std::string &testcontent,
-                                    const std::string &error) {
-    return "Component '" + base + "' FAILED its test. Fix the MODULE so the test passes (do not "
-           "change the test).\n\nModule (" + modpath + "):\n```\n" + modcontent + "\n```\n\nTest:\n```\n"
-           + testcontent + "\n```\n\nTest output / error:\n" + error +
+                                    const std::string &error, const std::string &spec) {
+    return "Component '" + base + "' FAILED its test. Fix the MODULE so the test passes (do not change "
+           "the test).\n\nSpec / blueprint for '" + base + "':\n" + (spec.empty() ? "(none)" : spec) +
+           "\n\nModule (" + modpath + "):\n```\n" + modcontent + "\n```\n\nTest:\n```\n" + testcontent +
+           "\n```\n\nTest output / error:\n" + error +
            "\n\nRe-emit the corrected module via create_file at " + modpath + ". Output only the tool call.";
 }
 // Repair scheduler verdict given the round, the budget, and how many tests still fail.
@@ -1325,11 +1332,18 @@ static std::string build_arbiter_user(const std::string &contract, const std::st
            "how to fix it\n<<<END>>>\n(module OR test). Emit none to accept the failures as-is.\n\n"
            "Interface contract:\n" + contract + "\n\nFailing pieces (module, test, error):\n" + failblock;
 }
-// PA.4d rework task (worker): rewrite one file per the boss's guidance.
-static std::string build_rework_user(const std::string &file, const std::string &current, const std::string &guidance) {
-    return "Rewrite the file '" + file + "' to fix the problem.\n\nCurrent contents:\n```\n" + current +
-           "\n```\n\nWhat to fix:\n" + guidance + "\n\nRe-emit the COMPLETE corrected file via create_file at "
-           + file + ". Output only the tool call.";
+// PA.4d rework task (worker): rewrite ONE file, given the full context (fresh session needs it all):
+// spec + module + test + error + the boss's guidance.
+static std::string build_rework_user(const std::string &target, const std::string &spec,
+                                     const std::string &modcontent, const std::string &testcontent,
+                                     const std::string &error, const std::string &guidance) {
+    return "A test is failing. Study the FULL context below, then rewrite ONLY '" + target + "' to fix it.\n\n"
+           "Spec / blueprint:\n" + (spec.empty() ? "(none)" : spec) +
+           "\n\nModule:\n```\n" + (modcontent.empty() ? "(none)" : modcontent) +
+           "\n```\n\nTest:\n```\n" + (testcontent.empty() ? "(none)" : testcontent) +
+           "\n```\n\nTest output / error:\n" + error +
+           "\n\nCoordinator's guidance:\n" + guidance +
+           "\n\nRe-emit the COMPLETE corrected '" + target + "' via create_file at " + target + ". Output only the tool call.";
 }
 
 // GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
@@ -1341,16 +1355,24 @@ static int coord_self_test() {
       chk("R1 module_for_test",  module_for_test("bird.test.js", m) == "src/bird.js"); }
     { std::vector<std::string> m={"src/bird.js"};
       chk("R2 no-match empty",   module_for_test("zzz.test.js", m).empty()); }
-    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR");
+    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR","SPEC");
       chk("R3 amend has parts",  u.find("src/bird.js")!=std::string::npos && u.find("CODE")!=std::string::npos
-                              && u.find("TEST")!=std::string::npos && u.find("ERR")!=std::string::npos); }
+                              && u.find("TEST")!=std::string::npos && u.find("ERR")!=std::string::npos
+                              && u.find("SPEC")!=std::string::npos); }
     chk("R4 verdict done",   repair_verdict(0,3,0) == RA_DONE);
     chk("R5 verdict repair", repair_verdict(0,3,2) == RA_REPAIR);
     chk("R6 verdict giveup", repair_verdict(3,3,2) == RA_GIVEUP);
     { auto rw = parse_rework("noise <<<REWORK file=test/a.test.js>>>\nfix the arc spy\n<<<END>>> tail");
       chk("R7 parse_rework", rw.size()==1 && rw[0].first=="test/a.test.js" && rw[0].second=="fix the arc spy"); }
     { auto rw = parse_rework("no markers here"); chk("R8 parse_rework empty", rw.empty()); }
-    fprintf(stderr, "  %s (%d/8 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 8-fail);
+    { std::string u = build_rework_user("src/bird.js","SPEC","MODC","TESTC","ERRC","GUIDE");   // fresh worker: full triad
+      chk("R9 rework full ctx", u.find("src/bird.js")!=std::string::npos && u.find("SPEC")!=std::string::npos
+                             && u.find("MODC")!=std::string::npos && u.find("TESTC")!=std::string::npos
+                             && u.find("ERRC")!=std::string::npos && u.find("GUIDE")!=std::string::npos); }
+    { std::string u = build_test_task("src/bird.js","CODEX","GOALX","BPX");   // test-maker: goal + spec + code
+      chk("R10 testgen ctx", u.find("GOALX")!=std::string::npos && u.find("BPX")!=std::string::npos
+                          && u.find("CODEX")!=std::string::npos); }
+    fprintf(stderr, "  %s (%d/10 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 10-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -1380,13 +1402,19 @@ static void finalize_verify(const WorkOrder &wo,
     }
     std::sort(mods.begin(), mods.end());
     if (!mods.empty()) {
-        fprintf(stderr, "\n══ PA.4 TEST-GEN — writing a test per module (given file + design): %d module(s) ══\n", (int)mods.size());
+        fprintf(stderr, "\n══ PA.4 TEST-GEN — writing a test per module (given goal + spec + file): %d module(s) ══\n", (int)mods.size());
+        // The project goal/contract: the reconciled INTERFACE.md if present, else the triage shared block.
+        std::string contract = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
+        std::string goal_ctx = contract.empty() ? wo.shared : contract;
         std::vector<std::string> items, ids;
         for (auto &m : mods) {
             std::string rel = fs::relative(m, g_work_dir, ec).string();
             std::string content; FILE *f = fopen(m.c_str(), "r");
             if (f) { char b[8192]; size_t k; while ((k = fread(b,1,sizeof(b),f)) > 0) content.append(b,k); fclose(f); }
-            items.push_back(build_test_task(rel, content, wo.shared));
+            std::string comp = fs::path(rel).filename().string();
+            { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
+            std::string bp = read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
+            items.push_back(build_test_task(rel, content, goal_ctx, bp));
             ids.push_back(rel);
         }
         std::vector<std::string> touts;
@@ -1435,11 +1463,16 @@ static void finalize_verify(const WorkOrder &wo,
         return mods;
     };
 
+    // Repair/rework is precise debugging — let those lanes REASON (coding 0.6), like designers.
+    // Items above are built against the live g_worker_think, so set it before the loop runs them.
+    bool sv_wt = g_worker_think; SParams sv_sp = g_worker_sp;
+    if (!g_greedy) { g_worker_think = true; g_worker_sp = qwen_params(true, false); }
+
     bool arbiter_done = false;   // PA.4d: boss arbiter escalates once on L1 budget exhaustion
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
         fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s) ══\n", round ? " (re-check)" : "", (int)res.size());
-        if (res.empty()) { fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify\n"); return; }
+        if (res.empty()) { fprintf(stderr, "  ⚠ NO *.test.js produced — cannot verify\n"); break; }
         int passed = 0; std::vector<TestRes> fails;
         for (auto &r : res) {
             if (r.ok) { passed++; fprintf(stderr, "  [PASS] %s\n", r.rel.c_str()); }
@@ -1468,10 +1501,24 @@ static void finalize_verify(const WorkOrder &wo,
                 if (!reworks.empty()) {
                     std::vector<std::string> ritems, rids;
                     for (auto &rw : reworks) {
-                        std::string u = build_rework_user(rw.first, read_file_str(std::string(g_work_dir) + "/" + rw.first), rw.second);
+                        std::string tgt = rw.first;
+                        std::string fn = std::filesystem::path(tgt).filename().string(), comp = fn;
+                        { size_t s = comp.find(".test.js");
+                          if (s != std::string::npos) comp = comp.substr(0, s);
+                          else { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); } }
+                        std::string modpath = module_for_test(comp + ".test.js", mods);
+                        std::string spec = read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
+                        std::string modc = modpath.empty() ? "" : read_file_str(modpath);
+                        std::string testc, err;                 // pull the comp's test + error from fails
+                        for (auto &r : fails) {
+                            std::string tb = std::filesystem::path(r.rel).filename().string();
+                            size_t s = tb.find(".test.js"); if (s != std::string::npos) tb = tb.substr(0, s);
+                            if (tb == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
+                        }
+                        std::string u = build_rework_user(tgt, spec, modc, testc, err, rw.second);
                         std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", u} }, true);
                         if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
-                        ritems.push_back(sp); rids.push_back(rw.first);
+                        ritems.push_back(sp); rids.push_back(tgt);
                     }
                     std::vector<std::string> routs; run_pool(ritems, n_lanes, max_new, &routs, "");
                     std::vector<std::pair<std::string,std::string>> rres;
@@ -1494,8 +1541,9 @@ static void finalize_verify(const WorkOrder &wo,
             if (modpath.empty()) { fprintf(stderr, "  (no module maps to %s — skip)\n", testfn.c_str()); continue; }
             std::string base = testfn; size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
             std::string modrel = fs::relative(modpath, g_work_dir, ec).string();
+            std::string spec = read_file_str(std::string(g_work_dir) + "/design/" + base + ".blueprint");
             std::string user = build_amend_user(base, modrel, read_file_str(modpath),
-                                                read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out);
+                                                read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out, spec);
             std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
             if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
             aitems.push_back(sp); aids.push_back(modrel);
@@ -1509,6 +1557,7 @@ static void finalize_verify(const WorkOrder &wo,
         }
         run_worker_tools(ares);   // overwrite the fixed modules; loop re-verifies
     }
+    g_worker_think = sv_wt; g_worker_sp = sv_sp;   // restore (implementers = instruct)
 }
 
 // ───────────────────────── PA.6: staged design→build pipeline ─────────────────
