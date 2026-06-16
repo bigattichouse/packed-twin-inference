@@ -34,6 +34,12 @@ PA.6 design pool, live Flappy run (2026-06-15), 5 designers on 4 lanes:
 Thinking lanes have the widest token spread (design, repair), so they suffer the worst tails — and
 they're exactly the stages PA.6 makes everyone wait on.
 
+> **Priority correction (MEASURED 2026-06-16, PA6 §6.1):** the *scale* test (13 modules) showed the
+> dominant wall cost is **per-item full prefill of the shared context** (the staged pools pass no
+> shared prefix → each item re-prefills the goal+contract), not the straggler tail. So **prefix-cache
+> the staged pipeline FIRST** (PA.2.1 mechanism, already in the codebase); eager scheduling then
+> recovers the residual straggler tail on top. PA.7 is the *second* wall lever, not the first.
+
 ---
 
 ## 2. Eager model — readiness is per-artifact, not per-stage

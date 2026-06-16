@@ -132,6 +132,37 @@ even sizes) — which the per-component granularity of this pipeline naturally p
 design to kill the plan-think. **No sampler optimization needed.** Greedy stays only as a
 diagnostic/bench reference + the MTP path; sampling is the product.
 
+## 6.1 MEASURED 2026-06-16: the SCALE bottleneck is PER-ITEM PREFILL, not stragglers
+
+`scale_validate.sh` (13 independent modules — packed's supposed sweet spot, items ≫ lanes) was run to
+test the hypothesis that *more, balanced, independent items recover throughput toward the ~1.9×
+ceiling*. **It did the opposite:**
+
+| stage | flappy (5 coupled) | scale (13 independent) |
+|---|---|---|
+| design aggregate | 0.69× | **0.64×** |
+| implement aggregate | 0.50× | **0.22×** |
+| packed wall | ~55 min | **108 min (6486 s), killed mid-test-gen — never reached verify** |
+
+More items made aggregate **worse** and the wall **brutal**. Root cause, visible in the logs as
+`full prefill` on every item: **`run_pipeline_staged` calls `run_pool(items, …, "")` with an EMPTY
+shared prefix**, so all N items **re-prefill the entire shared context** (the goal + the reconciled
+`INTERFACE.md` contract + the blueprint) from scratch. At 13 modules the contract is large and there
+are 13 of them → **prefill dominates the wall** and decode-aggregate tok/s craters. This is NOT
+stragglers (flappy) and NOT scheduling (PA.7) — it's **prefill bloat from re-sending the shared
+prefix N times.**
+
+**Fix — wire PA.2.1 prefix caching into the staged pools (likely a bigger wall win than PA.7).** The
+mechanism already exists (`POSITIVE_RESULTS` §PA.2.1 / memory): prefill the shared prefix **once** into
+a base seq, `seq_cp`-clone it per lane, and **delta-prefill only the per-item part** (the blueprint).
+`run_pipeline_staged` just never passes a shared prefix to `run_pool` (it passes `""`). Hoist the
+common prefix (goal + contract, identical across a stage's items) and pass it. This attacks the
+dominant cost at scale; eager scheduling (PA.7) then recovers the residual straggler tail on top.
+
+**Revised priority:** prefix-cache the staged pipeline **first**, then PA.7 eager scheduling. (And the
+"sweet spot" claim is retracted until prefill is fixed — at scale, packed is currently *prefill-bound*,
+not decode-bound.)
+
 ---
 
 ## 7. Risks & mitigations
