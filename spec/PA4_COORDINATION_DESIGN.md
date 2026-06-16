@@ -219,6 +219,31 @@ reasoning, not mechanical transcription. The verify→repair loop saves/sets `g_
 `g_worker_sp=qwen_params(true,false)` for its duration and restores after (mirrors the design pool).
 Covered GPU-free by `--coord-test` R3/R9/R10 (amend/rework/test-gen all carry their full context).
 
+### 4.3 The arbiter speaks WORK-ORDERS, not a bespoke REWORK format (MEASURED 2026-06-15/16)
+
+First full GPU run with §4.2 enrichment: **2/4** on Flappy (`bird`,`renderer` pass; `engine`,`pipes`
+fail). Both failures were **test bugs, not module bugs** — `engine.test.js`'s `MockContext` lacked
+`fillRect` (which `render()` calls); `pipes.test.js` asserted `p.x === 400` *after* `update()` had
+already moved the pipe left. So:
+
+- **L1 (module-amend) structurally can't fix them** — it spent both repair rounds rewriting already-
+  correct modules. Test bugs need L2's authority (only the boss may edit a test — anti-gaming).
+- **The §4.2 enrichment WORKED at the reasoning layer**: given the full triad, the boss diagnosed
+  both correctly — it even computed `400 − 22.5 = 377.5` to prove the pipes assertion wrong, and
+  noted "MockContext must implement `fillRect`". The context did its job.
+- **But the arbiter's output never parsed.** The boss emitted its decision as the **work-order
+  envelope it knows** (`<<<PLAN>>>/<<<PIECE …>>>`), while the old `parse_rework` only matched a
+  bespoke `<<<REWORK file=…>>>…<<<END>>>`. Result: **0 rework items → GIVEN UP.** The mechanism
+  reasoned right and then spoke the wrong language.
+
+**Fix (user choice, 2026-06-16): reuse the work-order envelope.** The arbiter prompt now asks for a
+PLAN/PIECE work-order (one PIECE per file to rewrite, path in `exports=`, fix in the instruction; may
+target a TEST file), and `reworks_from_plan()` maps each PIECE → `(target, guidance)` via the existing
+`parse_work_order` (path-like tokens from `exports`/instruction; dedup; `..` rejected). This unifies on
+**"the boss always emits work-orders; the harness turns pieces into queue items"** — the same model as
+PA.7 eager scheduling. Covered GPU-free by `--coord-test` R11/R12. (Secondary, not yet done: escalate
+to L2 *sooner* when an L1 round doesn't change the pass count, so budget isn't burned on test bugs.)
+
 ---
 
 ## 5. Boss reports to the user — the live board

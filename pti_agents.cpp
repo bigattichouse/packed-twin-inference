@@ -1335,13 +1335,48 @@ static std::vector<std::pair<std::string,std::string>> parse_rework(const std::s
     }
     return out;
 }
-// PA.4d arbiter prompt (boss): decide rework on L1-exhausted failures — the boss DELEGATES via REWORK.
+// PA.4d: turn the boss's rework decision into (target file, guidance) items. The boss reliably emits
+// the WORK-ORDER envelope it knows (PLAN/PIECE) rather than a bespoke REWORK format — measured
+// 2026-06-15: it reasoned correctly but spoke PLAN/PIECE, so the old REWORK parser got 0 items. So
+// reuse parse_work_order: each PIECE names file(s) to rewrite (path in exports= and/or the
+// instruction), guidance = its instruction (+ blueprint). Unifies on "the boss always emits
+// work-orders; the harness turns pieces into queue items" (user, 2026-06-15; PA.7 direction).
+static std::vector<std::pair<std::string,std::string>> reworks_from_plan(const std::string &raw) {
+    std::vector<std::pair<std::string,std::string>> out;
+    WorkOrder wo = parse_work_order(raw);   // best-effort: iterate pieces even if ok==false
+    static const std::regex pathre(R"([A-Za-z0-9_./-]+\.(?:js|mjs|cjs|ts|html|css|json))");
+    auto add = [&](const std::string &f, const std::string &g) {
+        if (f.empty() || f.find("..") != std::string::npos) return;
+        for (auto &e : out) if (e.first == f) return;                 // dedup by target
+        out.push_back({ f, g });
+    };
+    for (auto &p : wo.pieces) {
+        std::string guide = p.instruction;
+        if (!p.blueprint.empty()) guide += (guide.empty() ? "" : "\n") + p.blueprint;
+        for (auto &e : p.exports)                                     // file paths declared in exports=
+            if (std::regex_match(e, pathre)) add(e, guide);
+        for (std::sregex_iterator it(p.instruction.begin(), p.instruction.end(), pathre), end; it != end; ++it)
+            add(it->str(), guide);                                    // file paths named in the instruction
+    }
+    return out;
+}
+
+// PA.4d arbiter prompt (boss): decide rework on L1-exhausted failures. The boss DELEGATES via a
+// WORK-ORDER envelope (the format it reliably emits) — one PIECE per file to rewrite (module OR test).
 static std::string build_arbiter_user(const std::string &contract, const std::string &failblock) {
     return "Worker-level repair exhausted its budget on the failures below and gave up. As the "
            "COORDINATOR, decide the rework. IMPORTANT: the MODULE may be correct and the TEST may be "
-           "BUGGY — judge which file is actually wrong. You DELEGATE (parallel workers do the fix): emit "
-           "one rework request per file to rewrite —\n<<<REWORK file=relative/path>>>\nwhat is wrong and "
-           "how to fix it\n<<<END>>>\n(module OR test). Emit none to accept the failures as-is.\n\n"
+           "BUGGY — judge which file is actually wrong (you MAY target a test file). You DELEGATE: "
+           "parallel workers do the fixes. Emit a WORK-ORDER envelope — ONE PIECE per file to rewrite, "
+           "the file path in exports=, and what is wrong + how to fix it in the instruction line:\n\n"
+           "<<<PLAN strategy=file lang=LANG>>>\n"
+           "shared:\n<blueprint>\none line\n</blueprint>\n"
+           "<<<PIECE id=r1 exports=test/foo.test.js>>>\n"
+           "instruction: what is wrong with this file and how to fix it\n"
+           "<blueprint>one line</blueprint>\n"
+           "<<</PIECE>>>\n"
+           "<<<END>>>\n\n"
+           "Emit a PLAN with zero PIECEs to accept the failures as-is.\n\n"
            "Interface contract:\n" + contract + "\n\nFailing pieces (module, test, error):\n" + failblock;
 }
 // PA.4d rework task (worker): rewrite ONE file, given the full context (fresh session needs it all):
@@ -1384,7 +1419,17 @@ static int coord_self_test() {
     { std::string u = build_test_task("src/bird.js","CODEX","GOALX","BPX");   // test-maker: goal + spec + code
       chk("R10 testgen ctx", u.find("GOALX")!=std::string::npos && u.find("BPX")!=std::string::npos
                           && u.find("CODEX")!=std::string::npos); }
-    fprintf(stderr, "  %s (%d/10 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 10-fail);
+    // R11/R12: the boss emits a WORK-ORDER (PLAN/PIECE), not REWORK markers — map pieces → rework items.
+    { std::string plan =
+        "<think>\n\n</think>\n<<<PLAN strategy=file lang=js>>>\nshared:\n<blueprint>x</blueprint>\n"
+        "<<<PIECE id=r1 exports=test/pipes.test.js>>>\ninstruction: the assertion p.x===400 is wrong, the pipe moved\n<blueprint>b</blueprint>\n<<</PIECE>>>\n"
+        "<<<END>>>\n";
+      auto rw = reworks_from_plan(plan);
+      chk("R11 workorder→rework", rw.size()==1 && rw[0].first=="test/pipes.test.js"
+                               && rw[0].second.find("p.x===400")!=std::string::npos); }
+    { std::string empty = "<<<PLAN strategy=file lang=js>>>\nshared:\n<blueprint>x</blueprint>\n<<<END>>>\n";
+      chk("R12 empty plan→none", reworks_from_plan(empty).empty()); }
+    fprintf(stderr, "  %s (%d/12 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 12-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -1508,7 +1553,7 @@ static void finalize_verify(const WorkOrder &wo,
                     fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\nERROR:\n" + r.out + "\n";
                 }
                 std::string aprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", build_arbiter_user(contract, fb)} });
-                auto reworks = parse_rework(strip_think(boss_generate(aprompt, 2048)));   // boss judges (thinks)
+                auto reworks = reworks_from_plan(strip_think(boss_generate(aprompt, 2048)));   // boss judges (thinks) → work-order
                 fprintf(stderr, "  boss requested %d rework item(s)\n", (int)reworks.size());
                 if (!reworks.empty()) {
                     std::vector<std::string> ritems, rids;
