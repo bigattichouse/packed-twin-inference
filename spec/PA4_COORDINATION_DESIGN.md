@@ -275,6 +275,15 @@ blind, incomplete canvas mock to recognizing it needed a real DOM/canvas — but
   never inside `src/`. And the **initial** test-gen now generates **only for modules that still lack a
   test** (same "fill the gaps" rule as repair) — so implementer-written tests are kept and reviewed,
   not overwritten or duplicated.
+- **Repair reads the CONTRACT, and the blueprint is a LIVING doc (user, 2026-06-16).** The spec a
+  repair/rework worker reads should be the *current* spec, not a frozen original. So: (1) both repair
+  levels now fold the **authoritative `INTERFACE.md` contract** (reconcile-evolved, overrides
+  blueprints) into the `spec`, alongside the per-component blueprint; and (2) the **blueprint is
+  rewritable** — the arbiter may target `design/<comp>.blueprint` in its work-order to **RE-SPEC** a
+  component (`reworks_from_plan` now accepts `.blueprint` targets; `build_arbiter_user` lists it as an
+  option). Because repair re-reads the blueprint fresh each round, a RESPEC in round N is picked up
+  when round N+1 re-implements the module against it — the spec evolves, repair tracks it. Covered by
+  `--coord-test` R13.
 
 ---
 

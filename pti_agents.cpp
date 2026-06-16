@@ -1375,7 +1375,7 @@ static std::vector<std::pair<std::string,std::string>> parse_rework(const std::s
 static std::vector<std::pair<std::string,std::string>> reworks_from_plan(const std::string &raw) {
     std::vector<std::pair<std::string,std::string>> out;
     WorkOrder wo = parse_work_order(raw);   // best-effort: iterate pieces even if ok==false
-    static const std::regex pathre(R"([A-Za-z0-9_./-]+\.(?:js|mjs|cjs|ts|html|css|json))");
+    static const std::regex pathre(R"([A-Za-z0-9_./-]+\.(?:js|mjs|cjs|ts|html|css|json|blueprint))");
     auto add = [&](const std::string &f, const std::string &g) {
         if (f.empty() || f.find("..") != std::string::npos) return;
         for (auto &e : out) if (e.first == f) return;                 // dedup by target
@@ -1397,8 +1397,11 @@ static std::vector<std::pair<std::string,std::string>> reworks_from_plan(const s
 static std::string build_arbiter_user(const std::string &contract, const std::string &failblock) {
     return "Worker-level repair exhausted its budget on the failures below and gave up. As the "
            "COORDINATOR, decide the rework. IMPORTANT: the MODULE may be correct and the TEST may be "
-           "BUGGY — judge which file is actually wrong (you MAY target a test file). You DELEGATE: "
-           "parallel workers do the fixes. Emit a WORK-ORDER envelope — ONE PIECE per file to rewrite, "
+           "BUGGY — judge which file is actually wrong. You MAY target: a module (src/X.js), a test "
+           "(test/X.test.js), or **a spec (design/X.blueprint) to RE-SPEC the component** — the blueprint "
+           "is a LIVING doc; rewriting it updates the spec and a later round re-implements against it. "
+           "You DELEGATE: parallel workers do the fixes. Emit a WORK-ORDER envelope — ONE PIECE per file "
+           "to rewrite, "
            "the file path in exports=, and what is wrong + how to fix it in the instruction line:\n\n"
            "<<<PLAN strategy=file lang=LANG>>>\n"
            "shared:\n<blueprint>\none line\n</blueprint>\n"
@@ -1465,7 +1468,13 @@ static int coord_self_test() {
                                && rw[0].second.find("p.x===400")!=std::string::npos); }
     { std::string empty = "<<<PLAN strategy=file lang=js>>>\nshared:\n<blueprint>x</blueprint>\n<<<END>>>\n";
       chk("R12 empty plan→none", reworks_from_plan(empty).empty()); }
-    fprintf(stderr, "  %s (%d/12 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 12-fail);
+    { std::string plan =   // RESPEC: the arbiter may target a .blueprint to re-spec a component (living doc)
+        "<<<PLAN strategy=file lang=js>>>\nshared:\n<blueprint>x</blueprint>\n"
+        "<<<PIECE id=r1 exports=design/pipes.blueprint>>>\ninstruction: respec gapSize default to 120\n<blueprint>b</blueprint>\n<<</PIECE>>>\n"
+        "<<<END>>>\n";
+      auto rw = reworks_from_plan(plan);
+      chk("R13 respec blueprint target", rw.size()==1 && rw[0].first=="design/pipes.blueprint"); }
+    fprintf(stderr, "  %s (%d/13 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 13-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -1789,7 +1798,9 @@ static void finalize_verify(const WorkOrder &wo,
                           if (s != std::string::npos) comp = comp.substr(0, s);
                           else { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); } }
                         std::string modpath = module_for_test(comp + ".test.js", mods);
-                        std::string spec = read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
+                        std::string spec =   // contract (authoritative, reconcile-evolved) + the living blueprint
+                            (goal_ctx.empty() ? "" : "=== INTERFACE CONTRACT (authoritative; overrides blueprints) ===\n" + goal_ctx + "\n\n")
+                            + "=== blueprint: " + comp + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
                         std::string modc = modpath.empty() ? "" : read_file_str(modpath);
                         std::string testc, err;                 // pull the comp's test + error from fails
                         for (auto &r : fails) {
@@ -1832,7 +1843,9 @@ static void finalize_verify(const WorkOrder &wo,
             if (modpath.empty()) { fprintf(stderr, "  (no module maps to %s — skip)\n", testfn.c_str()); continue; }
             std::string base = testfn; size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
             std::string modrel = fs::relative(modpath, g_work_dir, ec).string();
-            std::string spec = read_file_str(std::string(g_work_dir) + "/design/" + base + ".blueprint");
+            std::string spec =   // contract (authoritative, reconcile-evolved) + the living blueprint
+                (goal_ctx.empty() ? "" : "=== INTERFACE CONTRACT (authoritative; overrides blueprints) ===\n" + goal_ctx + "\n\n")
+                + "=== blueprint: " + base + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + base + ".blueprint");
             std::string modcontent = read_file_str(modpath);
             std::string user = build_amend_user(base, modrel, modcontent,
                                                 read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out, spec,
