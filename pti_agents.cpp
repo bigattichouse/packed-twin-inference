@@ -1449,6 +1449,8 @@ static std::string build_rework_user(const std::string &target, const std::strin
            "the COMPLETE corrected '" + target + "' via create_file at " + target + ".";
 }
 
+static std::vector<std::pair<int,int>> reconcile_groups(int n, int g);   // PA.6 parallel reconcile (defined below)
+
 // GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
 static int coord_self_test() {
     fprintf(stderr, "── PA.4c coord self-test ──\n");
@@ -1496,7 +1498,11 @@ static int coord_self_test() {
     { chk("R14 extract_attempt", extract_attempt("blah\nATTEMPT: gapSize was off by one; fixed it\n<create_file>")
                                    == "gapSize was off by one; fixed it"
                               && extract_attempt("no marker here").empty()); }
-    fprintf(stderr, "  %s (%d/14 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 14-fail);
+    { auto g = reconcile_groups(13, 4);   // PA.6 parallel reconcile: balanced contiguous partition
+      int tot = 0, mn = 99, mx = 0; for (auto &p : g) { tot += p.second; mn = std::min(mn, p.second); mx = std::max(mx, p.second); }
+      chk("R15 reconcile_groups", g.size()==4 && tot==13 && (mx-mn)<=1
+                               && reconcile_groups(3,8).size()==3 && reconcile_groups(0,4).empty()); }
+    fprintf(stderr, "  %s (%d/15 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 15-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -2010,6 +2016,35 @@ static std::string build_reconcile_user(const std::string &goal, const std::stri
            "it. Output the contract as concise markdown — no preamble, no code.";
 }
 
+// ── PA.6 PARALLEL reconcile (user, 2026-06-16): the serial boss reconcile is the wall pole at scale.
+// Partition the blueprints into G balanced groups, reconcile each in PARALLEL on the pool (partial
+// contracts), then ONE light boss MERGE assembles them + resolves cross-group/global decisions. ───
+static std::vector<std::pair<int,int>> reconcile_groups(int n, int g) {   // pure: balanced contiguous (start,count)
+    std::vector<std::pair<int,int>> out;
+    if (n <= 0) return out;
+    if (g < 1) g = 1; if (g > n) g = n;
+    int base = n / g, rem = n % g, start = 0;
+    for (int i = 0; i < g; i++) { int c = base + (i < rem ? 1 : 0); out.push_back({ start, c }); start += c; }
+    return out;
+}
+static std::string build_partial_reconcile_user(const std::string &goal, const std::string &group_bps) {
+    return "Reconcile this SUBSET of component blueprints into a PARTIAL interface contract: resolve "
+           "conflicts AMONG these components (exact exported names + method signatures), and note any "
+           "interface they expose that OTHER (not-shown) components will depend on.\n\n" + goal +
+           "\nBlueprints in this group:\n" + group_bps +
+           "\n\nOutput the partial contract as concise markdown (per-component exact signatures). NO code, "
+           "NO tool calls — just the markdown.";
+}
+static std::string build_merge_user(const std::string &goal, const std::string &partials) {
+    return "Merge these PARTIAL interface contracts (each reconciled a subset of components in parallel) "
+           "into ONE AUTHORITATIVE INTERFACE CONTRACT. Resolve any CROSS-group conflict decisively and pin "
+           "the GLOBAL decisions: (1) MODULE SYSTEM = CommonJS; (2) wiring/instantiation; (3) input/score "
+           "ownership; (4) canvas/context convention; (5) DEPENDENCY POLICY — default ZERO external "
+           "packages; tests use Node built-ins + console.assert, NO jsdom/jest (stub collaborators). Put a "
+           "TECH DECISIONS section at the TOP.\n\n" + goal + "\nPartial contracts:\n" + partials +
+           "\n\nOutput the unified contract as concise markdown — no preamble, no code.";
+}
+
 // strip a leading <think>…</think> from a worker output
 static std::string strip_think(const std::string &in) {
     size_t t = in.find("</think>");
@@ -2060,22 +2095,49 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
     run_worker_tools(dres);
     g_worker_think = sv_wt; g_worker_sp = sv_sp;   // restore (implementers = instruct)
 
-    // ── RECONCILE (boss, serial but bounded): unify the parallel blueprints into ONE
-    //    authoritative interface contract → design/INTERFACE.md, appended to the goal so every
-    //    implementer obeys the SAME signatures (fixes the cross-component drift). ──
+    // ── RECONCILE: unify the parallel blueprints into ONE authoritative contract → design/INTERFACE.md,
+    //    appended to the goal (fixes cross-component drift). PARALLEL: partition the blueprints into G
+    //    groups, reconcile each on the pool, then a light boss MERGE (PA.6 §6.3; was a serial pole). ──
     {
         namespace fs = std::filesystem; std::error_code ec;
-        std::string bps, ddir = std::string(g_work_dir) + "/design";
+        std::vector<std::pair<std::string,std::string>> bps;   // (name, content), sorted for determinism
+        std::string ddir = std::string(g_work_dir) + "/design";
         for (auto it = fs::directory_iterator(ddir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
             if (!it->is_regular_file(ec)) continue;
             std::string n = it->path().filename().string();
             if (n == "INTERFACE.md") continue;
-            bps += "=== " + n + " ===\n" + read_file_str(it->path().string()) + "\n";
+            bps.push_back({ n, read_file_str(it->path().string()) });
         }
+        std::sort(bps.begin(), bps.end());
         if (!bps.empty()) {
-            std::string rprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", build_reconcile_user(goal, bps)} });
-            fprintf(stderr, "\n══ PA.6 RECONCILE — boss unifying the interface contract ══\n");
-            std::string contract = strip_think(boss_generate(rprompt, 3072));   // boss thinks (resolve conflicts), bounded
+            int N = (int)bps.size();
+            auto groups = reconcile_groups(N, std::min(n_lanes, N));
+            std::string contract;
+            if (groups.size() <= 1) {                          // small: one serial pass (no merge overhead)
+                std::string all; for (auto &b : bps) all += "=== " + b.first + " ===\n" + b.second + "\n";
+                fprintf(stderr, "\n══ PA.6 RECONCILE — 1 pass (%d blueprints) ══\n", N);
+                contract = strip_think(boss_generate(apply_chat_template(
+                    { {"system", boss_system_text()}, {"user", build_reconcile_user(goal, all)} }), 3072));
+            } else {                                           // PARALLEL partials → merge
+                fprintf(stderr, "\n══ PA.6 RECONCILE — %d parallel group passes + merge ══\n", (int)groups.size());
+                bool sv2 = g_worker_think; SParams sv2sp = g_worker_sp;
+                if (!g_greedy) { g_worker_think = true; g_worker_sp = qwen_params(true, false); }  // reconcile = reasoning
+                std::vector<std::string> gitems;
+                for (auto &grp : groups) {
+                    std::string gb; for (int i = grp.first; i < grp.first + grp.second; i++)
+                        gb += "=== " + bps[i].first + " ===\n" + bps[i].second + "\n";
+                    gitems.push_back(apply_chat_template({ {"system", boss_system_text()},
+                                                           {"user", build_partial_reconcile_user(goal, gb)} }, true));
+                }
+                std::vector<std::string> gouts; run_pool(gitems, n_lanes, 2048, &gouts, "");
+                g_worker_think = sv2; g_worker_sp = sv2sp;
+                std::string partials;
+                for (size_t i = 0; i < gouts.size(); i++)
+                    partials += "=== PARTIAL " + std::to_string(i+1) + " ===\n" + strip_think(gouts[i]) + "\n\n";
+                fprintf(stderr, "── merging %d partial contracts ──\n", (int)gouts.size());
+                contract = strip_think(boss_generate(apply_chat_template(
+                    { {"system", boss_system_text()}, {"user", build_merge_user(goal, partials)} }), 2560));
+            }
             FILE *cf = fopen((ddir + "/INTERFACE.md").c_str(), "w");
             if (cf) { fputs(contract.c_str(), cf); fclose(cf);
                 fprintf(stderr, "\n── wrote design/INTERFACE.md (%zu chars) ──\n", contract.size()); }

@@ -242,19 +242,27 @@ N modules, test/ has N tests, verifier runs, wall < serial baseline.
 Out of scope (v1): mid-flight blueprint renegotiation, a dedicated critic lane, streaming-path
 staging.
 
-### Future idea — parallel pairwise reconcile (round-robin / orthogonal array) (user, 2026-06-15)
+## 6.3 Parallel reconcile — IMPLEMENTED (2026-06-16)
 
-The v1 reconcile is one serial boss pass (bounded, but serial — the new long pole). Most interface
-conflicts are **pairwise** (A's assumed view of B vs B's actual). So reconcile could itself be
-parallelized: schedule **pairwise reconcile tasks** round-robin-tournament style — `(A,B),(C,D)…` in
-round 1, rotate to `(A,C),(B,D)…` in round 2 — so **N/2 disjoint pairs run in parallel each round**,
-and N−1 rounds cover all C(N,2) pairs. A **Taguchi / orthogonal array** prunes that to the few rounds
-that still cover the important interactions (no full factorial). Each pair agrees its shared boundary
-and writes it to the contract (the blackboard); a final light merge assembles the global contract.
-Caveats: pairwise agreements can be **globally inconsistent** → iterate to convergence; and schedule
-by the **actual dependency graph** from the goal blueprint (a hub like `engine` must pair with
-everyone; a mesh benefits most from the orthogonal-array pruning). Explore after single-pass reconcile
-is validated.
+The serial boss reconcile was the wall pole at scale (~23 min for 13 modules; §6.2). **v1 parallel
+reconcile**: partition the blueprints into **G = min(lanes, N) balanced groups** (`reconcile_groups`,
+pure + `--coord-test` R15), reconcile each group **in parallel on the pool** (`build_partial_reconcile_user`,
+thinking lanes) → G partial contracts, then **one light boss MERGE** (`build_merge_user`) assembles
+them + resolves cross-group/global decisions → `design/INTERFACE.md`. Small N (≤1 group) keeps the
+single serial pass (no merge overhead). The boss MERGE retains final authority, so cross-group
+consistency is preserved (the merge sees all partials); the win is that the per-group conflict-
+resolution — the bulk — runs concurrently, and the merge reads *pre-digested* partials, not raw
+blueprints. Biggest win on **independent** components (partials trivial → fast merge); ~neutral on
+heavily-coupled (merge still resolves cross-group). GPU before/after pending.
+
+### Future — sharper scheduling (round-robin / orthogonal array, dependency-graph-aware)
+
+v1 uses contiguous groups. The fuller idea: schedule **pairwise** tasks round-robin
+(`(A,B),(C,D)…` → rotate) so N/2 disjoint pairs run per round across N−1 rounds covering all C(N,2)
+pairs, **Taguchi/orthogonal-array**-pruned to the important interactions, and **scheduled by the
+dependency graph** (a hub pairs with everyone; a mesh benefits most from pruning). Caveat: pairwise
+agreements can be globally inconsistent → iterate to convergence. Explore if v1's contiguous grouping
+proves too coarse on coupled projects.
 
 ### Future idea — worker self-splits an oversized piece (user, 2026-06-15)
 
