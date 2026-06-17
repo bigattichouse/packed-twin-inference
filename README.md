@@ -159,7 +159,9 @@ table above. Open items, in value order:
    - **PA.4** coordination: test-gen → verify → L1 repair → boss arbiter (work-order rework). Fresh
      sessions get the **full triad + collaborator code** (goal/contract + blueprint + module + test +
      the modules it calls); thinking repair lanes; escalate to the boss early when L1 stalls; the
-     **designer dictates libraries** (contract pins deps/CommonJS); untested modules re-queue test-gen.
+     **designer dictates libraries** (contract pins deps/CommonJS); untested modules re-queue test-gen;
+     a **repair journal** (each attempt logs its hypothesis, read by the next), a **multi-round arbiter**,
+     and **RESPEC-on-stuck** (rewrite the living blueprint when the spec is the bug).
    - **PA.5** tool calls (`create_file`/`execute_bash`, nanocoder convention).
    - **PA.6** staged pipeline: triage → parallel design → reconcile (contract) → implement →
      test-gen → verify → repair (`spec/PA6_PIPELINE_DESIGN.md`); **prefix-cached pools** (shared

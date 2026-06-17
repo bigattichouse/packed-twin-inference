@@ -119,7 +119,9 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   collaborator code** (goal/contract + blueprint + module + test + error + the modules it calls); repair
   lanes think; **escalate to the boss early** when L1 stalls; the **designer dictates libraries**
   (contract pins deps = CommonJS, no jsdom/jest); **untested modules re-queue test-gen** (no silent
-  pass). `--coord-test` 12/12. See `spec/PA4_COORDINATION_DESIGN.md`.
+  pass); a **repair journal** (`ATTEMPT:` notes accumulated per-component, read by the next worker +
+  the arbiter), a **multi-round arbiter**, and **RESPEC-on-stuck** (rewrite the living blueprint when
+  the spec is the bug). `--coord-test` 14/14. See `spec/PA4_COORDINATION_DESIGN.md`.
 - **PA.5** ✓ *v1 (2026-06-14)* — worker tool-calls: nanocoder-style `<create_file>` /
   `<execute_bash>` (`--tools` / `--allow-run`), sandboxed to `--work-dir`. create_file verified
   end-to-end (workers wrote stack.js + test.js; the generated tests pass).
