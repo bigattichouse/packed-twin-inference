@@ -285,6 +285,28 @@ blind, incomplete canvas mock to recognizing it needed a real DOM/canvas — but
   when round N+1 re-implements the module against it — the spec evolves, repair tracks it. Covered by
   `--coord-test` R13.
 
+### 4.5 Repair journal + multi-round arbiter + RESPEC-on-stuck (user, 2026-06-16 — IMPLEMENTED)
+
+Diagnosis of the clean scale run's 3 survivors (`spec/PA6_PIPELINE_DESIGN.md` §6.2): **1 test bug +
+2 spec ambiguities** (`toInt(null)`, `formatDate` unknown-tokens), all of which the arbiter *should*
+crack — but they survived because each repair attempt was **blind to prior attempts** and the arbiter
+**escalated only once**. Three coupled fixes:
+
+- **Repair journal (user).** Each repair/rework worker writes one line `ATTEMPT: <what's wrong + what I
+  changed>` before its tool call; the harness (`extract_attempt`) accumulates these **per component**
+  (in-memory `journal[comp]` for now; files/git for cross-session survival is the documented next step).
+  The next worker reads the history **before the code** ("don't repeat these"), and the arbiter sees it
+  too. Stops the repeated-approach churn.
+- **Multi-round arbiter.** The boss now escalates up to `ARBITER_BUDGET` (=2) times, re-judging after
+  each rework with the journal in hand — instead of one-and-done.
+- **RESPEC-on-stuck.** The arbiter's failblock flags, per component, "PRIOR ATTEMPTS … if these failed
+  the SPEC may be ambiguous → RESPEC `design/<comp>.blueprint`" — steering it to fix the *spec* (the
+  living blueprint, §4.4) for the spec-ambiguity class, not just re-poke the test/module.
+
+GPU-free coverage: `--coord-test` R3/R9 (journal + `ATTEMPT:` in the repair prompts), R14
+(`extract_attempt`). Future (user, deferred): journal survives sessions; `git init` the work-dir so
+each worker sees real per-write diffs.
+
 ---
 
 ## 5. Boss reports to the user — the live board

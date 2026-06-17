@@ -27,6 +27,7 @@
 #include <ctime>
 #include <algorithm>
 #include <filesystem>
+#include <map>
 #include <regex>
 #include <string>
 #include <sys/wait.h>
@@ -1335,13 +1336,17 @@ static std::string module_for_test(const std::string &test_filename,
 static std::string build_amend_user(const std::string &base, const std::string &modpath,
                                     const std::string &modcontent, const std::string &testcontent,
                                     const std::string &error, const std::string &spec,
-                                    const std::string &collaborators) {
+                                    const std::string &collaborators, const std::string &journal) {
     return "Component '" + base + "' FAILED its test. Fix the MODULE so the test passes (do not change "
-           "the test).\n\nSpec / blueprint for '" + base + "':\n" + (spec.empty() ? "(none)" : spec) +
+           "the test).\n\n" +
+           (journal.empty() ? "" : "PRIOR REPAIR ATTEMPTS on this component (read FIRST — do NOT repeat "
+                                   "these; if they all failed, the bug is elsewhere):\n" + journal + "\n\n") +
+           "Spec / blueprint for '" + base + "':\n" + (spec.empty() ? "(none)" : spec) +
            "\n\nModule (" + modpath + "):\n```\n" + modcontent + "\n```\n\nTest:\n```\n" + testcontent +
            "\n```\n\nTest output / error:\n" + error +
            (collaborators.empty() ? "" : "\n\nCollaborator modules it interacts with:\n" + collaborators) +
-           "\n\nRe-emit the corrected module via create_file at " + modpath + ". Output only the tool call.";
+           "\n\nFirst write ONE line `ATTEMPT: <what you think is wrong + what you changed>`, then re-emit "
+           "the corrected module via create_file at " + modpath + ".";
 }
 // Repair scheduler verdict given the round, the budget, and how many tests still fail.
 enum RepairAction { RA_DONE, RA_REPAIR, RA_GIVEUP };
@@ -1392,6 +1397,17 @@ static std::vector<std::pair<std::string,std::string>> reworks_from_plan(const s
     return out;
 }
 
+// PA.4 repair journal: a repair/rework worker emits a one-line `ATTEMPT: …` (what it thinks is wrong +
+// what it changed). The harness accumulates these per component so the NEXT worker reads the history
+// before the code — and the arbiter sees what's already been tried (don't repeat; if a module keeps
+// failing, the spec is likely ambiguous → RESPEC). Pure; unit-tested via --coord-test.
+static std::string extract_attempt(const std::string &out) {
+    size_t a = out.find("ATTEMPT:");
+    if (a == std::string::npos) return "";
+    size_t e = out.find('\n', a);
+    return trim(out.substr(a + 8, (e == std::string::npos ? out.size() : e) - (a + 8)));
+}
+
 // PA.4d arbiter prompt (boss): decide rework on L1-exhausted failures. The boss DELEGATES via a
 // WORK-ORDER envelope (the format it reliably emits) — one PIECE per file to rewrite (module OR test).
 static std::string build_arbiter_user(const std::string &contract, const std::string &failblock) {
@@ -1418,8 +1434,9 @@ static std::string build_arbiter_user(const std::string &contract, const std::st
 static std::string build_rework_user(const std::string &target, const std::string &spec,
                                      const std::string &modcontent, const std::string &testcontent,
                                      const std::string &error, const std::string &guidance,
-                                     const std::string &collaborators) {
-    return "A test is failing. Study the FULL context below, then rewrite ONLY '" + target + "' to fix it.\n\n"
+                                     const std::string &collaborators, const std::string &journal) {
+    return "A test is failing. Study the FULL context below, then rewrite ONLY '" + target + "' to fix it.\n\n" +
+           (journal.empty() ? "" : "PRIOR REPAIR ATTEMPTS (read FIRST — do NOT repeat these):\n" + journal + "\n\n") +
            "Spec / blueprint:\n" + (spec.empty() ? "(none)" : spec) +
            "\n\nModule:\n```\n" + (modcontent.empty() ? "(none)" : modcontent) +
            "\n```\n\nTest:\n```\n" + (testcontent.empty() ? "(none)" : testcontent) +
@@ -1428,7 +1445,8 @@ static std::string build_rework_user(const std::string &target, const std::strin
                "\n\nCollaborator modules it interacts with — match their ACTUAL calls (e.g. a fake canvas "
                "must implement every ctx.* method the real code uses):\n" + collaborators) +
            "\n\nCoordinator's guidance:\n" + guidance +
-           "\n\nRe-emit the COMPLETE corrected '" + target + "' via create_file at " + target + ". Output only the tool call.";
+           "\n\nFirst write ONE line `ATTEMPT: <what you think is wrong + what you changed>`, then re-emit "
+           "the COMPLETE corrected '" + target + "' via create_file at " + target + ".";
 }
 
 // GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
@@ -1440,21 +1458,22 @@ static int coord_self_test() {
       chk("R1 module_for_test",  module_for_test("bird.test.js", m) == "src/bird.js"); }
     { std::vector<std::string> m={"src/bird.js"};
       chk("R2 no-match empty",   module_for_test("zzz.test.js", m).empty()); }
-    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR","SPEC","COLLAB");
+    { std::string u = build_amend_user("bird","src/bird.js","CODE","TEST","ERR","SPEC","COLLAB","JRNL");
       chk("R3 amend has parts",  u.find("src/bird.js")!=std::string::npos && u.find("CODE")!=std::string::npos
                               && u.find("TEST")!=std::string::npos && u.find("ERR")!=std::string::npos
-                              && u.find("SPEC")!=std::string::npos && u.find("COLLAB")!=std::string::npos); }
+                              && u.find("SPEC")!=std::string::npos && u.find("COLLAB")!=std::string::npos
+                              && u.find("JRNL")!=std::string::npos && u.find("ATTEMPT:")!=std::string::npos); }
     chk("R4 verdict done",   repair_verdict(0,3,0) == RA_DONE);
     chk("R5 verdict repair", repair_verdict(0,3,2) == RA_REPAIR);
     chk("R6 verdict giveup", repair_verdict(3,3,2) == RA_GIVEUP);
     { auto rw = parse_rework("noise <<<REWORK file=test/a.test.js>>>\nfix the arc spy\n<<<END>>> tail");
       chk("R7 parse_rework", rw.size()==1 && rw[0].first=="test/a.test.js" && rw[0].second=="fix the arc spy"); }
     { auto rw = parse_rework("no markers here"); chk("R8 parse_rework empty", rw.empty()); }
-    { std::string u = build_rework_user("src/bird.js","SPEC","MODC","TESTC","ERRC","GUIDE","COLLAB");  // full triad + collaborators
+    { std::string u = build_rework_user("src/bird.js","SPEC","MODC","TESTC","ERRC","GUIDE","COLLAB","JRNL");  // full triad + collaborators + journal
       chk("R9 rework full ctx", u.find("src/bird.js")!=std::string::npos && u.find("SPEC")!=std::string::npos
                              && u.find("MODC")!=std::string::npos && u.find("TESTC")!=std::string::npos
                              && u.find("ERRC")!=std::string::npos && u.find("GUIDE")!=std::string::npos
-                             && u.find("COLLAB")!=std::string::npos); }
+                             && u.find("COLLAB")!=std::string::npos && u.find("JRNL")!=std::string::npos); }
     { std::string u = test_user("src/bird.js","CODEX","BPX","COLLABZ");   // per-item delta: spec + code + collaborators
       chk("R10 testgen ctx", u.find("BPX")!=std::string::npos && u.find("COLLABZ")!=std::string::npos
                           && u.find("CODEX")!=std::string::npos); }
@@ -1474,7 +1493,10 @@ static int coord_self_test() {
         "<<<END>>>\n";
       auto rw = reworks_from_plan(plan);
       chk("R13 respec blueprint target", rw.size()==1 && rw[0].first=="design/pipes.blueprint"); }
-    fprintf(stderr, "  %s (%d/13 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 13-fail);
+    { chk("R14 extract_attempt", extract_attempt("blah\nATTEMPT: gapSize was off by one; fixed it\n<create_file>")
+                                   == "gapSize was off by one; fixed it"
+                              && extract_attempt("no marker here").empty()); }
+    fprintf(stderr, "  %s (%d/14 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 14-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -1741,8 +1763,14 @@ static void finalize_verify(const WorkOrder &wo,
     bool sv_wt = g_worker_think; SParams sv_sp = g_worker_sp;
     if (!g_greedy) { g_worker_think = true; g_worker_sp = qwen_params(true, false); }
 
-    bool arbiter_done = false;   // PA.4d: boss arbiter escalates once on L1 budget exhaustion
+    int  arbiter_rounds = 0;     // PA.4d: boss arbiter escalates up to ARBITER_BUDGET times (multi-round)
+    const int ARBITER_BUDGET = 2;
     int  prev_failed = -1;       // PA.4 #4: escalate sooner when an L1 round stops making progress
+    std::map<std::string,std::string> journal;   // PA.4: per-component repair-attempt history (user, 2026-06-16)
+    auto j_append = [&](const std::string &comp, const std::string &lvl, int rnd, const std::string &out) {
+        std::string a = extract_attempt(out);
+        journal[comp] += "[round " + std::to_string(rnd) + " " + lvl + "] " + (a.empty() ? "(no note)" : a) + "\n";
+    };
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
         // PA.4 (user 2026-06-16): a module with NO test must not pass silently — count it + re-queue test-gen.
@@ -1773,16 +1801,20 @@ static void finalize_verify(const WorkOrder &wo,
         prev_failed = issues;
         if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
         if (act == RA_GIVEUP) {
-            if (!arbiter_done && !fails.empty()) {   // PA.4d: escalate to the boss once; it re-queues rework
-                arbiter_done = true;
-                fprintf(stderr, "\n══ PA.4d ARBITER — escalating %d failure(s) to the boss ══\n", (int)fails.size());
+            if (arbiter_rounds < ARBITER_BUDGET && !fails.empty()) {   // PA.4d: escalate to the boss (multi-round)
+                arbiter_rounds++;
+                fprintf(stderr, "\n══ PA.4d ARBITER (escalation %d/%d) — %d failure(s) to the boss ══\n",
+                        arbiter_rounds, ARBITER_BUDGET, (int)fails.size());
                 std::string contract = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
                 std::vector<std::string> mods = list_modules(); std::string fb;
                 for (auto &r : fails) {
                     std::string testfn = std::filesystem::path(r.rel).filename().string();
                     std::string modpath = module_for_test(testfn, mods);
                     std::string modrel = modpath.empty() ? std::string("(none)") : fs::relative(modpath, g_work_dir, ec).string();
+                    std::string comp = testfn; { size_t s = comp.find(".test.js"); if (s!=std::string::npos) comp = comp.substr(0,s); }
                     fb += "\n--- test " + r.rel + "  (module " + modrel + ") ---\n";
+                    if (!journal[comp].empty()) fb += "PRIOR ATTEMPTS (already tried — if these failed, the SPEC "
+                                                      "may be ambiguous → RESPEC design/" + comp + ".blueprint):\n" + journal[comp];
                     if (!modpath.empty()) fb += "MODULE " + modrel + ":\n" + read_file_str(modpath) + "\n";
                     fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\nERROR:\n" + r.out + "\n";
                 }
@@ -1809,20 +1841,25 @@ static void finalize_verify(const WorkOrder &wo,
                             if (tb == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
                         }
                         std::string u = build_rework_user(tgt, spec, modc, testc, err, rw.second,
-                                                          collab_for(modc, modpath, mods));
+                                                          collab_for(modc, modpath, mods), journal[comp]);
                         std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", u} }, true);
                         if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
                         ritems.push_back(sp); rids.push_back(tgt);
                     }
                     std::vector<std::string> routs; run_pool(ritems, n_lanes, max_new, &routs, "");
                     std::vector<std::pair<std::string,std::string>> rres;
-                    for (size_t i = 0; i < rids.size() && i < routs.size(); i++) rres.push_back({ rids[i], strip_think(routs[i]) });
+                    for (size_t i = 0; i < rids.size() && i < routs.size(); i++) {
+                        rres.push_back({ rids[i], strip_think(routs[i]) });
+                        std::string c = std::filesystem::path(rids[i]).filename().string();   // record the attempt
+                        { size_t s=c.find(".test.js"); if(s!=std::string::npos) c=c.substr(0,s); else { size_t j=c.rfind(".js"); if(j!=std::string::npos) c=c.substr(0,j); } }
+                        j_append(c, "L2", round, routs[i]);
+                    }
                     run_worker_tools(rres);
                     continue;   // re-verify after the boss-directed rework
                 }
             }
-            fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d round(s)%s ══\n",
-                    passed, (int)res.size(), g_repair_budget, arbiter_done ? " + boss arbiter" : "");
+            fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d round(s) + %d arbiter escalation(s) ══\n",
+                    passed, (int)res.size(), g_repair_budget, arbiter_rounds);
             break;
         }
 
@@ -1849,7 +1886,7 @@ static void finalize_verify(const WorkOrder &wo,
             std::string modcontent = read_file_str(modpath);
             std::string user = build_amend_user(base, modrel, modcontent,
                                                 read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out, spec,
-                                                collab_for(modcontent, modpath, mods));
+                                                collab_for(modcontent, modpath, mods), journal[base]);
             std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
             if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
             aitems.push_back(sp); aids.push_back(modrel);
@@ -1858,8 +1895,10 @@ static void finalize_verify(const WorkOrder &wo,
         std::vector<std::string> aouts; run_pool(aitems, n_lanes, max_new, &aouts, "");
         std::vector<std::pair<std::string,std::string>> ares;
         for (size_t i = 0; i < aids.size() && i < aouts.size(); i++) {
-            std::string b = aouts[i]; size_t t = b.find("</think>"); if (t != std::string::npos) b = b.substr(t + 8);
-            ares.push_back({ aids[i], trim(b) });
+            ares.push_back({ aids[i], strip_think(aouts[i]) });
+            std::string c = std::filesystem::path(aids[i]).filename().string();   // record the attempt in the journal
+            { size_t j = c.rfind(".js"); if (j != std::string::npos) c = c.substr(0, j); }
+            j_append(c, "L1", round, aouts[i]);
         }
         run_worker_tools(ares);   // overwrite the fixed modules; loop re-verifies
     }
