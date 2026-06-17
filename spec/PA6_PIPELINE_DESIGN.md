@@ -169,8 +169,27 @@ each stage passes it to `run_pool`:
 the new wall/aggregate numbers.
 
 **Revised priority (done):** prefix-cache landed; **PA.7 eager scheduling is next** (recovers the
-residual straggler tail on top). The "sweet spot" claim stays retracted until the scale re-run with
-caching reports.
+residual straggler tail on top).
+
+## 6.2 Clean scale re-run — RESULTS (2026-06-16, all four fixes)
+
+`scale_validate.sh`, 13-component utility library, with prefix-cache + test-placement + contract-in-
+repair + living-blueprint:
+
+- **PACKED: 9/12 green, CLEAN** — 12 modules + 12 tests all in `test/` (zero `src/` dup), every module
+  tested, auto-repaired. First pass 6/12 → L1 stalled (escalate-early fired) → **boss arbiter requested
+  6 reworks, correctly MIXED**: `test/*.test.js` for judged test-bugs, `src/*.js` for module-bugs →
+  **6→9**. 3 hard fails survived the budget (`dateUtils`, `numberUtils`, `stringUtils`). Cache **100%**
+  (`cloned+delta`, 0 `full prefill`); **implement aggregate 0.22×→~0.68×** (prefill fix); design 0.79×.
+  Wall ~116 min (serial reconcile + thinking-design stragglers remain — PA.7 / parallel-reconcile).
+- **SINGLE: unscored** — fast (30 min) but in thinking mode it spent most of its budget *sketching*
+  the 24-file output (`...` placeholders) and the harness splitter extracted 0 files. Real signal:
+  **single is great at a fast single-file one-shot; cramming 24 complete files into one thinking pass
+  is awkward** (output-length + reasoning budget). Packed's decomposition isn't bound by one context's
+  output length — that's its structural edge at multi-file scale.
+
+**Takeaway:** packed delivered a clean, fully test-covered, auto-repaired multi-file product (9/12);
+single owns the fast small one-shot. They have different sweet spots — see "How to improve" (§11).
 
 ---
 
@@ -245,3 +264,37 @@ giant file. This turns the static triage→design→implement depth into an **ad
 boss does a coarse map, and lanes refine where needed. Fits the existing queue/blackboard (a split
 is just "push N smaller work items + their blueprints"). Explore after the repair loop (PA.4c);
 needs a depth/anti-runaway budget so splitting can't recurse forever.
+
+---
+
+## 11. How to improve the agents (roadmap, value-ordered after the 2026-06-16 scale verdict)
+
+The clean scale run (§6.2) showed the system *works* — a clean, fully test-covered, auto-repaired
+9/12 multi-file product — and pinned where the value leaks. In priority order:
+
+**A. Close the pass-rate gap (the "great tested product" priority).** 3 of 12 survived the repair
+budget. Levers:
+- **Multi-round arbiter** — today the boss escalates *once*; let it iterate (bounded by an L2 budget),
+  re-judging after each rework.
+- **RESPEC on repeated failure** — when a module fails repair *and* re-amend, the spec itself may be
+  ambiguous → arbiter rewrites the **living blueprint** (capability shipped; encourage its use when a
+  module is stuck, not just test-vs-module).
+- **Minimal failing case** — feed the rework worker the *specific* failing assertion + values, not the
+  whole test output, so it targets precisely.
+- **Smarter budget** — more rounds for the few hard cases rather than a flat cap.
+
+**B. Make workers genuinely autonomous — the live tool loop (PA.7b).** `read_file`/`abandon` primitives
+are built; wire the **mid-stream round-trip** so a worker fetches exactly the context it needs (and
+`abandon`→re-queue on a not-yet-built dep). This is the real-agent capability and unblocks eager.
+
+**C. Throughput (secondary per user; wall ~116 min at 13 modules).** Two serial/straggler poles remain
+after prefix-cache: **serial reconcile** (→ parallel pairwise reconcile) and **thinking-design
+stragglers** (→ PA.7 eager scheduling). Both decode-bound, both documented.
+
+**D. Right tool for the job — a packed-vs-single router.** Single owns the fast single-file one-shot
+(§6.2); packed owns decomposed multi-file projects (not bound by one context's output length). Triage
+should **route**: a small/single-file ask → one fast single pass; a multi-file project → the packed
+pipeline. Don't run the 116-min pipeline for what single does in seconds.
+
+**E. Right-size the pieces** — worker self-split (§future above) for oversized components; tighter
+triage granularity so pieces are balanced (helps both quality and the straggler tail).
