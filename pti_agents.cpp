@@ -1336,12 +1336,40 @@ static std::string test_user(const std::string &relpath, const std::string &cont
 // ───────────────────────── PA.4c: verify→repair helpers ──────────────────────
 // Pure, unit-tested via --coord-test. The loop that uses them is wired into the verifier.
 // Which module a failing test targets: "bird.test.js" → the module whose base is "bird".
+// ── PA.8 §9: STACK PROFILE — centralize the (currently JS-baked) language assumptions so a non-JS task
+// (Python, SQL, …) is a config, not a rewrite. Default = javascript ⇒ the existing path is a NO-OP. The
+// CLIENT owns the stack (PA8_SERVER_DESIGN §9); for now g_stack is set from --lang. Pure; --coord-test R24/R25.
+// (Layer 1a: the 4 core mechanics — detection, run cmd, module_for_test, comp_key. Path-strings + prompts
+// are still JS-literal = Layer 1b/2.)
+struct StackProfile {
+    std::string lang;         // "javascript"
+    std::string src_ext;      // ".js"       — a module file is <comp> + src_ext
+    std::string test_suffix;  // ".test.js"  — a test file is <comp> + test_suffix (the harness controls naming)
+    std::string runner;       // "node"      — a test runs as: runner '<relpath>'
+};
+static StackProfile g_stack = { "javascript", ".js", ".test.js", "node" };
+static StackProfile stack_profile(std::string name) {
+    for (auto &c : name) c = (char)tolower((unsigned char)c);
+    if (name == "python" || name == "py") return { "python", ".py",  "_test.py",  "python3" };
+    if (name == "sql")                    return { "sql",    ".sql", "_test.sql", "psql -f" };  // illustrative
+    return { "javascript", ".js", ".test.js", "node" };
+}
+static bool has_suffix(const std::string &s, const std::string &suf) {
+    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+static bool is_test_file(const std::string &fn) { return has_suffix(fn, g_stack.test_suffix); }
+static bool is_src_file (const std::string &fn) { return has_suffix(fn, g_stack.src_ext) && !is_test_file(fn); }
+static std::string test_file_name(const std::string &comp) { return comp + g_stack.test_suffix; }   // "bird.test.js"
+static std::string src_file_name (const std::string &comp) { return comp + g_stack.src_ext; }        // "bird.js"
+static std::string run_test_cmd  (const std::string &rel)  { return g_stack.runner + " '" + rel + "'"; }
+
+// Which module a failing test targets: "bird.test.js" -> the module whose base is "bird".
 static std::string module_for_test(const std::string &test_filename,
                                    const std::vector<std::string> &modules) {
     std::string base = test_filename;
-    size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
+    if (has_suffix(base, g_stack.test_suffix)) base = base.substr(0, base.size() - g_stack.test_suffix.size());
     for (auto &m : modules)
-        if (std::filesystem::path(m).filename().string() == base + ".js") return m;
+        if (std::filesystem::path(m).filename().string() == src_file_name(base)) return m;
     return "";
 }
 
@@ -1351,10 +1379,9 @@ static std::string module_for_test(const std::string &test_filename,
 // "X.blueprint" while readers looked up "X" — orphaning history exactly when the spec kept drifting.
 static std::string comp_key(const std::string &path) {
     std::string b = std::filesystem::path(path).filename().string();
-    for (const char *suf : { ".test.js", ".blueprint", ".mjs", ".cjs", ".js", ".ts" }) {
-        size_t n = strlen(suf);
-        if (b.size() >= n && b.compare(b.size() - n, n, suf) == 0) return b.substr(0, b.size() - n);
-    }
+    for (const std::string &suf : { g_stack.test_suffix, std::string(".blueprint"), g_stack.src_ext,
+                                    std::string(".mjs"), std::string(".cjs"), std::string(".ts"), std::string(".py") })
+        if (has_suffix(b, suf)) return b.substr(0, b.size() - suf.size());
     return b;
 }
 // index just past the ')' matching the '(' at `open` (quote/escape aware); npos if unbalanced.
@@ -1607,6 +1634,7 @@ static int reconcile_parallel_g(int n, int lanes) { return (lanes >= 1 && n >= 2
 static int coord_self_test() {
     fprintf(stderr, "── PA.4c coord self-test ──\n");
     int fail = 0;
+    StackProfile _sv_stack = g_stack; g_stack = stack_profile("javascript");   // JS-fixture suite; pin regardless of --lang
     auto chk = [&](const char *n, bool ok){ fprintf(stderr, "  %s: %s\n", n, ok?"PASS":"FAIL"); if(!ok) fail++; };
     { std::vector<std::string> m={"src/bird.js","src/pipes.js"};
       chk("R1 module_for_test",  module_for_test("bird.test.js", m) == "src/bird.js"); }
@@ -1688,7 +1716,19 @@ static int coord_self_test() {
           tool_call_truncated("blah <create_file><path>x</path><content>partial...")
        && !tool_call_truncated("<create_file><path>x</path><content>full</content></create_file>")
        && !tool_call_truncated("no tool call here")); }
-    fprintf(stderr, "  %s (%d/23 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 23-fail);
+    { auto js = stack_profile("javascript"); auto py = stack_profile("python");                // PA.8 §9 stack profile
+      chk("R24 stack_profile", js.src_ext==".js" && js.test_suffix==".test.js" && js.runner=="node"
+                            && py.src_ext==".py" && py.test_suffix=="_test.py"
+                            && has_suffix("a.test.js",".test.js") && !has_suffix("a.js",".test.js")); }
+    { bool ok_js = is_test_file("bird.test.js") && !is_src_file("bird.test.js") && is_src_file("bird.js")
+                && test_file_name("bird")=="bird.test.js" && src_file_name("bird")=="bird.js";
+      StackProfile sv = g_stack; g_stack = stack_profile("python");                              // switch profile, then restore
+      bool ok_py = is_test_file("bird_test.py") && is_src_file("bird.py") && !is_test_file("bird.py")
+                && test_file_name("bird")=="bird_test.py";
+      g_stack = sv;
+      chk("R25 file helpers (js+python)", ok_js && ok_py); }
+    fprintf(stderr, "  %s (%d/25 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 25-fail);
+    g_stack = _sv_stack;   // restore (the suite pins javascript for its JS fixtures)
     return fail > 0 ? 5 : 0;
 }
 
@@ -1875,8 +1915,7 @@ static void finalize_verify(const WorkOrder &wo,
         if (ec) break;
         if (!it->is_regular_file(ec)) continue;
         std::string n = it->path().filename().string();
-        if (n.size() >= 3 && n.substr(n.size()-3) == ".js" &&
-            !(n.size() >= 8 && n.substr(n.size()-8) == ".test.js")) mods.push_back(it->path().string());
+        if (is_src_file(n)) mods.push_back(it->path().string());   // PA.8 §9: src file per stack profile
     }
     std::sort(mods.begin(), mods.end());
     // The project goal/contract: the reconciled INTERFACE.md if present, else the triage shared block.
@@ -1952,12 +1991,12 @@ static void finalize_verify(const WorkOrder &wo,
              it != fs::recursive_directory_iterator(); it.increment(ec)) {
             if (ec) break;
             if (it->is_regular_file(ec)) { std::string n = it->path().filename().string();
-                if (n.size() >= 8 && n.substr(n.size()-8) == ".test.js") tests.push_back(it->path().string()); }
+                if (is_test_file(n)) tests.push_back(it->path().string()); }   // PA.8 §9: test file per profile
         }
         std::sort(tests.begin(), tests.end());
         for (auto &t : tests) {
             std::string rel = fs::relative(t, g_work_dir, ec).string();
-            std::string cmd = "cd '" + std::string(g_work_dir) + "' && timeout 30 node '" + rel + "' 2>&1";
+            std::string cmd = "cd '" + std::string(g_work_dir) + "' && timeout 30 " + run_test_cmd(rel) + " 2>&1";  // PA.8 §9
             FILE *pp = popen(cmd.c_str(), "r");
             std::string out; if (pp){ char b[4096]; size_t k; while((k=fread(b,1,sizeof(b),pp))>0) out.append(b,k); }
             int rc = pp ? pclose(pp) : -1; int code = (pp && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
@@ -1972,7 +2011,7 @@ static void finalize_verify(const WorkOrder &wo,
             if (ec) break;
             if (!it->is_regular_file(ec)) continue;
             std::string n = it->path().filename().string();
-            if (n.size() >= 3 && n.substr(n.size()-3) == ".js" && !(n.size()>=8 && n.substr(n.size()-8)==".test.js"))
+            if (is_src_file(n))   // PA.8 §9: src file per stack profile
                 mods.push_back(it->path().string());
         }
         return mods;
@@ -2838,6 +2877,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
         else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
         else if (!strcmp(argv[i], "--repair-budget") && i+1 < argc) g_repair_budget = atoi(argv[++i]);  // PA.4c
+        else if (!strcmp(argv[i], "--lang") && i+1 < argc) g_stack = stack_profile(argv[++i]);   // PA.8 §9 stack profile
         else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
         else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--all-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--repair-budget N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }

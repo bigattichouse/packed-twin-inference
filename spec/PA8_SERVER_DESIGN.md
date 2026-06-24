@@ -138,6 +138,16 @@ glob → `profile.test_glob`; `comp_key`'s extension list; the reconcile contrac
 test-gen / integration-test prompts. Well-defined, but broad. **It pays off even in the local path today** —
 a Python or SQL task currently can't be tested.
 
+**Layer 1a IMPLEMENTED 2026-06-24 (`--lang`, `--coord-test` R24/R25):** a `StackProfile`
+(lang / src_ext / test_suffix / runner) with `javascript` (default — a no-op), `python`, `sql`. The four
+**core mechanics** are now profile-driven: file detection (`is_src_file`/`is_test_file`), the run command
+(`run_test_cmd`), `module_for_test`, and `comp_key`. JS path verified unchanged (25/25; gather/eager/mtp
+green). **Layer 1b (next):** the remaining path-string construction (`test/<comp>.test.js` literals,
+integration-test naming) + the comp-extraction call sites. **Layer 2:** the prompts themselves
+(`CommonJS`/`module.exports`/"node …" → profile-templated) — where cross-language behavior actually changes.
+(The `--coord-test` fixtures are JS strings, so the suite pins `javascript`; the profile mechanism itself is
+covered by R24/R25.)
+
 ## 10. The session-start contract
 
 The client announces, up front (MCP-shaped): its **tools + schemas**, its **locality** (local/remote), its
