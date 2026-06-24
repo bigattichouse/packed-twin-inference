@@ -148,6 +148,56 @@ integration-test naming) + the comp-extraction call sites. **Layer 2:** the prom
 (The `--coord-test` fixtures are JS strings, so the suite pins `javascript`; the profile mechanism itself is
 covered by R24/R25.)
 
+## 9.1 Variables / mini-memories — the resolved-decision store (user, 2026-06-24)
+
+The stack profile (§9) is the typed slice of a more general idea: a **session variable store** — named
+key-value facts that accumulate and travel with every request, so a decision is resolved **once** and
+injected everywhere, deterministically (no per-lane re-inference + drift).
+
+**Three tiers, by lifetime:**
+- **user-level** = **memories** (survive across sessions; seed every new one) — *"I always use pytest + ruff."*
+- **project-level** = `.blackboard/` (persist for the project; brownfield reload) — the detected stack/conventions.
+- **session-level** = the live task's dialog-resolved values (checkpointed to `.blackboard/` for resume).
+
+**Prompts become templates — this is Layer 2.** Prompts carry `<var>` placeholders — *"write a
+`<test_framework>` test for `<lang>`, asserting via `<assertion_style>`, runnable by `<runner>`"* — filled
+from the store. The current JS constants become the **default values**, so an empty store = today's
+behavior, and a populated store retargets without editing prompt text. This promotes reconcile's "TECH
+DECISIONS" from prose to **typed, inspectable, overridable** key-values — and the block sits in the shared
+system prefix, so it's **prefix-cache-friendly** (free per item).
+
+**Variables are DISCOVERED mid-run, not just set up front (user — the MySQL/MyISAM case).** A worker or
+tester can find a fact *during execution* — *"the database is MySQL / MyISAM"* — and write it back:
+`db_engine=mysql`, `storage=MyISAM`, `supports_transactions=false`. The broker (§8.4) routes a `set_var`
+marker into the store at the batch boundary; every subsequent lane carries the updated values. This is the
+**discovered-dependency** model (PA.7b `NOT_FOUND` → re-queue) generalized from *files* to *facts*.
+
+**Discovered > configured > inferred — the §4.6 principle, again.** For *environment facts* (DB engine,
+runtime version), an **empirically-discovered** value (a worker actually connected) outranks a config-file
+reading (which can be stale) which outranks a guess — exactly "executed-truth over reasoning" (PA4 §4.6)
+applied to the fact-base. For *preferences* (test framework, style), **user-explicit** outranks
+project-convention outranks inference. So precedence is **per-variable-kind**: *intent* variables defer to
+the user; *fact* variables defer to observation. (And the three entry modes — greenfield / mid / brownfield
+— are just which tier seeds the store first: model-inference / user-explicit / project-detection.)
+
+**A late discovery can invalidate prior work → rework.** If code was written assuming transactions and then
+`supports_transactions=false` is discovered, the transaction-using modules are **re-queued** — the same
+rework operation as a failing test (PA.4) or contract drift (PA.7 §3). So there are now **three rework
+triggers, one operation**: a failing test, a contract drift, and a **variable invalidation**. The store is a
+*living* fact-base (like the living blueprint, §4.4): discoveries update it, downstream conforms, upstream
+violators get a touch-up.
+
+**Schema — the consequential variables** (what prompts template against), vs. freeform notes the boss may
+stash but that don't drive generation: `lang`, `test_framework`, `runner`, `test_suffix`, `module_system`,
+`assertion_style`, `deps_policy` (the stack slice — what §9's `StackProfile` already carries), plus
+discovered environment facts (`db_engine`, `runtime_version`, …). The known set keeps the store from
+becoming an untyped junk drawer; freeform stays allowed but non-templating.
+
+**Build-order impact:** Layer 2 reframes from "edit every prompt" to **(a)** define the consequential-variable
+schema + the store, **(b)** variabilize the prompts against it, **(c)** populate from the three tiers + the
+`set_var` discovery marker + the variable-invalidation rework trigger. The `StackProfile` (§9 Layer 1a) is
+the first typed entries.
+
 ## 10. The session-start contract
 
 The client announces, up front (MCP-shaped): its **tools + schemas**, its **locality** (local/remote), its
