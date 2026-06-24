@@ -146,3 +146,13 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   **self-contradiction lint** (two asserts, same input, different expected → straight to L2); and a **test
   hierarchy** — integration tests *one or more levels up* that compose the **real** sibling subtree and stub
   only the external boundary (DOM/canvas/clock/RNG), failures routed straight to the boss arbiter.
+- **§4.6/§4.7 IMPLEMENTED + merged to main (2026-06-24)** — the repair-quality trio + integration-test
+  layer + reconcile gate (§6.3, `N≥2·lanes`) + cap-truncation guard; `--coord-test` 23/23; §4.7+§6.3
+  GPU-validated (v47b clean 5/5). §4.6's contradiction/arbiter paths remain GPU-unexercised (no wrong test
+  arose across runs) — to be validated with a deterministic fixture.
+- **PA.8 — server / remote deployment (design, 2026-06-24)** — run cognition on a shared inference box;
+  **percolate execution + resources to the calling client** (the LLM-outside-firewall / DB-inside case); a
+  durable client-side **`.blackboard/`** (survives session close, isolated from cwd); a **stateless
+  resumable server** (checkpoint coordination state → abandon-and-re-derive); client-declared **stack
+  profiles** (de-JS-ify → SQL/Python/…); Board-on-the-wire status. One principle: *client owns the
+  environment, server owns the cognition*. See [`spec/PA8_SERVER_DESIGN.md`](spec/PA8_SERVER_DESIGN.md).
