@@ -451,8 +451,9 @@ only the external boundary, output → `test/<node>.integration.test.js`. `final
 internal node after unit test-gen (independent modules reference no siblings → none, so **zero cost on the
 scale task**); a failing test that maps to no single module now **escalates straight to L2** (was a silent
 break). **Partial:** integration-rework now gets the subtree-root module + siblings (`integration_base`,
-`--coord-test` R22) so an integration failure is repairable with full context; no dedicated root smoke
-test yet; GPU end-to-end pending.
+`--coord-test` R22) so an integration failure is repairable with full context. The root node's
+integration test composes the real subtree *transitively* (real children, which use their real children),
+so it doubles as the smoke test — no separate path needed. GPU end-to-end confirmation pending.
 
 ---
 
