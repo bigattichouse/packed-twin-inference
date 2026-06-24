@@ -1546,6 +1546,10 @@ static std::string build_rework_user(const std::string &target, const std::strin
 }
 
 static std::vector<std::pair<int,int>> reconcile_groups(int n, int g);   // PA.6 parallel reconcile (defined below)
+// PA.6 §6.3 (MEASURED 2026-06-22): parallelize reconcile ONLY when blueprints are plentiful enough that
+// per-group bulk dominates (N >= 2*lanes). Below that, the partials+merge cost (e.g. 5 boss gens for 6
+// blueprints) exceeds a single serial pass → return 1 group (serial). Pure; --coord-test R19.
+static int reconcile_parallel_g(int n, int lanes) { return (lanes >= 1 && n >= 2 * lanes) ? std::min(lanes, n) : 1; }
 
 // GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
 static int coord_self_test() {
@@ -1612,7 +1616,10 @@ static int coord_self_test() {
       chk("R18 frame_executed_truth", f.find("`'hello'`")!=std::string::npos
                                    && f.find("`'hello.'`")!=std::string::npos
                                    && frame_executed_truth("no comparison here").empty()); }
-    fprintf(stderr, "  %s (%d/18 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 18-fail);
+    { chk("R19 reconcile gate (N>=2*lanes)",                                    // PA.6 §6.3 small-N regression fix
+          reconcile_parallel_g(6,4)==1 && reconcile_parallel_g(13,4)==4 && reconcile_parallel_g(8,4)==4
+       && reconcile_parallel_g(3,2)==1); }
+    fprintf(stderr, "  %s (%d/19 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 19-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -2243,7 +2250,7 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
         std::sort(bps.begin(), bps.end());
         if (!bps.empty()) {
             int N = (int)bps.size();
-            auto groups = reconcile_groups(N, std::min(n_lanes, N));
+            auto groups = reconcile_groups(N, reconcile_parallel_g(N, n_lanes));   // PA.6 §6.3 small-N gate
             std::string contract;
             if (groups.size() <= 1) {                          // small: one serial pass (no merge overhead)
                 std::string all; for (auto &b : bps) all += "=== " + b.first + " ===\n" + b.second + "\n";

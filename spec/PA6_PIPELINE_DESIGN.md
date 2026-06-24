@@ -267,8 +267,9 @@ heavily-coupled (merge still resolves cross-group). **GPU MEASURED 2026-06-22 (`
 small N this HURT.** 6 blueprints triggered the parallel path (`min(lanes,N)=4` groups) → **5 boss
 generations** (4 partials + a merge) vs **1** serial pass — inflating wall with no coherence gain on
 independent components. The `min(lanes,N)` trigger is **too loose**: gate parallel reconcile on **N >>
-lanes** (e.g. `N >= 2*lanes`) and keep the single serial pass otherwise. Scale before/after (13 modules)
-still pending.
+lanes** (e.g. `N >= 2*lanes`) and keep the single serial pass otherwise. **IMPLEMENTED 2026-06-23** (`reconcile_parallel_g(N,lanes)`,
+`--coord-test` R19): N < 2·lanes now takes the single serial pass (6 blueprints / 4 lanes → 1 gen, not 5).
+Scale before/after (13 modules) still pending.
 
 ### Future — sharper scheduling (round-robin / orthogonal array, dependency-graph-aware)
 
