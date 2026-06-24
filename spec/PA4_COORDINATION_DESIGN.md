@@ -453,7 +453,16 @@ scale task**); a failing test that maps to no single module now **escalates stra
 break). **Partial:** integration-rework now gets the subtree-root module + siblings (`integration_base`,
 `--coord-test` R22) so an integration failure is repairable with full context. The root node's
 integration test composes the real subtree *transitively* (real children, which use their real children),
-so it doubles as the smoke test — no separate path needed. GPU end-to-end confirmation pending.
+so it doubles as the smoke test — no separate path needed.
+
+**GPU-validated 2026-06-23 (v47, coupled task — engine/pipes/bird):** §4.7 fired — integration test-gen
+produced a **passing** `pipes.integration.test.js`, using the §6.3 gate (1 serial pass for 4 blueprints,
+confirmed live). It also surfaced a **pre-existing bug**: a `create_file` truncated by the `-n` cap writes
+nothing *silently* → the module stays untested → `GIVEN UP` with no visible cause (items that hit `-n 2000`
+wrote no file; the one finishing at 1195 tok wrote fine). `tool_call_truncated()` (R23) now warns on it.
+**§4.6 was not exercised** — the run's failures were *missing* tests, not *wrong* ones, so
+contradiction/executed-truth never triggered; a re-run with a larger `-n` (≥2600) is needed for clean
+test-gen and to surface a failing-assertion scenario.
 
 ---
 

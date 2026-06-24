@@ -1216,13 +1216,26 @@ static bool safe_join(const std::string &rel, std::filesystem::path &out) {
 
 // Execute the tool calls in each worker's output; return a textual report (files
 // written + command output) that gets folded into the gather context.
+// PA4 (MEASURED 2026-06-23, v47): a tool call truncated by the -n cap — an opened create_file/content
+// with no close tag — parses to NO complete call → writes NO file SILENTLY → the module ends up untested
+// → GIVEN UP, with no visible cause. Detect it so we can warn (and the caller can raise -n). Pure; R23.
+static bool tool_call_truncated(const std::string &out) {
+    auto open_no_close = [&](const char *o, const char *c){
+        size_t p = out.rfind(o); return p != std::string::npos && out.find(c, p) == std::string::npos; };
+    return open_no_close("<create_file>", "</create_file>") || open_no_close("<content>", "</content>");
+}
 static std::string run_worker_tools(
     const std::vector<std::pair<std::string,std::string>> &worker_results) {
     namespace fs = std::filesystem;
     std::error_code ec; fs::create_directories(g_work_dir, ec);
     std::string report;
     for (auto &wr : worker_results) {
-        for (auto &c : parse_tool_calls(wr.second)) {
+        auto calls = parse_tool_calls(wr.second);
+        if (calls.empty() && tool_call_truncated(wr.second)) {   // PA4 v47: don't fail silently on cap-truncation
+            fprintf(stderr, "  ⚠ %s: tool call TRUNCATED by the -n cap (unterminated create_file) — no file written; raise -n\n", wr.first.c_str());
+            report += "  [" + wr.first + "] TRUNCATED tool call (hit -n cap) — no file written\n";
+        }
+        for (auto &c : calls) {
             if (c.name == "create_file") {
                 std::string rel = tc_param(c, "path");
                 if (rel.empty()) rel = tc_param(c, "file_path");
@@ -1671,7 +1684,11 @@ static int coord_self_test() {
     { chk("R22 integration_base",                                              // PA4 §4.7 rework subtree recovery
           integration_base("test/engine.integration.test.js")=="engine"
        && integration_base("test/bird.test.js")=="bird" && integration_base("src/pipes.js")=="pipes"); }
-    fprintf(stderr, "  %s (%d/22 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 22-fail);
+    { chk("R23 tool_call_truncated",                                           // PA4 v47: cap-truncation guard
+          tool_call_truncated("blah <create_file><path>x</path><content>partial...")
+       && !tool_call_truncated("<create_file><path>x</path><content>full</content></create_file>")
+       && !tool_call_truncated("no tool call here")); }
+    fprintf(stderr, "  %s (%d/23 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 23-fail);
     return fail > 0 ? 5 : 0;
 }
 
