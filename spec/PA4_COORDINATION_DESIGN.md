@@ -307,6 +307,135 @@ GPU-free coverage: `--coord-test` R3/R9 (journal + `ATTEMPT:` in the repair prom
 (`extract_attempt`). Future (user, deferred): journal survives sessions; `git init` the work-dir so
 each worker sees real per-write diffs.
 
+### 4.6 The repair HISTORY bundle + executed-truth-over-reasoning (user, 2026-06-22 — DESIGN)
+
+Diagnosis of the scale run's surviving failures (`spec/PA6_PIPELINE_DESIGN.md` §6.2) sharpened into two
+coupled principles, both grounded in one specimen — `stringUtils.truncate` (the 13-module scale run,
+`validate/scale_packed`):
+
+**The specimen.** `truncate('hello', 6)` — `'hello'` is 5 chars, fits in 6, so the stated rule ("truncate
+only if `len > max`") yields `'hello'`; the module is correct. The harness-generated test asserted it
+**twice, contradictorily** — `=== 'hello.'` then `=== 'hel...'` — with a literal self-correcting comment
+between them (`// Wait, default suffix is '...' (len 3)… = 'hel...'`) whose correction was *also* wrong. The
+test-writer **reasoned** the expected value, in its head, and was wrong both times, when
+`node -e 'truncate("hello",6)'` would have ended it. L1 (module-only) is **structurally incapable** here —
+no module can satisfy two mutually-exclusive assertions on the same input — so it burns its budget
+corrupting a correct module until `no_progress` (§4.3) escalates.
+
+**Principle 1 — a rework worker needs the ENTIRE history of its item, as one persisted object (user):**
+*"you need to see the entire history and notes related — how that item fits in the plan, the code, the
+tests, the comments, arb, etc."* Today the repair context is **re-assembled fresh each round** (spec/
+contract + module + test + error + collaborators + `journal[comp]`), and the two richest history pieces are
+**dropped**:
+
+- **The arbiter's diagnosis is discarded.** `reworks_from_plan(strip_think(boss_generate(...)))` keeps only
+  the one-line `instruction:` from each PIECE — the boss's actual reasoning (its `<think>` block + prose:
+  *"these two asserts contradict; the module is right; rewrite the test to expect `'hello'`"*) is thrown
+  away. The rework worker and the *next* arbiter round never see **why**. On flappy (§4.1) the doc celebrated
+  the boss computing `400 − 22.5 = 377.5` to prove a test wrong — then deleted that proof.
+- **The cross-round trajectory is not assembled** — only the latest `r.out`. A worker that fixed the first
+  assertion → re-ran → now fails the second isn't told *"you already changed this; a **different** assertion
+  on the same input broke"* — the exact signature of a multiply-wrong test. `journal[comp]` was meant to be
+  this memory but it's thin (fires only when a worker emits `ATTEMPT:`, often "(no note)", and is not
+  file-attributed).
+
+Fix: a **per-component history bundle**, harness-owned, threaded into every amend/rework/arbiter prompt —
+the round trajectory `{file changed, the boss's FULL diagnosis (not the one-liner), what was tried, error
+before→after}`, **file-attributed**, blueprint/contract under the right key. One persisted object, not six
+re-derived with the two best dropped.
+
+**A concrete keying bug this exposes.** The L2 attempt recorder strips `.test.js`/`.js` to key the journal
+by component, but a **RESPEC target (`design/X.blueprint`) matches neither** → it is journaled under
+`"X.blueprint"` while every reader looks up `journal["X"]`. So living-blueprint RESPEC history (§4.4) is
+**orphaned under the wrong key** and invisible to the next module/test repair — precisely the thread you
+most want when a spec keeps drifting. Fix the key extraction to also strip `.blueprint`.
+
+**Principle 2 — an executed/verifiable value always beats a reasoned one (user):** *"tool calls should
+always win over reasoned values — running a little command-line calculation is verifiable."* The project
+ethos ("MEASURED, not predicted") pushed **into the agents**. The boundary that keeps this from being
+self-defeating:
+
+> **Execute to get a FACT; something INDEPENDENT must supply the ORACLE. Never run the artifact-under-test
+> to SOURCE the test's expected values** — that yields `assert(fn(x) === fn(x))`, a tautology that catches
+> zero module bugs and silently converts a spec-test into a characterization-test (violating §4.2 "test the
+> SPEC, not the code-as-written").
+
+The executed fact is **already in hand and merely not privileged.** Node's assert prints `'hello' !==
+'hello.'`: the left side is the **executed actual** (a verified fact — what the module really returns), the
+right is the **reasoned expected** (the test-writer's hand-derivation). The harness dumps it raw and lets
+the arbiter *re-reason*. Instead, frame it as a ranking:
+
+```
+EXECUTED actual = 'hello'  ·  test-expected = 'hello.'  ·  spec rule (truncate iff len>max) endorses 'hello'  →  the TEST is wrong.
+```
+
+Execution supplies the fact, the **spec rule** supplies the oracle, the reasoned value loses — and the boss
+never has to do arithmetic in its head (the exact failure mode that bit the test-writer). The **harness
+already owns the runtime** (`run_all_tests`, popen) so it can run the failing call against the module and
+inject `EXECUTED: …` into the failblock **today**, before the PA.7b live tool loop; the agent-driven version
+(a worker calls `execute_bash` mid-stream and continues) is a prime PA.7b motivation.
+
+**Principle 2b — a self-contradiction lint.** Two assertions, same input, different expected is
+**unsatisfiable by any module** — detectable by reading the test file: a hard *"the test is the bug → jump
+straight to L2"* signal (no reasoning, no L1 budget burned).
+
+**Build (the "trio"; GPU-free fixture = the `stringUtils.truncate` case, new `--coord-test` cases):**
+(1) history bundle — persist the arbiter's full diagnosis into the journal; fix the `.blueprint` keying;
+carry the error trajectory; (2) executed-ground-truth injection — harness runs the failing call, frames
+actual-vs-expected-vs-spec, journals the *executed* fact over any reasoned claim; (3) self-contradiction
+lint → immediate L2.
+
+### 4.7 Test HIERARCHY — integration tests one or more levels up (user, 2026-06-22 — DESIGN)
+
+Today the test layer is **one level deep**: `test/<comp>.test.js` requires one module and asserts on it,
+**collaborators stubbed**. That stubbing is the bug source for *coupled* tasks: the flappy
+`addEventListener is not a function` / canvas-vs-ctx failure (§4.1, PA6 §2) lives in **no single module** —
+it is in how `index` wires the *real* `renderer`. Two modules each pass their unit test against their own
+*mock* of each other and still don't compose, because **both sides of the mock drifted** — the "blind mock,
+whack-a-mole one missing method at a time" of PA7 §3.1, unfixable at the unit level by construction.
+
+**The rule: mock only the external boundary; use real siblings inside the tree.** A dependency that
+resolves to a generated `src/*.js` is *internal* → use it for real; anything outside the generated tree
+(canvas, DOM, clock, RNG, fs, network) is *external* → stub it. The test layers then **mirror the dependency
+DAG**:
+
+- **leaves** → unit tests, external boundary stubbed (have this);
+- **internal nodes** (`engine`, `index`) → **integration tests** composing the *real* subtree below them,
+  stubbing only the external edge;
+- **root** → a **smoke test** that boots the whole thing.
+
+"One or more levels up" = walk up the DAG; each non-leaf gets a test against real children. This is *less*
+work than the current path, not more: the whole collaborator-injection thread (PA.7a injects collaborator
+code so the unit test can mock it *accurately*; PA.7b fetches more to mock better) exists to make mocks
+faithful — the endpoint of "be collaborator-aware" is **stop mocking collaborators**. It also **restores the
+boss's original `smokeTest` SELF-piece** (PACKED_AGENTS_DESIGN §4), dropped when gather collapsed into
+finalize/verify (§3.2) — but properly: graph-structured + harness-generated, not a boss blob.
+
+Three consequences, each coupling to the rest of the design:
+
+1. **The oracle rises with the level.** A unit test's oracle is the function's spec rule; an integration
+   test's oracle is the **contract's wiring section** + the goal-blueprint connections ("engine calls
+   `bird.update()/flap()`; renderer reads `getBounds()`"). The harness owns both (`INTERFACE.md` + the goal
+   map); the generator is seeded with the *wiring*, and the edges to test are exactly what `collab_for`
+   already computes.
+2. **Integration failures route straight to L2.** When `engine`-with-real-`renderer` fails, L1 (module-only)
+   can't tell *which* module — or the wiring, or the contract — is wrong; only the arbiter has the graph +
+   contract to attribute it. So an integration red **skips L1**. This is why §4.6 (history bundle +
+   executed-truth) is the prerequisite: integration failures are the hardest to attribute, so they need the
+   fullest history and a *run-the-composition-and-observe* fact over reasoning across five modules.
+3. **Cost is self-targeting.** The 12-independent-utils scale task has **zero internal edges** → zero
+   integration tests → nothing added to the throughput showcase; the coupled flappy app is almost all
+   internal edges → all the value lands there. Readiness is the natural eager rule one level up from
+   `testgen:X`: an integration test for node N is **ready when N's whole internal subtree exists on disk**
+   (PA.7 §2).
+
+**Build order (after the §4.6 trio, which makes integration failures repairable):** derive the internal-dep
+DAG (reuse `collab_for` edges / parse the goal blueprint) → identify non-leaf nodes → generate one
+integration test per internal node (real siblings, external-only stubs, seeded with the contract wiring) +
+a root smoke test → integration reds skip to the arbiter. GPU-free fixture: a 2-module compose (one real
+sibling + one external stub). Rationale for sequencing: building integration first would only generate
+harder-to-attribute failures into a loop that cannot yet repair them.
+
 ---
 
 ## 5. Boss reports to the user — the live board
