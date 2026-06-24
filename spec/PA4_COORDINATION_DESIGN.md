@@ -464,6 +464,13 @@ wrote no file; the one finishing at 1195 tok wrote fine). `tool_call_truncated()
 contradiction/executed-truth never triggered; a re-run with a larger `-n` (≥2600) is needed for clean
 test-gen and to surface a failing-assertion scenario.
 
+**v47b re-run (`-n 3000`, 2026-06-24): CLEAN 5/5 GREEN.** Both internal nodes got integration tests
+(`engine.integration.test.js` + `pipes.integration.test.js`, each composing the real siblings, all passing)
+alongside unit tests; wall 2456 s (faster than v47's 3188 s — no give-up spiral). The truncation guard
+fired once and the untested-requeue **recovered** the module (visible + self-healing at adequate `-n`). §4.6
+still not GPU-exercised — no *wrong* tests arose this run (it remains unit-tested; awaits a run that yields a
+failing-assertion scenario).
+
 ---
 
 ## 5. Boss reports to the user — the live board
