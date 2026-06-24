@@ -385,6 +385,15 @@ carry the error trajectory; (2) executed-ground-truth injection — harness runs
 actual-vs-expected-vs-spec, journals the *executed* fact over any reasoned claim; (3) self-contradiction
 lint → immediate L2.
 
+**IMPLEMENTED 2026-06-23 (commit adb8a90):** the trio is built + wired + unit-tested (`--coord-test`
+R16–R18 → 18/18). `comp_key()` fixes the journal-key orphan (both recorders); `contradictory_asserts()`
+(paren-aware) routes a self-contradictory failing test **straight to L2**; `frame_executed_truth()` is
+prepended to the error in the arbiter failblock + L1 amend + L2 rework prompts; and `arbiter_diag`
+persists the arbiter's full reasoning across escalations (round 2 refines round 1). **Partial:**
+executed-truth currently re-frames node's error text (which already carries the actual) — having the
+harness *run the failing call* for values the error omits is the deeper follow-up. End-to-end GPU
+confirmation (a contradictory test escalating + getting fixed) still pending.
+
 ### 4.7 Test HIERARCHY — integration tests one or more levels up (user, 2026-06-22 — DESIGN)
 
 Today the test layer is **one level deep**: `test/<comp>.test.js` requires one module and asserts on it,
