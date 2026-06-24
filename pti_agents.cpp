@@ -1458,6 +1458,13 @@ static std::string build_integration_task(const std::string &goal, const std::st
            "\n```\n\nREAL collaborators (require these, do NOT mock):\n" + sibling_code +
            "\n\nWrite ONLY the test via create_file at test/" + target + ".integration.test.js. No prose.";
 }
+// PA4 §4.7: the real component an integration test targets — "test/engine.integration.test.js" → "engine"
+// (so L2 rework gets the subtree-root module + its siblings as context, not an empty module). Pure; R22.
+static std::string integration_base(const std::string &path) {
+    std::string c = comp_key(path);                          // strips .test.js → "engine.integration"
+    size_t i = c.rfind(".integration"); if (i != std::string::npos) c = c.substr(0, i);
+    return c;
+}
 
 // Amend instruction (user turn) for a failing module — fix the code so its test passes.
 // Gives the worker the full context (it's a fresh session): SPEC + module + test + error.
@@ -1661,7 +1668,10 @@ static int coord_self_test() {
     { std::string t = build_integration_task("GOAL", "engine", "CODEX", "// bird.js\nstub");
       chk("R21 build_integration_task", t.find("engine")!=std::string::npos && t.find("do NOT mock")!=std::string::npos
                                      && t.find("integration.test.js")!=std::string::npos && t.find("CODEX")!=std::string::npos); }
-    fprintf(stderr, "  %s (%d/21 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 21-fail);
+    { chk("R22 integration_base",                                              // PA4 §4.7 rework subtree recovery
+          integration_base("test/engine.integration.test.js")=="engine"
+       && integration_base("test/bird.test.js")=="bird" && integration_base("src/pipes.js")=="pipes"); }
+    fprintf(stderr, "  %s (%d/22 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 22-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -2045,21 +2055,16 @@ static void finalize_verify(const WorkOrder &wo,
                     std::vector<std::string> ritems, rids;
                     for (auto &rw : reworks) {
                         std::string tgt = rw.first;
-                        std::string fn = std::filesystem::path(tgt).filename().string(), comp = fn;
-                        { size_t s = comp.find(".test.js");
-                          if (s != std::string::npos) comp = comp.substr(0, s);
-                          else { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); } }
-                        std::string modpath = module_for_test(comp + ".test.js", mods);
+                        std::string comp  = comp_key(tgt);                // "engine.integration" for an integration test
+                        std::string rbase = integration_base(tgt);        // §4.7: the real component ("engine"); == comp for normal targets
+                        std::string modpath = module_for_test(rbase + ".test.js", mods);   // subtree-root module (src/engine.js)
                         std::string spec =   // contract (authoritative, reconcile-evolved) + the living blueprint
                             (goal_ctx.empty() ? "" : "=== INTERFACE CONTRACT (authoritative; overrides blueprints) ===\n" + goal_ctx + "\n\n")
-                            + "=== blueprint: " + comp + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
-                        std::string modc = modpath.empty() ? "" : read_file_str(modpath);
-                        std::string testc, err;                 // pull the comp's test + error from fails
-                        for (auto &r : fails) {
-                            std::string tb = std::filesystem::path(r.rel).filename().string();
-                            size_t s = tb.find(".test.js"); if (s != std::string::npos) tb = tb.substr(0, s);
-                            if (tb == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
-                        }
+                            + "=== blueprint: " + rbase + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + rbase + ".blueprint");
+                        std::string modc = modpath.empty() ? "" : read_file_str(modpath);   // §4.7: collab_for(modc) below adds the subtree
+                        std::string testc, err;                 // pull THIS target's test + error from fails
+                        for (auto &r : fails)
+                            if (comp_key(r.rel) == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
                         std::string u = build_rework_user(tgt, spec, modc, testc, frame_executed_truth(err) + err, rw.second,
                                                           collab_for(modc, modpath, mods), journal[comp]);
                         std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", u} }, true);

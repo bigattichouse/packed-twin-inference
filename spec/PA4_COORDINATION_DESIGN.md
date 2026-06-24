@@ -450,8 +450,9 @@ leaf vs internal node; `build_integration_task()` (R21) composes the REAL target
 only the external boundary, output → `test/<node>.integration.test.js`. `finalize_verify` generates one per
 internal node after unit test-gen (independent modules reference no siblings → none, so **zero cost on the
 scale task**); a failing test that maps to no single module now **escalates straight to L2** (was a silent
-break). **Partial:** no dedicated root smoke test yet; integration-rework context could be enriched with the
-subtree code; GPU end-to-end pending.
+break). **Partial:** integration-rework now gets the subtree-root module + siblings (`integration_base`,
+`--coord-test` R22) so an integration failure is repairable with full context; no dedicated root smoke
+test yet; GPU end-to-end pending.
 
 ---
 
