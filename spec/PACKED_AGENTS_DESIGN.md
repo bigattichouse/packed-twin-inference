@@ -38,6 +38,65 @@ most important economic decision in the doc.
 1.6–2.4×. State it that way everywhere; it is still the largest lever on the board for
 splittable work.
 
+### 1.1 Throughput verdict (MEASURED 2026-06-22): interleaving is **not** the speed win — and below full occupancy a sequential loop is faster
+
+The table above is the *prediction*. The end-to-end agentic pipeline does **not** sustain it.
+Consolidating the scattered measurements (PA.0, PA.3, PA6 §6/§6.2, PA7 §1):
+
+| regime | aggregate vs 1 stream | note |
+|---|---|---|
+| 4 lanes, full + **balanced** (uniform A/B) | **1.89×** | the ceiling — real, but synthetic |
+| design stage (uneven thinking items), post-fix | **0.79×** | below a single stream |
+| implement stage at scale, post prefix-cache | **0.68×** | (was 0.22× pre-cache) |
+| MTP interleaving (PA.3) | **net-slower** | doubled `n_seq_max`; shelved |
+
+Three packed-**only** costs eat the batch win, in measured order of damage: the **idle-seq SSM tax**
+(a hybrid/Mamba model processes the recurrent state of *every allocated lane each step* — so partial
+occupancy and N>4 are taxed regardless of live work; this caps N at 4), **stragglers + barriers**
+(thinking stages have the widest token spread → lanes idle behind the longest item while still paying
+the allocation tax), and **per-item prefill** (now fixed by prefix-caching the staged pools, but only
+to 0.68×).
+
+**The crossover — theory, then measurement.** *Theory (since revised):* a sequential `-s 1` loop runs each
+item near the ~19.3 tok/s baseline (no allocation tax / straggler / barrier), so packed wins only if its
+aggregate clears 1×. *Measurement (the A/B below) corrected this:* **both** modes actually run far below
+baseline (pool aggregate 0.33–0.62×) — **per-item overhead** (delta-prefill + setup + tool round-trips +
+short items) dominates regardless of packing — and packed's pool aggregate is in fact *higher* than
+sequential's. So the wall crossover is driven less by the SSM decode tax than by **packed-only overhead**
+(parallel reconcile + extra repair rounds). Packing's raw decode advantage is real but small and easily
+swamped by that overhead.
+
+**Crucially, this does not touch the real win.** Decomposition + verification are **independent of the
+decode mechanism** — a sequential loop keeps the entire staged pipeline (triage → blueprints → reconcile
+→ implement → test-gen → verify → arbiter repair) and with it the two advantages tok/s never captured:
+(1) **not output-length-bound** — the single one-shot produced **0/24 files** on the scale task (sketched
+placeholders) where the decomposed pipeline completes; (2) **autonomous verify/repair** a one-shot can't
+do to itself. Honest stance: **stop selling interleaving as a speed win on this hardware; bank
+decomposition + verification, and treat lane count as a tuning knob that only helps at full balanced
+occupancy.**
+
+**MEASURED A/B (2026-06-22, `seq_vs_packed_ab.sh`, 5 independent modules, identical flags, GPU-serial):**
+packed `-s 4` = **3389 s**, sequential `-s 1` = **2627 s** → **sequential 1.29× faster at identical 5/5
+verified quality.** Mechanism, honestly: per-stage *pool* aggregate actually favored packed (design 0.61×
+vs 0.39×, implement 0.62× vs 0.37×) — interleaving *did* make the pool loop more throughput-efficient — but
+packed lost the **wall** to two packed-only costs: (1) **parallel reconcile** (the newest commit) did **5
+boss generations** (4 group passes + a merge) to reconcile 6 blueprints vs sequential's **1 pass** — it
+mis-triggers at small N and *inflates* wall there (see PA6 §6.3); (2) packed's first verify had 1 failing
+module → an extra **repair round** (7.3 tok/s); sequential passed 5/5 first try (variance). **Answer to
+"would looping one agent at a time be faster?": measured YES (1.29×), at equal quality** — but a clean
+isolation of the pure SSM-throughput crossover still wants a follow-up that forces **1 reconcile pass on
+both sides** and controls repair rounds. The lane count (`-s`) is the knob; `seq_vs_packed_ab.sh` reruns it.
+
+**Curve filled in (`-s 2`, 2026-06-23): 3525 s, 4/5 — the SLOWEST and worst, but NOT from lane count.**
+N=1 = 2627 s (5/5, 0 repair) · N=2 = 3525 s (4/5, 2 repair rounds + **2 arbiter escalations** that gave up
+on a `capitalize` spec-ambiguity) · N=4 = 3389 s (5/5, 1 repair round). The *pool decode* aggregate is
+cleanly **monotonic** in lanes (N=4 ~0.60× > N=2 ~0.55× > N=1 ~0.38× — interleaving's decode benefit is
+real, orderly, and small), but the **wall is not** — it tracks (repair rounds + arbiter escalations +
+reconcile generations), i.e. **quality-path variance, not lane count**. **Conclusion: lane count is a
+*minor* wall lever; the repair path is the major one.** N=2 lost ~900 s to two arbiter escalations over one
+spec-ambiguous test (the §4.6 class) and *still* shipped 4/5 — empirical proof that the §4.6 work
+(executed-truth + history bundle) outranks any lane tuning for wall.
+
 ---
 
 ## 2. Substrate contract (what the hardware/llama.cpp give us)

@@ -1216,13 +1216,26 @@ static bool safe_join(const std::string &rel, std::filesystem::path &out) {
 
 // Execute the tool calls in each worker's output; return a textual report (files
 // written + command output) that gets folded into the gather context.
+// PA4 (MEASURED 2026-06-23, v47): a tool call truncated by the -n cap — an opened create_file/content
+// with no close tag — parses to NO complete call → writes NO file SILENTLY → the module ends up untested
+// → GIVEN UP, with no visible cause. Detect it so we can warn (and the caller can raise -n). Pure; R23.
+static bool tool_call_truncated(const std::string &out) {
+    auto open_no_close = [&](const char *o, const char *c){
+        size_t p = out.rfind(o); return p != std::string::npos && out.find(c, p) == std::string::npos; };
+    return open_no_close("<create_file>", "</create_file>") || open_no_close("<content>", "</content>");
+}
 static std::string run_worker_tools(
     const std::vector<std::pair<std::string,std::string>> &worker_results) {
     namespace fs = std::filesystem;
     std::error_code ec; fs::create_directories(g_work_dir, ec);
     std::string report;
     for (auto &wr : worker_results) {
-        for (auto &c : parse_tool_calls(wr.second)) {
+        auto calls = parse_tool_calls(wr.second);
+        if (calls.empty() && tool_call_truncated(wr.second)) {   // PA4 v47: don't fail silently on cap-truncation
+            fprintf(stderr, "  ⚠ %s: tool call TRUNCATED by the -n cap (unterminated create_file) — no file written; raise -n\n", wr.first.c_str());
+            report += "  [" + wr.first + "] TRUNCATED tool call (hit -n cap) — no file written\n";
+        }
+        for (auto &c : calls) {
             if (c.name == "create_file") {
                 std::string rel = tc_param(c, "path");
                 if (rel.empty()) rel = tc_param(c, "file_path");
@@ -1331,6 +1344,141 @@ static std::string module_for_test(const std::string &test_filename,
         if (std::filesystem::path(m).filename().string() == base + ".js") return m;
     return "";
 }
+
+// ── PA4 §4.6 repair-quality helpers (pure; unit-tested via --coord-test) ──────────────────────
+// Component key for any path: strip test/.blueprint/.js/.ts suffixes → bare comp ("X"). FIX: the old
+// inline strips missed ".blueprint", so a RESPEC target design/X.blueprint was journaled under
+// "X.blueprint" while readers looked up "X" — orphaning history exactly when the spec kept drifting.
+static std::string comp_key(const std::string &path) {
+    std::string b = std::filesystem::path(path).filename().string();
+    for (const char *suf : { ".test.js", ".blueprint", ".mjs", ".cjs", ".js", ".ts" }) {
+        size_t n = strlen(suf);
+        if (b.size() >= n && b.compare(b.size() - n, n, suf) == 0) return b.substr(0, b.size() - n);
+    }
+    return b;
+}
+// index just past the ')' matching the '(' at `open` (quote/escape aware); npos if unbalanced.
+static size_t match_paren(const std::string &s, size_t open) {
+    int depth = 0; bool inq = false; char q = 0;
+    for (size_t i = open; i < s.size(); i++) { char c = s[i];
+        if (inq) { if (c == '\\') i++; else if (c == q) inq = false; continue; }
+        if (c == '\'' || c == '"' || c == '`') { inq = true; q = c; }
+        else if (c == '(') depth++;
+        else if (c == ')' && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+// split a JS arg list on TOP-LEVEL commas (paren/bracket/brace/quote aware).
+static std::vector<std::string> split_top_commas(const std::string &s) {
+    std::vector<std::string> out; int depth = 0; bool inq = false; char q = 0; size_t start = 0;
+    for (size_t i = 0; i < s.size(); i++) { char c = s[i];
+        if (inq) { if (c == '\\') i++; else if (c == q) inq = false; continue; }
+        if (c == '\'' || c == '"' || c == '`') { inq = true; q = c; }
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (c == ',' && depth == 0) { out.push_back(s.substr(start, i - start)); start = i + 1; }
+    }
+    out.push_back(s.substr(start));
+    return out;
+}
+// position of a TOP-LEVEL "===" (depth 0, not in a string); npos if none.
+static size_t find_top_eqeqeq(const std::string &s) {
+    int depth = 0; bool inq = false; char q = 0;
+    for (size_t i = 0; i + 2 < s.size(); i++) { char c = s[i];
+        if (inq) { if (c == '\\') i++; else if (c == q) inq = false; continue; }
+        if (c == '\'' || c == '"' || c == '`') { inq = true; q = c; }
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (depth == 0 && c == '=' && s[i+1] == '=' && s[i+2] == '=') return i;
+    }
+    return std::string::npos;
+}
+// PA4 §4.6 self-contradiction lint: a test asserting the SAME call to TWO different expected values is
+// unsatisfiable by ANY module → the TEST is the bug → route straight to L2 (don't burn L1). Returns the
+// offending call expressions. Handles assert.strictEqual(call, exp) and assert(call === exp) forms.
+static std::vector<std::string> contradictory_asserts(const std::string &src) {
+    std::map<std::string, std::vector<std::string>> seen;
+    auto nows = [](const std::string &s){ std::string o; for (char c : s) if (!isspace((unsigned char)c)) o += c; return o; };
+    for (size_t pos = 0; ; ) {
+        pos = src.find("assert", pos);
+        if (pos == std::string::npos) break;
+        size_t after = pos + 6; char nx = after < src.size() ? src[after] : 0;
+        if (nx != '(' && nx != '.') { pos = after; continue; }      // a real assert(...) / assert.x(...)
+        size_t op = src.find('(', after); if (op == std::string::npos) break;
+        size_t cl = match_paren(src, op);
+        pos = (cl == std::string::npos) ? op + 1 : cl + 1;          // advance past this call
+        if (cl == std::string::npos) continue;
+        std::string inside = src.substr(op + 1, cl - op - 1), call, exp;
+        size_t eq = find_top_eqeqeq(inside);
+        if (eq != std::string::npos) { call = inside.substr(0, eq);
+            auto a = split_top_commas(inside.substr(eq + 3)); exp = a.empty() ? "" : a[0]; }
+        else { auto a = split_top_commas(inside); if (a.size() < 2) continue; call = a[0]; exp = a[1]; }
+        call = nows(call); exp = nows(exp);
+        if (call.empty() || exp.empty()) continue;
+        auto &v = seen[call]; if (std::find(v.begin(), v.end(), exp) == v.end()) v.push_back(exp);
+    }
+    std::vector<std::string> out;
+    for (auto &kv : seen) if (kv.second.size() > 1) out.push_back(kv.first);
+    return out;
+}
+// PA4 §4.6 executed-truth: node's AssertionError already carries the EXECUTED actual vs the reasoned
+// expected — surface it as a ranking so the arbiter trusts the RUN, not its own re-derivation. Best
+// effort: "" if it can't parse (purely additive).
+static std::string frame_executed_truth(const std::string &err) {
+    std::string a, e; std::smatch m;
+    static const std::regex rne(R"(([^\n]{1,80}?)\s*!==\s*([^\n]{1,80}?)\s*(?:\n|$))");
+    static const std::regex ract(R"([Aa]ctual[^\n:]*:\s*([^\n]{1,80}))");
+    static const std::regex rexp(R"([Ee]xpected[^\n:]*:\s*([^\n]{1,80}))");
+    if (std::regex_search(err, m, rne)) { a = m[1].str(); e = m[2].str(); }
+    else { std::smatch ma, me; if (std::regex_search(err, ma, ract) && std::regex_search(err, me, rexp)) { a = ma[1].str(); e = me[1].str(); } }
+    auto trim = [](std::string s){ size_t b = s.find_first_not_of(" \t+-"); if (b == std::string::npos) return std::string();
+                                   size_t z = s.find_last_not_of(" \t,"); return s.substr(b, z - b + 1); };
+    a = trim(a); e = trim(e);
+    if (a.empty() || e.empty()) return "";
+    return "EXECUTED FACT (trust the run over any re-derivation): the code actually produced `" + a +
+           "`, the test asserted `" + e + "`. Decide which the SPEC endorses — if the run matches the spec, "
+           "the TEST is wrong; otherwise the module.\n";
+}
+
+// ── PA4 §4.7 integration-test layer (pure; unit-tested via --coord-test) ───────────────────────
+// Which OTHER generated modules does `content` reference? The dep edges that decide integration tests:
+// an internal node (refs >=1 sibling) gets an integration test against the REAL siblings; a leaf (refs
+// none) gets only its unit test. Whole-word match on the basename (avoids 'bird' inside 'blackbird').
+static std::vector<std::string> module_refs(const std::string &content, const std::string &self_base,
+                                            const std::vector<std::string> &all_bases) {
+    auto idchar = [](char c){ return isalnum((unsigned char)c) || c == '_'; };
+    std::vector<std::string> out;
+    for (auto &b : all_bases) {
+        if (b.empty() || b == self_base) continue;
+        for (size_t p = 0; (p = content.find(b, p)) != std::string::npos; p += b.size()) {
+            char bef = p ? content[p-1] : ' ', aft = p + b.size() < content.size() ? content[p + b.size()] : ' ';
+            if (!idchar(bef) && !idchar(aft)) { out.push_back(b); break; }
+        }
+    }
+    return out;
+}
+// Build the integration-test task for an internal node — compose the REAL target + REAL siblings (mock
+// ONLY the external boundary), test the contract's wiring. Output → test/<t>.integration.test.js, which
+// the verifier runs like any *.test.js; a failure maps to no single module → routes to the L2 arbiter.
+static std::string build_integration_task(const std::string &goal, const std::string &target,
+                                          const std::string &target_code, const std::string &sibling_code) {
+    return "Write a Node.js INTEGRATION test for `" + target + "` that composes it with its REAL "
+           "collaborators — require the ACTUAL sibling modules below, do NOT mock them. Stub ONLY the "
+           "external boundary (DOM/canvas/timers/RNG/network/fs), nothing internal. Assert that the wiring "
+           "the contract specifies works end-to-end (the methods each calls on the other exist and behave), "
+           "with console.assert + process.exit(1) on any failure.\n\n"
+           "Project goal/contract:\n" + goal + "\n\nTarget (src/" + target + ".js):\n```js\n" + target_code +
+           "\n```\n\nREAL collaborators (require these, do NOT mock):\n" + sibling_code +
+           "\n\nWrite ONLY the test via create_file at test/" + target + ".integration.test.js. No prose.";
+}
+// PA4 §4.7: the real component an integration test targets — "test/engine.integration.test.js" → "engine"
+// (so L2 rework gets the subtree-root module + its siblings as context, not an empty module). Pure; R22.
+static std::string integration_base(const std::string &path) {
+    std::string c = comp_key(path);                          // strips .test.js → "engine.integration"
+    size_t i = c.rfind(".integration"); if (i != std::string::npos) c = c.substr(0, i);
+    return c;
+}
+
 // Amend instruction (user turn) for a failing module — fix the code so its test passes.
 // Gives the worker the full context (it's a fresh session): SPEC + module + test + error.
 static std::string build_amend_user(const std::string &base, const std::string &modpath,
@@ -1450,6 +1598,10 @@ static std::string build_rework_user(const std::string &target, const std::strin
 }
 
 static std::vector<std::pair<int,int>> reconcile_groups(int n, int g);   // PA.6 parallel reconcile (defined below)
+// PA.6 §6.3 (MEASURED 2026-06-22): parallelize reconcile ONLY when blueprints are plentiful enough that
+// per-group bulk dominates (N >= 2*lanes). Below that, the partials+merge cost (e.g. 5 boss gens for 6
+// blueprints) exceeds a single serial pass → return 1 group (serial). Pure; --coord-test R19.
+static int reconcile_parallel_g(int n, int lanes) { return (lanes >= 1 && n >= 2 * lanes) ? std::min(lanes, n) : 1; }
 
 // GPU-free self-test for the repair bookkeeping (like --gather-test / --mtp-test).
 static int coord_self_test() {
@@ -1502,7 +1654,41 @@ static int coord_self_test() {
       int tot = 0, mn = 99, mx = 0; for (auto &p : g) { tot += p.second; mn = std::min(mn, p.second); mx = std::max(mx, p.second); }
       chk("R15 reconcile_groups", g.size()==4 && tot==13 && (mx-mn)<=1
                                && reconcile_groups(3,8).size()==3 && reconcile_groups(0,4).empty()); }
-    fprintf(stderr, "  %s (%d/15 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 15-fail);
+    { chk("R16 comp_key strips .blueprint/.test.js/.js",                        // PA4 §4.6 orphan fix
+          comp_key("design/stringUtils.blueprint")=="stringUtils" && comp_key("test/bird.test.js")=="bird"
+       && comp_key("src/pipes.js")=="pipes" && comp_key("engine")=="engine"); }
+    { std::string t =                                                            // PA4 §4.6 self-contradiction lint
+        "assert.strictEqual(truncate('hello', 6), 'hello.', 'msg');\n"
+        "assert.strictEqual(truncate('hello', 6), 'hel...', 'msg2');\n"
+        "assert.strictEqual(truncate('hi', 5), 'hi', 'ok');\n"
+        "assert(m.capitalize('') === '');\n";
+      auto c = contradictory_asserts(t);
+      chk("R17 contradictory_asserts", c.size()==1 && c[0]=="truncate('hello',6)"); }
+    { std::string f = frame_executed_truth("AssertionError: msg\n    'hello' !== 'hello.'\n");  // PA4 §4.6 executed-truth
+      chk("R18 frame_executed_truth", f.find("`'hello'`")!=std::string::npos
+                                   && f.find("`'hello.'`")!=std::string::npos
+                                   && frame_executed_truth("no comparison here").empty()); }
+    { chk("R19 reconcile gate (N>=2*lanes)",                                    // PA.6 §6.3 small-N regression fix
+          reconcile_parallel_g(6,4)==1 && reconcile_parallel_g(13,4)==4 && reconcile_parallel_g(8,4)==4
+       && reconcile_parallel_g(3,2)==1); }
+    { std::vector<std::string> bases = {"bird","pipes","engine","renderer"};                 // PA4 §4.7
+      auto r = module_refs("const bird=require('./bird'); renderer.draw(bird);", "engine", bases);
+      bool ok = std::find(r.begin(),r.end(),"bird")!=r.end() && std::find(r.begin(),r.end(),"renderer")!=r.end()
+             && std::find(r.begin(),r.end(),"pipes")==r.end() && std::find(r.begin(),r.end(),"engine")==r.end();
+      auto leaf = module_refs("function add(a,b){return a+b;}", "math", bases);              // refs nothing → leaf
+      auto noword = module_refs("blackbird flies", "x", {"bird"});                            // whole-word: no match
+      chk("R20 module_refs (internal/leaf/whole-word)", ok && leaf.empty() && noword.empty()); }
+    { std::string t = build_integration_task("GOAL", "engine", "CODEX", "// bird.js\nstub");
+      chk("R21 build_integration_task", t.find("engine")!=std::string::npos && t.find("do NOT mock")!=std::string::npos
+                                     && t.find("integration.test.js")!=std::string::npos && t.find("CODEX")!=std::string::npos); }
+    { chk("R22 integration_base",                                              // PA4 §4.7 rework subtree recovery
+          integration_base("test/engine.integration.test.js")=="engine"
+       && integration_base("test/bird.test.js")=="bird" && integration_base("src/pipes.js")=="pipes"); }
+    { chk("R23 tool_call_truncated",                                           // PA4 v47: cap-truncation guard
+          tool_call_truncated("blah <create_file><path>x</path><content>partial...")
+       && !tool_call_truncated("<create_file><path>x</path><content>full</content></create_file>")
+       && !tool_call_truncated("no tool call here")); }
+    fprintf(stderr, "  %s (%d/23 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 23-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -1730,6 +1916,34 @@ static void finalize_verify(const WorkOrder &wo,
         gen_tests_for(untested0, mods);
     }
 
+    // ── PA4 §4.7: INTEGRATION tests for INTERNAL nodes (modules that reference siblings) — compose the
+    //    REAL subtree, stub only the external boundary. Independent modules (no refs) get none → zero cost
+    //    on the scale task; coupled apps get one per internal node. A failure maps to no single module →
+    //    routed to L2 by the verify loop (only the arbiter can attribute a multi-module failure). ──
+    if (!mods.empty()) {
+        std::vector<std::string> bases;
+        for (auto &m : mods) bases.push_back(comp_key(m));
+        std::vector<std::string> iitems, iids;
+        for (auto &m : mods) {
+            std::string base = comp_key(m), content = read_file_str(m);
+            auto refs = module_refs(content, base, bases);
+            if (refs.empty()) continue;                                              // leaf → unit test only
+            if (fs::exists(std::string(g_work_dir) + "/test/" + base + ".integration.test.js", ec)) continue;
+            std::string sib;
+            for (auto &rb : refs) for (auto &mm : mods) if (comp_key(mm) == rb) {
+                sib += "// src/" + rb + ".js\n```js\n" + read_file_str(mm) + "\n```\n"; break; }
+            iitems.push_back(stage_item(goal_ctx, build_integration_task(goal_ctx, base, content, sib)));
+            iids.push_back("test/" + base + ".integration.test.js");
+        }
+        if (!iitems.empty()) {
+            fprintf(stderr, "\n══ PA4 §4.7 INTEGRATION TEST-GEN — %d internal node(s) ══\n", (int)iitems.size());
+            std::vector<std::string> iouts; run_pool(iitems, n_lanes, max_new, &iouts, stage_prefix(goal_ctx));
+            std::vector<std::pair<std::string,std::string>> itrs;
+            for (size_t i = 0; i < iids.size() && i < iouts.size(); i++) itrs.push_back({ iids[i], strip_think(iouts[i]) });
+            run_worker_tools(itrs);
+        }
+    }
+
     // ── VERIFY + REPAIR (PA.4c): run all tests; on failure amend the module & re-verify ──
     struct TestRes { std::string rel; bool ok; std::string out; };
     auto run_all_tests = [&]() {
@@ -1771,6 +1985,7 @@ static void finalize_verify(const WorkOrder &wo,
 
     int  arbiter_rounds = 0;     // PA.4d: boss arbiter escalates up to ARBITER_BUDGET times (multi-round)
     const int ARBITER_BUDGET = 2;
+    std::string arbiter_diag;    // PA4 §4.6: persist the arbiter's reasoning across escalations (history bundle)
     int  prev_failed = -1;       // PA.4 #4: escalate sooner when an L1 round stops making progress
     std::map<std::string,std::string> journal;   // PA.4: per-component repair-attempt history (user, 2026-06-16)
     auto j_append = [&](const std::string &comp, const std::string &lvl, int rnd, const std::string &out) {
@@ -1804,6 +2019,23 @@ static void finalize_verify(const WorkOrder &wo,
                     prev_failed, issues);
             act = RA_GIVEUP;
         }
+        // PA4 §4.6: a failing test asserting the SAME call to DIFFERENT values is unsatisfiable by ANY
+        // module — L1 (module-only) can never fix it → escalate straight to the boss arbiter (only it may
+        // edit a test). Detect a contradiction among the failing tests and force the L2 path now.
+        if (act == RA_REPAIR) {
+            for (auto &r : fails) {
+                if (module_for_test(std::filesystem::path(r.rel).filename().string(), curmods).empty()) {
+                    fprintf(stderr, "  (test %s maps to no single module: integration/orphan, only L2 can attribute it)\n", r.rel.c_str());
+                    act = RA_GIVEUP; break;   // §4.7: integration failures route straight to the boss arbiter
+                }
+                auto bad = contradictory_asserts(read_file_str(std::string(g_work_dir) + "/" + r.rel));
+                if (!bad.empty()) {
+                    fprintf(stderr, "  (contradictory test %s asserts %s to multiple values — unsatisfiable → arbiter)\n",
+                            r.rel.c_str(), bad[0].c_str());
+                    act = RA_GIVEUP; break;
+                }
+            }
+        }
         prev_failed = issues;
         if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
         if (act == RA_GIVEUP) {
@@ -1813,6 +2045,9 @@ static void finalize_verify(const WorkOrder &wo,
                         arbiter_rounds, ARBITER_BUDGET, (int)fails.size());
                 std::string contract = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
                 std::vector<std::string> mods = list_modules(); std::string fb;
+                if (!arbiter_diag.empty())   // §4.6 history bundle: the prior escalation's reasoning, so round 2 refines round 1
+                    fb += "PRIOR ARBITER REASONING (you already judged these — refine, do NOT repeat rejected approaches):\n"
+                          + arbiter_diag + "\n";
                 for (auto &r : fails) {
                     std::string testfn = std::filesystem::path(r.rel).filename().string();
                     std::string modpath = module_for_test(testfn, mods);
@@ -1822,31 +2057,32 @@ static void finalize_verify(const WorkOrder &wo,
                     if (!journal[comp].empty()) fb += "PRIOR ATTEMPTS (already tried — if these failed, the SPEC "
                                                       "may be ambiguous → RESPEC design/" + comp + ".blueprint):\n" + journal[comp];
                     if (!modpath.empty()) fb += "MODULE " + modrel + ":\n" + read_file_str(modpath) + "\n";
+                    { auto bad = contradictory_asserts(read_file_str(std::string(g_work_dir) + "/" + r.rel));   // §4.6 lint
+                      if (!bad.empty()) fb += "⚠ CONTRADICTORY TEST — it asserts " + bad[0] + " to MULTIPLE expected "
+                                              "values (unsatisfiable by ANY module): the TEST is the bug — fix it.\n"; }
+                    fb += frame_executed_truth(r.out);   // §4.6 executed-truth: trust the run, not re-derivation
                     fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\nERROR:\n" + r.out + "\n";
                 }
                 std::string aprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", build_arbiter_user(contract, fb)} });
-                auto reworks = reworks_from_plan(strip_think(boss_generate(aprompt, 2048)));   // boss judges (thinks) → work-order
+                std::string araw = strip_think(boss_generate(aprompt, 2048));   // boss judges (thinks) → work-order
+                arbiter_diag += "── escalation " + std::to_string(arbiter_rounds) + " ──\n" + araw + "\n\n";   // §4.6 persist diagnosis
+                auto reworks = reworks_from_plan(araw);
                 fprintf(stderr, "  boss requested %d rework item(s)\n", (int)reworks.size());
                 if (!reworks.empty()) {
                     std::vector<std::string> ritems, rids;
                     for (auto &rw : reworks) {
                         std::string tgt = rw.first;
-                        std::string fn = std::filesystem::path(tgt).filename().string(), comp = fn;
-                        { size_t s = comp.find(".test.js");
-                          if (s != std::string::npos) comp = comp.substr(0, s);
-                          else { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); } }
-                        std::string modpath = module_for_test(comp + ".test.js", mods);
+                        std::string comp  = comp_key(tgt);                // "engine.integration" for an integration test
+                        std::string rbase = integration_base(tgt);        // §4.7: the real component ("engine"); == comp for normal targets
+                        std::string modpath = module_for_test(rbase + ".test.js", mods);   // subtree-root module (src/engine.js)
                         std::string spec =   // contract (authoritative, reconcile-evolved) + the living blueprint
                             (goal_ctx.empty() ? "" : "=== INTERFACE CONTRACT (authoritative; overrides blueprints) ===\n" + goal_ctx + "\n\n")
-                            + "=== blueprint: " + comp + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + comp + ".blueprint");
-                        std::string modc = modpath.empty() ? "" : read_file_str(modpath);
-                        std::string testc, err;                 // pull the comp's test + error from fails
-                        for (auto &r : fails) {
-                            std::string tb = std::filesystem::path(r.rel).filename().string();
-                            size_t s = tb.find(".test.js"); if (s != std::string::npos) tb = tb.substr(0, s);
-                            if (tb == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
-                        }
-                        std::string u = build_rework_user(tgt, spec, modc, testc, err, rw.second,
+                            + "=== blueprint: " + rbase + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + rbase + ".blueprint");
+                        std::string modc = modpath.empty() ? "" : read_file_str(modpath);   // §4.7: collab_for(modc) below adds the subtree
+                        std::string testc, err;                 // pull THIS target's test + error from fails
+                        for (auto &r : fails)
+                            if (comp_key(r.rel) == comp) { testc = read_file_str(std::string(g_work_dir) + "/" + r.rel); err = r.out; break; }
+                        std::string u = build_rework_user(tgt, spec, modc, testc, frame_executed_truth(err) + err, rw.second,
                                                           collab_for(modc, modpath, mods), journal[comp]);
                         std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", u} }, true);
                         if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
@@ -1856,8 +2092,7 @@ static void finalize_verify(const WorkOrder &wo,
                     std::vector<std::pair<std::string,std::string>> rres;
                     for (size_t i = 0; i < rids.size() && i < routs.size(); i++) {
                         rres.push_back({ rids[i], strip_think(routs[i]) });
-                        std::string c = std::filesystem::path(rids[i]).filename().string();   // record the attempt
-                        { size_t s=c.find(".test.js"); if(s!=std::string::npos) c=c.substr(0,s); else { size_t j=c.rfind(".js"); if(j!=std::string::npos) c=c.substr(0,j); } }
+                        std::string c = comp_key(rids[i]);   // record the attempt (comp_key strips .blueprint too — was orphaned)
                         j_append(c, "L2", round, routs[i]);
                     }
                     run_worker_tools(rres);
@@ -1891,7 +2126,8 @@ static void finalize_verify(const WorkOrder &wo,
                 + "=== blueprint: " + base + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + base + ".blueprint");
             std::string modcontent = read_file_str(modpath);
             std::string user = build_amend_user(base, modrel, modcontent,
-                                                read_file_str(std::string(g_work_dir) + "/" + r.rel), r.out, spec,
+                                                read_file_str(std::string(g_work_dir) + "/" + r.rel),
+                                                frame_executed_truth(r.out) + r.out, spec,
                                                 collab_for(modcontent, modpath, mods), journal[base]);
             std::string sp = apply_chat_template({ {"system", worker_preamble_text()}, {"user", user} }, true);
             if (!g_worker_think) sp += "<think>\n\n</think>\n\n";
@@ -1902,8 +2138,7 @@ static void finalize_verify(const WorkOrder &wo,
         std::vector<std::pair<std::string,std::string>> ares;
         for (size_t i = 0; i < aids.size() && i < aouts.size(); i++) {
             ares.push_back({ aids[i], strip_think(aouts[i]) });
-            std::string c = std::filesystem::path(aids[i]).filename().string();   // record the attempt in the journal
-            { size_t j = c.rfind(".js"); if (j != std::string::npos) c = c.substr(0, j); }
+            std::string c = comp_key(aids[i]);   // record the attempt in the journal
             j_append(c, "L1", round, aouts[i]);
         }
         run_worker_tools(ares);   // overwrite the fixed modules; loop re-verifies
@@ -2111,7 +2346,7 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
         std::sort(bps.begin(), bps.end());
         if (!bps.empty()) {
             int N = (int)bps.size();
-            auto groups = reconcile_groups(N, std::min(n_lanes, N));
+            auto groups = reconcile_groups(N, reconcile_parallel_g(N, n_lanes));   // PA.6 §6.3 small-N gate
             std::string contract;
             if (groups.size() <= 1) {                          // small: one serial pass (no merge overhead)
                 std::string all; for (auto &b : bps) all += "=== " + b.first + " ===\n" + b.second + "\n";

@@ -137,3 +137,12 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   re-queue) gates discovered deps. Pure scheduler + makespan sim (`--eager-test` 8/8: **eager 18% <
   barriers** on the measured spread) and active-tool primitives (`--gather-test` T5–T8) are in; the
   `run_pool` mid-stream loop + ready-queue orchestration are next. See `spec/PA7_PIPELINING_DESIGN.md`.
+- **Next (design, 2026-06-22)** — sharpening the verify→repair loop (`spec/PA4_COORDINATION_DESIGN.md`
+  §4.6–4.7), grounded in the `stringUtils.truncate` scale specimen: a per-component **repair history
+  bundle** (persist the arbiter's FULL diagnosis, not just its one-line work-order; carry the cross-round
+  error trajectory; fix the RESPEC `.blueprint` journal-key orphan); **executed-truth over reasoning** (the
+  harness owns the runtime → inject the *executed* actual + the spec rule and rank them above any
+  hand-derived expected; never source expected values from the artifact-under-test → tautology) + a
+  **self-contradiction lint** (two asserts, same input, different expected → straight to L2); and a **test
+  hierarchy** — integration tests *one or more levels up* that compose the **real** sibling subtree and stub
+  only the external boundary (DOM/canvas/clock/RNG), failures routed straight to the boss arbiter.

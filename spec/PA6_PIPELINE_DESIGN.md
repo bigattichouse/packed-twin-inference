@@ -191,6 +191,16 @@ repair + living-blueprint:
 **Takeaway:** packed delivered a clean, fully test-covered, auto-repaired multi-file product (9/12);
 single owns the fast small one-shot. They have different sweet spots — see "How to improve" (§11).
 
+> **Reproducibility NOTE (verified 2026-06-22).** The committed artifacts in `validate/scale_packed`
+> currently re-run at **6/12** — they are the **pre-arbiter first-pass snapshot** (`scale_packed.log` ends
+> exactly at `══ PA.4d ARBITER (escalation 1/2) ══`); the **6→9 arbiter recovery was not preserved on
+> disk**, so 9/12 is not reproducible from the repo as-is (re-run `scale_validate.sh` to regenerate). The 6
+> first-pass survivors are dominated by **test-bugs + spec-ambiguities** — `stringUtils.truncate` (two
+> contradictory assertions on the same input, both hand-reasoned wrong), `numberUtils.toInt(null)`,
+> `objectUtils` Map-handling, `validationUtils` password policy, `colorUtils` float-rounding, `dateUtils`
+> tokens — exactly the class that PA4 §4.6 (executed-truth + history bundle) and the L2 arbiter target. This
+> is *why* §11.A (pass-rate) is the priority.
+
 ---
 
 ## 7. Risks & mitigations
@@ -253,7 +263,13 @@ single serial pass (no merge overhead). The boss MERGE retains final authority, 
 consistency is preserved (the merge sees all partials); the win is that the per-group conflict-
 resolution — the bulk — runs concurrently, and the merge reads *pre-digested* partials, not raw
 blueprints. Biggest win on **independent** components (partials trivial → fast merge); ~neutral on
-heavily-coupled (merge still resolves cross-group). GPU before/after pending.
+heavily-coupled (merge still resolves cross-group). **GPU MEASURED 2026-06-22 (`seq_vs_packed_ab.sh`): at
+small N this HURT.** 6 blueprints triggered the parallel path (`min(lanes,N)=4` groups) → **5 boss
+generations** (4 partials + a merge) vs **1** serial pass — inflating wall with no coherence gain on
+independent components. The `min(lanes,N)` trigger is **too loose**: gate parallel reconcile on **N >>
+lanes** (e.g. `N >= 2*lanes`) and keep the single serial pass otherwise. **IMPLEMENTED 2026-06-23** (`reconcile_parallel_g(N,lanes)`,
+`--coord-test` R19): N < 2·lanes now takes the single serial pass (6 blueprints / 4 lanes → 1 gen, not 5).
+Scale before/after (13 modules) still pending.
 
 ### Future — sharper scheduling (round-robin / orthogonal array, dependency-graph-aware)
 
@@ -290,6 +306,13 @@ budget. Levers:
 - **Minimal failing case** — feed the rework worker the *specific* failing assertion + values, not the
   whole test output, so it targets precisely.
 - **Smarter budget** — more rounds for the few hard cases rather than a flat cap.
+- **Full repair-history bundle (PA4 §4.6)** — persist the **arbiter's full diagnosis** (today only its
+  one-line work-order survives `strip_think`+parse); carry the **cross-round error trajectory**; fix the
+  RESPEC `.blueprint` **journal-key orphan**. A rework worker should see the *entire* history of its item.
+- **Executed-truth over reasoning (PA4 §4.6)** — the harness owns the runtime, so inject the **executed
+  actual** (already in node's `actual !== expected`) + the **spec rule** and rank them above any
+  hand-derived expected; a **self-contradiction lint** (same input, two expecteds) jumps straight to L2.
+  (The `stringUtils.truncate` survivor was a value the test-writer *reasoned* wrong twice.)
 
 **B. Make workers genuinely autonomous — the live tool loop (PA.7b).** `read_file`/`abandon` primitives
 are built; wire the **mid-stream round-trip** so a worker fetches exactly the context it needs (and
@@ -306,3 +329,12 @@ pipeline. Don't run the 116-min pipeline for what single does in seconds.
 
 **E. Right-size the pieces** — worker self-split (§future above) for oversized components; tighter
 triage granularity so pieces are balanced (helps both quality and the straggler tail).
+
+**F. A TEST HIERARCHY — integration tests one or more levels up (PA4 §4.7).** The unit-only layer
+(collaborators stubbed) can't catch composition bugs (the flappy canvas-vs-ctx class) — both sides of a mock
+drift. Add integration tests that **use the real sibling subtree and stub only the external boundary**
+(DOM/canvas/clock/RNG), mirroring the dependency DAG (leaf=unit, internal node=integration, root=smoke);
+integration reds route **straight to L2** (only the arbiter can attribute a multi-module failure).
+Self-targeting: zero cost on the independent-utils scale task, all value on coupled apps. Restores the boss's
+original `smokeTest` intent. Sequenced **after** A's history/executed-truth work, which is what makes
+integration failures repairable.
