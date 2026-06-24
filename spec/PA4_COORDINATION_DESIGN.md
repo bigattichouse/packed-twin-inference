@@ -445,6 +445,14 @@ a root smoke test → integration reds skip to the arbiter. GPU-free fixture: a 
 sibling + one external stub). Rationale for sequencing: building integration first would only generate
 harder-to-attribute failures into a loop that cannot yet repair them.
 
+**IMPLEMENTED 2026-06-23:** `module_refs()` (whole-word dep-edge detection, `--coord-test` R20) classifies
+leaf vs internal node; `build_integration_task()` (R21) composes the REAL target + REAL siblings, stubbing
+only the external boundary, output → `test/<node>.integration.test.js`. `finalize_verify` generates one per
+internal node after unit test-gen (independent modules reference no siblings → none, so **zero cost on the
+scale task**); a failing test that maps to no single module now **escalates straight to L2** (was a silent
+break). **Partial:** no dedicated root smoke test yet; integration-rework context could be enriched with the
+subtree code; GPU end-to-end pending.
+
 ---
 
 ## 5. Boss reports to the user — the live board

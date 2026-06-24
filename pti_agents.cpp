@@ -1427,6 +1427,38 @@ static std::string frame_executed_truth(const std::string &err) {
            "the TEST is wrong; otherwise the module.\n";
 }
 
+// ── PA4 §4.7 integration-test layer (pure; unit-tested via --coord-test) ───────────────────────
+// Which OTHER generated modules does `content` reference? The dep edges that decide integration tests:
+// an internal node (refs >=1 sibling) gets an integration test against the REAL siblings; a leaf (refs
+// none) gets only its unit test. Whole-word match on the basename (avoids 'bird' inside 'blackbird').
+static std::vector<std::string> module_refs(const std::string &content, const std::string &self_base,
+                                            const std::vector<std::string> &all_bases) {
+    auto idchar = [](char c){ return isalnum((unsigned char)c) || c == '_'; };
+    std::vector<std::string> out;
+    for (auto &b : all_bases) {
+        if (b.empty() || b == self_base) continue;
+        for (size_t p = 0; (p = content.find(b, p)) != std::string::npos; p += b.size()) {
+            char bef = p ? content[p-1] : ' ', aft = p + b.size() < content.size() ? content[p + b.size()] : ' ';
+            if (!idchar(bef) && !idchar(aft)) { out.push_back(b); break; }
+        }
+    }
+    return out;
+}
+// Build the integration-test task for an internal node — compose the REAL target + REAL siblings (mock
+// ONLY the external boundary), test the contract's wiring. Output → test/<t>.integration.test.js, which
+// the verifier runs like any *.test.js; a failure maps to no single module → routes to the L2 arbiter.
+static std::string build_integration_task(const std::string &goal, const std::string &target,
+                                          const std::string &target_code, const std::string &sibling_code) {
+    return "Write a Node.js INTEGRATION test for `" + target + "` that composes it with its REAL "
+           "collaborators — require the ACTUAL sibling modules below, do NOT mock them. Stub ONLY the "
+           "external boundary (DOM/canvas/timers/RNG/network/fs), nothing internal. Assert that the wiring "
+           "the contract specifies works end-to-end (the methods each calls on the other exist and behave), "
+           "with console.assert + process.exit(1) on any failure.\n\n"
+           "Project goal/contract:\n" + goal + "\n\nTarget (src/" + target + ".js):\n```js\n" + target_code +
+           "\n```\n\nREAL collaborators (require these, do NOT mock):\n" + sibling_code +
+           "\n\nWrite ONLY the test via create_file at test/" + target + ".integration.test.js. No prose.";
+}
+
 // Amend instruction (user turn) for a failing module — fix the code so its test passes.
 // Gives the worker the full context (it's a fresh session): SPEC + module + test + error.
 static std::string build_amend_user(const std::string &base, const std::string &modpath,
@@ -1619,7 +1651,17 @@ static int coord_self_test() {
     { chk("R19 reconcile gate (N>=2*lanes)",                                    // PA.6 §6.3 small-N regression fix
           reconcile_parallel_g(6,4)==1 && reconcile_parallel_g(13,4)==4 && reconcile_parallel_g(8,4)==4
        && reconcile_parallel_g(3,2)==1); }
-    fprintf(stderr, "  %s (%d/19 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 19-fail);
+    { std::vector<std::string> bases = {"bird","pipes","engine","renderer"};                 // PA4 §4.7
+      auto r = module_refs("const bird=require('./bird'); renderer.draw(bird);", "engine", bases);
+      bool ok = std::find(r.begin(),r.end(),"bird")!=r.end() && std::find(r.begin(),r.end(),"renderer")!=r.end()
+             && std::find(r.begin(),r.end(),"pipes")==r.end() && std::find(r.begin(),r.end(),"engine")==r.end();
+      auto leaf = module_refs("function add(a,b){return a+b;}", "math", bases);              // refs nothing → leaf
+      auto noword = module_refs("blackbird flies", "x", {"bird"});                            // whole-word: no match
+      chk("R20 module_refs (internal/leaf/whole-word)", ok && leaf.empty() && noword.empty()); }
+    { std::string t = build_integration_task("GOAL", "engine", "CODEX", "// bird.js\nstub");
+      chk("R21 build_integration_task", t.find("engine")!=std::string::npos && t.find("do NOT mock")!=std::string::npos
+                                     && t.find("integration.test.js")!=std::string::npos && t.find("CODEX")!=std::string::npos); }
+    fprintf(stderr, "  %s (%d/21 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 21-fail);
     return fail > 0 ? 5 : 0;
 }
 
@@ -1847,6 +1889,34 @@ static void finalize_verify(const WorkOrder &wo,
         gen_tests_for(untested0, mods);
     }
 
+    // ── PA4 §4.7: INTEGRATION tests for INTERNAL nodes (modules that reference siblings) — compose the
+    //    REAL subtree, stub only the external boundary. Independent modules (no refs) get none → zero cost
+    //    on the scale task; coupled apps get one per internal node. A failure maps to no single module →
+    //    routed to L2 by the verify loop (only the arbiter can attribute a multi-module failure). ──
+    if (!mods.empty()) {
+        std::vector<std::string> bases;
+        for (auto &m : mods) bases.push_back(comp_key(m));
+        std::vector<std::string> iitems, iids;
+        for (auto &m : mods) {
+            std::string base = comp_key(m), content = read_file_str(m);
+            auto refs = module_refs(content, base, bases);
+            if (refs.empty()) continue;                                              // leaf → unit test only
+            if (fs::exists(std::string(g_work_dir) + "/test/" + base + ".integration.test.js", ec)) continue;
+            std::string sib;
+            for (auto &rb : refs) for (auto &mm : mods) if (comp_key(mm) == rb) {
+                sib += "// src/" + rb + ".js\n```js\n" + read_file_str(mm) + "\n```\n"; break; }
+            iitems.push_back(stage_item(goal_ctx, build_integration_task(goal_ctx, base, content, sib)));
+            iids.push_back("test/" + base + ".integration.test.js");
+        }
+        if (!iitems.empty()) {
+            fprintf(stderr, "\n══ PA4 §4.7 INTEGRATION TEST-GEN — %d internal node(s) ══\n", (int)iitems.size());
+            std::vector<std::string> iouts; run_pool(iitems, n_lanes, max_new, &iouts, stage_prefix(goal_ctx));
+            std::vector<std::pair<std::string,std::string>> itrs;
+            for (size_t i = 0; i < iids.size() && i < iouts.size(); i++) itrs.push_back({ iids[i], strip_think(iouts[i]) });
+            run_worker_tools(itrs);
+        }
+    }
+
     // ── VERIFY + REPAIR (PA.4c): run all tests; on failure amend the module & re-verify ──
     struct TestRes { std::string rel; bool ok; std::string out; };
     auto run_all_tests = [&]() {
@@ -1927,6 +1997,10 @@ static void finalize_verify(const WorkOrder &wo,
         // edit a test). Detect a contradiction among the failing tests and force the L2 path now.
         if (act == RA_REPAIR) {
             for (auto &r : fails) {
+                if (module_for_test(std::filesystem::path(r.rel).filename().string(), curmods).empty()) {
+                    fprintf(stderr, "  (test %s maps to no single module: integration/orphan, only L2 can attribute it)\n", r.rel.c_str());
+                    act = RA_GIVEUP; break;   // §4.7: integration failures route straight to the boss arbiter
+                }
                 auto bad = contradictory_asserts(read_file_str(std::string(g_work_dir) + "/" + r.rel));
                 if (!bad.empty()) {
                     fprintf(stderr, "  (contradictory test %s asserts %s to multiple values — unsatisfiable → arbiter)\n",
