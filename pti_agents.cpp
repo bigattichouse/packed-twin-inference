@@ -916,6 +916,9 @@ static std::string worker_preamble_text() {
              "process.exit(1) on ANY failure — it must be runnable as `node <name>.test.js` and exit "
              "non-zero when it fails. A VERIFIER runs every test file at the end; your code must pass.\n"
              "Emit one create_file per file (module, then its test). RELATIVE paths only.";
+        p += "\n\nIf you DISCOVER a concrete project fact others must know (e.g. the database engine, a "
+             "runtime version, a required dependency), record it on its own line: `SET_VAR key=value` "
+             "(e.g. `SET_VAR db_engine=mysql`). It is saved and shared with every other agent.";
     }
     return p;
 }
@@ -1224,6 +1227,9 @@ static bool tool_call_truncated(const std::string &out) {
         size_t p = out.rfind(o); return p != std::string::npos && out.find(c, p) == std::string::npos; };
     return open_no_close("<create_file>", "</create_file>") || open_no_close("<content>", "</content>");
 }
+static int vars_absorb(const std::string &);   // PA.8 §9.1 (defined below) — discover SET_VAR facts
+static void vars_save();                        // PA.8 §9.1 (defined below)
+static std::string vars_path();                 // PA.8 §9.1 (defined below)
 static std::string run_worker_tools(
     const std::vector<std::pair<std::string,std::string>> &worker_results) {
     namespace fs = std::filesystem;
@@ -1280,6 +1286,10 @@ static std::string run_worker_tools(
             }
         }
     }
+    // PA.8 §9.1: absorb any `SET_VAR key=value` facts a worker/tester discovered (e.g. db_engine=mysql) into
+    // the store + persist to .blackboard/memory, so every later lane carries them.
+    int nv = 0; for (auto &wr : worker_results) nv += vars_absorb(wr.second);
+    if (nv) { vars_save(); fprintf(stderr, "  ⊕ %d discovered variable(s) → %s\n", nv, vars_path().c_str()); }
     return report;
 }
 
@@ -1362,6 +1372,71 @@ static bool is_src_file (const std::string &fn) { return has_suffix(fn, g_stack.
 static std::string test_file_name(const std::string &comp) { return comp + g_stack.test_suffix; }   // "bird.test.js"
 static std::string src_file_name (const std::string &comp) { return comp + g_stack.src_ext; }        // "bird.js"
 static std::string run_test_cmd  (const std::string &rel)  { return g_stack.runner + " '" + rel + "'"; }
+
+// ── PA.8 §9.1: the session VARIABLE STORE — named key-value facts (resolved stack decisions + DISCOVERED
+// environment facts like "db_engine=mysql"). Persisted ONE LINE PER ITEM (`key = value`) in
+// <project>/.blackboard/memory — git-diffable + hand-editable, and the SAME syntax as the `SET_VAR
+// key=value` discovery marker a worker emits. Schema vars are single-line by nature; a rare multiline
+// freeform note escapes newline as `\n` (and `\\`), so the one-line-per-item invariant always holds. The
+// blackboard lives in the PROJECT (default <work-dir>/.blackboard) or a --blackboard override (the user's
+// home-project location). Pure helpers; --coord-test R26-R28. ─────────────────────────────────────────────
+static char g_blackboard[512] = "";   // --blackboard DIR override; default = <work-dir>/.blackboard
+static std::map<std::string,std::string> g_vars;
+static std::string blackboard_dir() { return g_blackboard[0] ? std::string(g_blackboard)
+                                                             : std::string(g_work_dir) + "/.blackboard"; }
+static std::string vars_path()      { return blackboard_dir() + "/memory"; }
+static std::string line_escape(const std::string &s) {   // keep one line per item: newline/backslash only
+    std::string o; o.reserve(s.size());
+    for (char c : s) { if (c == '\\') o += "\\\\"; else if (c == '\n') o += "\\n"; else if (c == '\r') {} else o += c; }
+    return o;
+}
+static std::string line_unescape(const std::string &s) {
+    std::string o; o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i+1 < s.size()) { char e = s[++i]; o += (e == 'n') ? '\n' : e; }
+        else o += s[i];
+    }
+    return o;
+}
+static std::map<std::string,std::string> vars_parse(const std::string &s) {   // line-based `key = value`
+    std::map<std::string,std::string> out; size_t i = 0;
+    while (i <= s.size()) {
+        size_t nl = s.find('\n', i); std::string line = s.substr(i, (nl == std::string::npos ? s.size() : nl) - i);
+        i = (nl == std::string::npos) ? s.size() + 1 : nl + 1;
+        std::string t = trim(line);
+        if (t.empty() || t[0] == '#') continue;                  // blank / comment lines ignored (hand-edit friendly)
+        size_t eq = t.find('=');  if (eq == std::string::npos) continue;   // split on the FIRST '=' (values may contain '=')
+        std::string k = trim(t.substr(0, eq)), v = trim(t.substr(eq + 1));
+        if (!k.empty()) out[k] = line_unescape(v);
+    }
+    return out;
+}
+static void vars_save() {
+    std::error_code ec; std::filesystem::create_directories(blackboard_dir(), ec);
+    FILE *f = fopen(vars_path().c_str(), "w"); if (!f) return;
+    for (auto &kv : g_vars) fprintf(f, "%s = %s\n", kv.first.c_str(), line_escape(kv.second).c_str());
+    fclose(f);
+}
+static void vars_load() {   // loaded values WIN over later stack-defaults (precedence: stored > inferred)
+    FILE *f = fopen(vars_path().c_str(), "r"); if (!f) return;
+    std::string s; char b[4096]; size_t k; while ((k = fread(b,1,sizeof(b),f)) > 0) s.append(b,k); fclose(f);
+    for (auto &kv : vars_parse(s)) g_vars[kv.first] = kv.second;
+}
+static void vars_seed_from_stack() { g_vars.emplace("lang", g_stack.lang); g_vars.emplace("src_ext", g_stack.src_ext);
+                                     g_vars.emplace("test_suffix", g_stack.test_suffix); g_vars.emplace("runner", g_stack.runner); }
+static std::string vars_render() {
+    if (g_vars.empty()) return "";
+    std::string o = "PROJECT VARIABLES (resolved decisions — conform to ALL of these):\n";
+    for (auto &kv : g_vars) o += "  " + kv.first + " = " + kv.second + "\n";
+    return o;
+}
+// discovered facts: a worker/tester emits `SET_VAR key=value` (e.g. SET_VAR db_engine=mysql) → merge into the store.
+static int vars_absorb(const std::string &worker_out) {
+    static const std::regex re(R"(SET_VAR\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\n]+))");
+    int n = 0; for (std::sregex_iterator it(worker_out.begin(), worker_out.end(), re), e; it != e; ++it) {
+        g_vars[(*it)[1].str()] = trim((*it)[2].str()); n++; }
+    return n;
+}
 
 // Which module a failing test targets: "bird.test.js" -> the module whose base is "bird".
 static std::string module_for_test(const std::string &test_filename,
@@ -1727,7 +1802,21 @@ static int coord_self_test() {
                 && test_file_name("bird")=="bird_test.py";
       g_stack = sv;
       chk("R25 file helpers (js+python)", ok_js && ok_py); }
-    fprintf(stderr, "  %s (%d/25 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 25-fail);
+    { auto m = vars_parse("# a comment\nlang = javascript\ndb_url = postgres://h/db?x=1\n\nnote = a\\nb\n");  // PA.8 §9.1
+      chk("R26 vars_parse (comments, '=' in value, escape)",
+          m["lang"]=="javascript" && m["db_url"]=="postgres://h/db?x=1" && m["note"]=="a\nb" && m.count("# a comment")==0); }
+    { std::map<std::string,std::string> sv = g_vars; g_vars.clear();                          // round-trip via parse(save-format)
+      g_vars["lang"]="javascript"; g_vars["note"]="line1\nline2";
+      std::string ser; for (auto &kv : g_vars) ser += kv.first + " = " + line_escape(kv.second) + "\n";
+      auto back = vars_parse(ser); g_vars = sv;
+      chk("R27 vars round-trip (multiline escaped)", back["lang"]=="javascript" && back["note"]=="line1\nline2"
+                                                  && ser.find("line1\\nline2")!=std::string::npos); }
+    { std::map<std::string,std::string> sv = g_vars; g_vars.clear();                          // SET_VAR discovery marker
+      int n = vars_absorb("...reasoning...\nSET_VAR db_engine=mysql\nSET_VAR storage = MyISAM\nmore text\n");
+      bool ok = n==2 && g_vars["db_engine"]=="mysql" && g_vars["storage"]=="MyISAM";
+      g_vars = sv;
+      chk("R28 vars_absorb (SET_VAR discovery)", ok); }
+    fprintf(stderr, "  %s (%d/28 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 28-fail);
     g_stack = _sv_stack;   // restore (the suite pins javascript for its JS fixtures)
     return fail > 0 ? 5 : 0;
 }
@@ -1921,6 +2010,7 @@ static void finalize_verify(const WorkOrder &wo,
     // The project goal/contract: the reconciled INTERFACE.md if present, else the triage shared block.
     std::string contract0 = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
     std::string goal_ctx = contract0.empty() ? wo.shared : contract0;
+    { std::string vr = vars_render(); if (!vr.empty()) goal_ctx = vr + "\n" + goal_ctx; }   // PA.8 §9.1: vars into test-gen/repair context
     // Generate + store a test per TARGET module — reused for the initial pass AND for untested modules
     // discovered in the repair phase (user, 2026-06-16: "untested modules trigger test job requests").
     auto gen_tests_for = [&](const std::vector<std::string> &targets, const std::vector<std::string> &allmods) {
@@ -2355,6 +2445,8 @@ static void run_pipeline_staged(const std::string &task, int n_lanes, int max_ne
         if (wo.pieces.empty()) { fprintf(stderr, "PA.6 triage produced only test pieces — nothing to build\n"); return; }
     }
     std::string goal = build_goal_blueprint(wo);
+    { std::string vr = vars_render();   // PA.8 §9.1: prepend resolved/discovered variables to the shared goal (cached prefix)
+      if (!vr.empty()) goal = vr + "\n" + goal; }
 
     // ── DESIGN pool (parallel, THINKING) → design/<id>.blueprint ──
     bool sv_wt = g_worker_think; SParams sv_sp = g_worker_sp;
@@ -2878,6 +2970,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
         else if (!strcmp(argv[i], "--repair-budget") && i+1 < argc) g_repair_budget = atoi(argv[++i]);  // PA.4c
         else if (!strcmp(argv[i], "--lang") && i+1 < argc) g_stack = stack_profile(argv[++i]);   // PA.8 §9 stack profile
+        else if (!strcmp(argv[i], "--blackboard") && i+1 < argc) strncpy(g_blackboard, argv[++i], sizeof(g_blackboard)-1);  // PA.8 §9.1
         else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
         else { fprintf(stderr, "Usage: %s -m <model> [-p \"task\"] [-s streams(1-%d)] [-n max] [-c ctx] [--text] [--parse-test] [--pool M] [--plan-only] [--kv-q8|--kv-f16] [--no-think] [--all-think] [--no-stream] [--out FILE] [--no-gather] [--tools] [--allow-run] [--work-dir DIR] [--mtp] [-t temp] [--general] [--seed N] [--repair-budget N] [--verbose]\n", argv[0], MAX_STREAMS); return 1; }
@@ -2888,6 +2981,10 @@ int main(int argc, char **argv) {
     if (coord_test)  return coord_self_test();   // PA.4c: GPU-free repair-loop bookkeeping self-test
     if (eager_test)  return eager_self_test();   // PA.7: GPU-free eager-scheduling core self-test
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
+    if (g_tools) {   // PA.8 §9.1: seed the variable store from the stack profile, then let .blackboard/memory override
+        vars_seed_from_stack(); vars_load();
+        if (!g_vars.empty()) fprintf(stderr, "── PA.8 vars (%s): %zu loaded ──\n", vars_path().c_str(), g_vars.size());
+    }
     if (n_streams < 1) n_streams = 1;
     if (n_streams > MAX_STREAMS) { fprintf(stderr, "note: clamping -s to MAX_STREAMS=%d\n", MAX_STREAMS); n_streams = MAX_STREAMS; }
     if (task[0] && max_new == 96) max_new = 768;   // small pooled work items: think + a function

@@ -198,6 +198,20 @@ schema + the store, **(b)** variabilize the prompts against it, **(c)** populate
 `set_var` discovery marker + the variable-invalidation rework trigger. The `StackProfile` (§9 Layer 1a) is
 the first typed entries.
 
+**Store IMPLEMENTED 2026-06-24 (`--coord-test` R26-R28).** Format decision (user): **one line per item**,
+not JSON — `key = value`, in `<project>/.blackboard/memory` (default `<work-dir>/.blackboard`, or
+`--blackboard DIR` for the user's home-project location). Rationale: git-diffable (one var changed = one
+line), hand-editable (`#` comments + blank lines ignored), and the **same syntax as the `SET_VAR key=value`
+discovery marker** — store line and marker are identical. **Multiline:** schema vars are single-line by
+nature; a rare freeform note escapes newline → `\n` (and `\\`), so one-line-per-item always holds. Split on
+the **first** `=` (values may contain `=`, e.g. a connection string). Wiring: `vars_seed_from_stack` +
+`vars_load` at startup (stored > stack-default); `vars_render()` prepends the block to the shared goal +
+the test-gen/repair context (cached prefix); `run_worker_tools` runs `vars_absorb` on every worker output
+and `vars_save`s discoveries; the worker preamble advertises `SET_VAR`. **Still Layer 2:** the prompts'
+hardcoded `console.assert`/`node`/`*.test.js` aren't yet templated against the vars (needs
+`assertion_style`/`test_framework` entries); the **variable-invalidation rework trigger** isn't wired
+(discovery updates the store + flows to later lanes, but doesn't yet re-queue already-built violators).
+
 ## 10. The session-start contract
 
 The client announces, up front (MCP-shaped): its **tools + schemas**, its **locality** (local/remote), its
