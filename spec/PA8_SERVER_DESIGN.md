@@ -225,6 +225,42 @@ injects `pytest`. JS is a verified no-op (29/29; gather/eager/mtp green). **Rema
 templating); the **stack-resolution front-end** (boss infers lang/framework from the task/dialog and seeds
 the store, §9 levels 2-4) and the **variable-invalidation rework trigger** are still unbuilt.
 
+## 9.2 Stack resolution — folded into triage, not a separate stage (user, 2026-06-24)
+
+Where does "what language / framework?" get decided? **Folded into triage**, *not* a standalone analysis
+stage. Triage is the one serial bottleneck (PA6 §7: keep it light), and in the common cases stack choice is
+a **lookup, not deliberation** — brownfield detects it from `package.json`/`requirements.txt`/`Cargo.toml`
+(zero model cost, before triage); "build X in javascript" states it; an obvious greenfield ("a web game" →
+JS/canvas) is a one-line inference. Triage already reads the task once to build the component map; emitting
+the resolved stack alongside it is one more output line, not a stage.
+
+**Consequential + uncertain → ASK, don't analyze.** Framework choice ripples into every file (the instinct
+behind "analysis step"). But the fix for "consequential and unsure" is **ask the user** (cheap,
+authoritative, and exactly the §9.1 precedence: user-explicit beats inference) — not a deep autonomous
+analysis that might pick `vitest` when they wanted `jest`. So genuine ambiguity routes to the §4.2 ASK
+channel. That leaves "analyze" a *narrow* band: greenfield + must-decide-autonomously + enough signal to
+weigh — rare, not worth a default stage.
+
+**Language vs framework-within-language.** Language is almost always stated/detected/obvious. The
+framework *within* a language (vitest vs jest, pytest vs unittest) is where "best framework" has teeth — but
+even there the default is **detect-the-project's** or **convention** (pytest, vitest), not analyze, unless
+the user cares. And it's a **living variable** (§9.1): a worker can `SET_VAR test_framework=…` mid-run if a
+discovery forces it ("needs async fixtures → pytest"). Not a one-shot front-end decision to nail perfectly.
+
+**Resolution order — per dimension, cheapest signal first:**
+1. **detect** (brownfield files / client-declared stack, §10) — free, authoritative;
+2. **user-stated** (prompt or dialog) — authoritative;
+3. **convention** for the language (pytest, vitest) — cheap default;
+4. **infer** in triage — only the dimensions still unresolved;
+5. **ask** (§4.2) — only when consequential *and* uncertain *and* a user is reachable;
+6. **discover** mid-run (`SET_VAR`, §9.1) — revises any of the above.
+
+Triage owns 3–4 (it is the "establish ground truth" front-end); 1–2 seed the store pre-triage; 5–6 are
+existing channels. So the build is a **`resolve_stack` step inside triage** that writes the resolved
+dimensions to the variable store (§9.1) before design/implement consume them via `test_directive()` (§9
+Layer 2) — consistent with "triage establishes the pivot; downstream is mode-agnostic." **Not built;
+design captured.**
+
 ## 10. The session-start contract
 
 The client announces, up front (MCP-shaped): its **tools + schemas**, its **locality** (local/remote), its
