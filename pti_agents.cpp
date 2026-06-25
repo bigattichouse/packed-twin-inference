@@ -902,6 +902,12 @@ static const char *WORKER_PREAMBLE =
     "else — no prose, no other functions, no re-declaring the shared interface. Match the\n"
     "declared signatures exactly. Output only code.";
 
+static std::string test_directive();   // PA.8 Layer 2 (defined with the var store) — stack-neutral test guidance
+static std::string var_or(const std::string &, const std::string &);   // PA.8 Layer 2 (defined below)
+static std::string stk_test_suffix();  // PA.8 Layer 2 (defined with the stack profile) — g_stack.test_suffix
+static std::string stk_module_hint();  // PA.8 Layer 2 (defined with the stack profile) — g_stack.module_hint
+static std::string comp_key(const std::string &);   // PA.4 §4.6 (defined with the stack profile) — bare component key
+
 // Tool-call instructions appended to the worker preamble when --tools is set. Format and verb
 // names match nanocoder's XML convention (../nanocoder, source/app/prompts + source/tools):
 // the tool name is the tag, parameters are nested tags.
@@ -912,9 +918,8 @@ static std::string worker_preamble_text() {
              "parameter is a nested tag):\n"
              "<create_file>\n<path>relative/path.ext</path>\n<content>\n...full file...\n</content>\n</create_file>\n"
              "- Write your module to its file, using the exact path/folders the shared interface specifies.\n"
-             "- ALSO write a matching test file (e.g. <name>.test.js) with console.assert checks that call "
-             "process.exit(1) on ANY failure — it must be runnable as `node <name>.test.js` and exit "
-             "non-zero when it fails. A VERIFIER runs every test file at the end; your code must pass.\n"
+             "- ALSO write a matching test file — " + test_directive() + ". A VERIFIER runs every test "
+             "file at the end; your code must pass.\n"
              "Emit one create_file per file (module, then its test). RELATIVE paths only.";
         p += "\n\nIf you DISCOVER a concrete project fact others must know (e.g. the database engine, a "
              "runtime version, a required dependency), record it on its own line: `SET_VAR key=value` "
@@ -1325,22 +1330,20 @@ static std::string test_user(const std::string &relpath, const std::string &cont
                              const std::string &blueprint, const std::string &collaborators) {
     std::filesystem::path p(relpath);
     std::string base = p.filename().string();
-    size_t dot = base.rfind(".js"); if (dot != std::string::npos) base = base.substr(0, dot);
-    std::string testpath = "test/" + base + ".test.js";
-    return "Write a Node.js unit test for the '" + base + "' module — test it against its SPEC (below), "
+    base = comp_key(base);
+    std::string testpath = "test/" + base + stk_test_suffix();
+    return "Write a unit test for the '" + base + "' module — test it against its SPEC (below), "
         "not merely whatever the current code happens to do. (The project goal + interface contract are "
         "above.)\n\nSpec / blueprint for '" + base + "':\n" + (blueprint.empty() ? "(none on disk)" : blueprint) +
-        "\n\nModule file (" + relpath + "):\n```js\n" + content + "\n```\n" +
+        "\n\nModule file (" + relpath + "):\n```\n" + content + "\n```\n" +
         (collaborators.empty() ? "" :
             "\nCollaborator modules this one interacts with — so your stubs/mocks match the methods "
             "they ACTUALLY call (e.g. a fake canvas must implement every ctx.* method the real code uses):\n"
             + collaborators) +
-        "\nThe test MUST: use **CommonJS** `require` (NOT `import`) — e.g. const m = require('../" + relpath +
-        "'); use ONLY Node built-ins + `console.assert` (NO external packages — do NOT require/import "
-        "`jsdom`, `jest`, `canvas`, etc.; **stub collaborators directly**, e.g. `eng.renderer = { clear(){} }`); "
-        "follow any TECH DECISIONS in the contract above; print a line per check; and call process.exit(1) "
-        "on ANY failure so `node` exits non-zero. Save it with create_file at path: " + testpath +
-        "\nOutput only the create_file tool call.";
+        "\nThe test MUST: be written " + test_directive() + "; import the module via " +
+        var_or("module_hint", stk_module_hint()) + " (e.g. from '../" + relpath + "'); **stub collaborators "
+        "directly** (NO external packages — do NOT pull in jsdom/jest/etc.); follow any TECH DECISIONS in the "
+        "contract above. Save it with create_file at path: " + testpath + "\nOutput only the create_file tool call.";
 }
 
 // ───────────────────────── PA.4c: verify→repair helpers ──────────────────────
@@ -1356,17 +1359,29 @@ struct StackProfile {
     std::string src_ext;      // ".js"       — a module file is <comp> + src_ext
     std::string test_suffix;  // ".test.js"  — a test file is <comp> + test_suffix (the harness controls naming)
     std::string runner;       // "node"      — a test runs as: runner '<relpath>'
+    std::string module_hint;  // PA.8 Layer 2: the export/module-system convention (prompt-templated)
+    std::string test_hint;    // PA.8 Layer 2: the assertion-style + pass/fail convention (prompt-templated)
 };
-static StackProfile g_stack = { "javascript", ".js", ".test.js", "node" };
+static StackProfile g_stack = { "javascript", ".js", ".test.js", "node",
+    "CommonJS (`module.exports` / `require`, NOT `import`)",
+    "use ONLY built-ins + `console.assert` (NO external packages); print a line per check; call `process.exit(1)` on ANY failure" };
 static StackProfile stack_profile(std::string name) {
     for (auto &c : name) c = (char)tolower((unsigned char)c);
-    if (name == "python" || name == "py") return { "python", ".py",  "_test.py",  "python3" };
-    if (name == "sql")                    return { "sql",    ".sql", "_test.sql", "psql -f" };  // illustrative
-    return { "javascript", ".js", ".test.js", "node" };
+    if (name == "python" || name == "py") return { "python", ".py",  "_test.py",  "python3",
+        "standard modules (`def` functions; `import`)",
+        "use plain `assert` statements; print a line per check; exit non-zero (`raise SystemExit(1)`) on ANY failure" };
+    if (name == "sql")                    return { "sql",    ".sql", "_test.sql", "psql -f",   // illustrative
+        "plain SQL scripts (no module system)",
+        "assert via queries returning expected rows; signal failure with a non-zero exit / RAISE" };
+    return { "javascript", ".js", ".test.js", "node",
+        "CommonJS (`module.exports` / `require`, NOT `import`)",
+        "use ONLY built-ins + `console.assert` (NO external packages); print a line per check; call `process.exit(1)` on ANY failure" };
 }
 static bool has_suffix(const std::string &s, const std::string &suf) {
     return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
+static std::string stk_test_suffix() { return g_stack.test_suffix; }   // PA.8 Layer 2: accessors for the early prompt builders
+static std::string stk_module_hint() { return g_stack.module_hint; }
 static bool is_test_file(const std::string &fn) { return has_suffix(fn, g_stack.test_suffix); }
 static bool is_src_file (const std::string &fn) { return has_suffix(fn, g_stack.src_ext) && !is_test_file(fn); }
 static std::string test_file_name(const std::string &comp) { return comp + g_stack.test_suffix; }   // "bird.test.js"
@@ -1436,6 +1451,20 @@ static int vars_absorb(const std::string &worker_out) {
     int n = 0; for (std::sregex_iterator it(worker_out.begin(), worker_out.end(), re), e; it != e; ++it) {
         g_vars[(*it)[1].str()] = trim((*it)[2].str()); n++; }
     return n;
+}
+// PA.8 Layer 2: an effective value — a user/discovered VAR overrides the stack-profile default.
+static std::string var_or(const std::string &key, const std::string &fallback) {
+    auto it = g_vars.find(key); return (it != g_vars.end() && !it->second.empty()) ? it->second : fallback;
+}
+// PA.8 Layer 2: the stack-neutral "how to write + run a test here" directive the prompts template against,
+// instead of hardcoded console.assert/node/CommonJS. Each piece is a var (user-overridable) over the profile.
+static std::string test_directive() {
+    std::string lang = var_or("lang", g_stack.lang);
+    std::string fw   = var_or("test_framework", "");                                  // optional: pytest, vitest, …
+    std::string th   = var_or("test_hint", g_stack.test_hint);
+    std::string d = "in " + lang + ", " + (fw.empty() ? "" : "using the " + fw + " framework, ") + th
+                  + "; runnable with `" + var_or("runner", g_stack.runner) + " <file" + var_or("test_suffix", g_stack.test_suffix) + ">`";
+    return d;
 }
 
 // Which module a failing test targets: "bird.test.js" -> the module whose base is "bird".
@@ -1564,14 +1593,15 @@ static std::vector<std::string> module_refs(const std::string &content, const st
 // the verifier runs like any *.test.js; a failure maps to no single module → routes to the L2 arbiter.
 static std::string build_integration_task(const std::string &goal, const std::string &target,
                                           const std::string &target_code, const std::string &sibling_code) {
-    return "Write a Node.js INTEGRATION test for `" + target + "` that composes it with its REAL "
-           "collaborators — require the ACTUAL sibling modules below, do NOT mock them. Stub ONLY the "
-           "external boundary (DOM/canvas/timers/RNG/network/fs), nothing internal. Assert that the wiring "
-           "the contract specifies works end-to-end (the methods each calls on the other exist and behave), "
-           "with console.assert + process.exit(1) on any failure.\n\n"
-           "Project goal/contract:\n" + goal + "\n\nTarget (src/" + target + ".js):\n```js\n" + target_code +
-           "\n```\n\nREAL collaborators (require these, do NOT mock):\n" + sibling_code +
-           "\n\nWrite ONLY the test via create_file at test/" + target + ".integration.test.js. No prose.";
+    std::string ipath = "test/" + target + ".integration" + g_stack.test_suffix;
+    return "Write an INTEGRATION test for `" + target + "` that composes it with its REAL "
+           "collaborators — import the ACTUAL sibling modules below, do NOT mock them. Stub ONLY the "
+           "external boundary (DOM/canvas/timers/RNG/network/fs/DB), nothing internal. Assert that the wiring "
+           "the contract specifies works end-to-end (the methods each calls on the other exist and behave). "
+           "Write it " + test_directive() + ".\n\n"
+           "Project goal/contract:\n" + goal + "\n\nTarget (src/" + target + g_stack.src_ext + "):\n```\n" + target_code +
+           "\n```\n\nREAL collaborators (import these, do NOT mock):\n" + sibling_code +
+           "\n\nWrite ONLY the test via create_file at " + ipath + ". No prose.";
 }
 // PA4 §4.7: the real component an integration test targets — "test/engine.integration.test.js" → "engine"
 // (so L2 rework gets the subtree-root module + its siblings as context, not an empty module). Pure; R22.
@@ -1816,7 +1846,16 @@ static int coord_self_test() {
       bool ok = n==2 && g_vars["db_engine"]=="mysql" && g_vars["storage"]=="MyISAM";
       g_vars = sv;
       chk("R28 vars_absorb (SET_VAR discovery)", ok); }
-    fprintf(stderr, "  %s (%d/28 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 28-fail);
+    { StackProfile svp = g_stack; std::map<std::string,std::string> svv = g_vars;   // PA.8 Layer 2: prompts retarget
+      g_vars.clear();
+      std::string js = test_directive(); g_stack = stack_profile("python"); std::string py = test_directive();
+      g_vars["test_framework"] = "pytest"; std::string pyfw = test_directive();
+      g_stack = svp; g_vars = svv;
+      chk("R29 test_directive retargets",
+          js.find("javascript")!=std::string::npos && js.find("console.assert")!=std::string::npos
+       && py.find("python")!=std::string::npos && py.find("console.assert")==std::string::npos
+       && pyfw.find("pytest")!=std::string::npos); }
+    fprintf(stderr, "  %s (%d/29 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 29-fail);
     g_stack = _sv_stack;   // restore (the suite pins javascript for its JS fixtures)
     return fail > 0 ? 5 : 0;
 }
@@ -2038,7 +2077,7 @@ static void finalize_verify(const WorkOrder &wo,
         for (auto &m : mods) {
             std::string comp = fs::path(m).filename().string();
             { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
-            if (!fs::exists(std::string(g_work_dir) + "/test/" + comp + ".test.js", ec)) untested0.push_back(m);
+            if (!fs::exists(std::string(g_work_dir) + "/test/" + test_file_name(comp), ec)) untested0.push_back(m);
         }
         fprintf(stderr, "\n══ PA.4 TEST-GEN — %d module(s); %d already tested, generating %d ══\n",
                 (int)mods.size(), (int)(mods.size() - untested0.size()), (int)untested0.size());
@@ -2057,12 +2096,12 @@ static void finalize_verify(const WorkOrder &wo,
             std::string base = comp_key(m), content = read_file_str(m);
             auto refs = module_refs(content, base, bases);
             if (refs.empty()) continue;                                              // leaf → unit test only
-            if (fs::exists(std::string(g_work_dir) + "/test/" + base + ".integration.test.js", ec)) continue;
+            if (fs::exists(std::string(g_work_dir) + "/test/" + base + ".integration" + g_stack.test_suffix, ec)) continue;
             std::string sib;
             for (auto &rb : refs) for (auto &mm : mods) if (comp_key(mm) == rb) {
                 sib += "// src/" + rb + ".js\n```js\n" + read_file_str(mm) + "\n```\n"; break; }
             iitems.push_back(stage_item(goal_ctx, build_integration_task(goal_ctx, base, content, sib)));
-            iids.push_back("test/" + base + ".integration.test.js");
+            iids.push_back("test/" + base + ".integration" + g_stack.test_suffix);
         }
         if (!iitems.empty()) {
             fprintf(stderr, "\n══ PA4 §4.7 INTEGRATION TEST-GEN — %d internal node(s) ══\n", (int)iitems.size());
@@ -2128,7 +2167,7 @@ static void finalize_verify(const WorkOrder &wo,
         for (auto &m : curmods) {
             std::string comp = fs::path(m).filename().string();
             { size_t j = comp.rfind(".js"); if (j != std::string::npos) comp = comp.substr(0, j); }
-            if (!fs::exists(std::string(g_work_dir) + "/test/" + comp + ".test.js", ec)) untested.push_back(m);
+            if (!fs::exists(std::string(g_work_dir) + "/test/" + test_file_name(comp), ec)) untested.push_back(m);
         }
         fprintf(stderr, "\n══ PA.4 VERIFY%s — %d test file(s), %d untested module(s) ══\n",
                 round ? " (re-check)" : "", (int)res.size(), (int)untested.size());
@@ -2181,7 +2220,7 @@ static void finalize_verify(const WorkOrder &wo,
                     std::string testfn = std::filesystem::path(r.rel).filename().string();
                     std::string modpath = module_for_test(testfn, mods);
                     std::string modrel = modpath.empty() ? std::string("(none)") : fs::relative(modpath, g_work_dir, ec).string();
-                    std::string comp = testfn; { size_t s = comp.find(".test.js"); if (s!=std::string::npos) comp = comp.substr(0,s); }
+                    std::string comp = comp_key(testfn);   // PA.8: strip per stack profile
                     fb += "\n--- test " + r.rel + "  (module " + modrel + ") ---\n";
                     if (!journal[comp].empty()) fb += "PRIOR ATTEMPTS (already tried — if these failed, the SPEC "
                                                       "may be ambiguous → RESPEC design/" + comp + ".blueprint):\n" + journal[comp];
@@ -2203,7 +2242,7 @@ static void finalize_verify(const WorkOrder &wo,
                         std::string tgt = rw.first;
                         std::string comp  = comp_key(tgt);                // "engine.integration" for an integration test
                         std::string rbase = integration_base(tgt);        // §4.7: the real component ("engine"); == comp for normal targets
-                        std::string modpath = module_for_test(rbase + ".test.js", mods);   // subtree-root module (src/engine.js)
+                        std::string modpath = module_for_test(test_file_name(rbase), mods);   // subtree-root module (src/engine.js)
                         std::string spec =   // contract (authoritative, reconcile-evolved) + the living blueprint
                             (goal_ctx.empty() ? "" : "=== INTERFACE CONTRACT (authoritative; overrides blueprints) ===\n" + goal_ctx + "\n\n")
                             + "=== blueprint: " + rbase + " ===\n" + read_file_str(std::string(g_work_dir) + "/design/" + rbase + ".blueprint");
@@ -2248,7 +2287,7 @@ static void finalize_verify(const WorkOrder &wo,
             std::string testfn = std::filesystem::path(r.rel).filename().string();
             std::string modpath = module_for_test(testfn, mods);
             if (modpath.empty()) { fprintf(stderr, "  (no module maps to %s — skip)\n", testfn.c_str()); continue; }
-            std::string base = testfn; size_t s = base.find(".test.js"); if (s != std::string::npos) base = base.substr(0, s);
+            std::string base = comp_key(testfn);   // PA.8: strip per stack profile
             std::string modrel = fs::relative(modpath, g_work_dir, ec).string();
             std::string spec =   // contract (authoritative, reconcile-evolved) + the living blueprint
                 (goal_ctx.empty() ? "" : "=== INTERFACE CONTRACT (authoritative; overrides blueprints) ===\n" + goal_ctx + "\n\n")

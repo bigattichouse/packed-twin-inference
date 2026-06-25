@@ -212,6 +212,19 @@ hardcoded `console.assert`/`node`/`*.test.js` aren't yet templated against the v
 `assertion_style`/`test_framework` entries); the **variable-invalidation rework trigger** isn't wired
 (discovery updates the store + flows to later lanes, but doesn't yet re-queue already-built violators).
 
+**Layer 2 IMPLEMENTED 2026-06-24 (`--coord-test` R29).** `StackProfile` gained `module_hint` +
+`test_hint` (the assertion-style/module-system guidance, per-lang); `test_directive()` assembles the
+stack-neutral *"write a test in `<lang>`, [using `<test_framework>`,] `<test_hint>`, runnable with
+`<runner> <file><test_suffix>`"* string, each piece a **var-overridable** profile default (`var_or`). It is
+now interpolated into the **worker preamble**, the **test-gen prompt** (`test_user`), and the **integration
+prompt** (`build_integration_task`) in place of the hardcoded `console.assert`/`node`/`CommonJS`; the path
+literals (`.test.js` / `.integration.test.js`) in `finalize_verify` now use the profile suffix too. R29
+asserts the directive **retargets**: JS→Python drops `console.assert`, and `test_framework=pytest` (a var)
+injects `pytest`. JS is a verified no-op (29/29; gather/eager/mtp green). **Remaining:** the reconcile
+**TECH DECISIONS** prompt still pins CommonJS/Node explicitly (the boss's global call — wants the same
+templating); the **stack-resolution front-end** (boss infers lang/framework from the task/dialog and seeds
+the store, §9 levels 2-4) and the **variable-invalidation rework trigger** are still unbuilt.
+
 ## 10. The session-start contract
 
 The client announces, up front (MCP-shaped): its **tools + schemas**, its **locality** (local/remote), its
