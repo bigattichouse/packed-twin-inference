@@ -1388,6 +1388,44 @@ static std::string test_file_name(const std::string &comp) { return comp + g_sta
 static std::string src_file_name (const std::string &comp) { return comp + g_stack.src_ext; }        // "bird.js"
 static std::string run_test_cmd  (const std::string &rel)  { return g_stack.runner + " '" + rel + "'"; }
 
+// ── PA.8 §9.2: STACK RESOLUTION (folded into the triage front-end, not a separate stage). Per-dimension,
+// cheapest signal first: a project marker file (brownfield), then an explicit mention in the task
+// (user-stated), then the default. Pure helpers (R30/R31); resolve_stack() applies them in main. ─────────
+static bool word_at(const std::string &h, const std::string &n, size_t p) {   // n occurs at p as a whole word
+    auto idc = [](char c){ return isalnum((unsigned char)c) || c == '_' || c == '+'; };
+    char b = p ? h[p-1] : ' ', a = (p + n.size() < h.size()) ? h[p + n.size()] : ' ';
+    return !idc(b) && !idc(a);
+}
+static bool has_word(const std::string &haystack_lc, const std::string &w) {
+    for (size_t p = 0; (p = haystack_lc.find(w, p)) != std::string::npos; p += w.size())
+        if (word_at(haystack_lc, w, p)) return true;
+    return false;
+}
+// explicit language mention in the task text → canonical lang ("" if none). Conservative whole-word match.
+static std::string lang_from_task(const std::string &task) {
+    std::string t = task; for (auto &c : t) c = (char)tolower((unsigned char)c);
+    if (has_word(t,"python")||has_word(t,"pytest")||has_word(t,"django")||has_word(t,"flask")) return "python";
+    if (has_word(t,"javascript")||has_word(t,"node")||has_word(t,"node.js")||has_word(t,"js")) return "javascript";
+    if (has_word(t,"sql")||has_word(t,"postgres")||has_word(t,"postgresql")||has_word(t,"sqlite")) return "sql";
+    return "";
+}
+// a project marker file → the stack it implies ("" if not a marker). Brownfield detection, zero model cost.
+static std::string lang_from_marker(const std::string &filename) {
+    if (filename == "package.json") return "javascript";
+    if (filename == "requirements.txt" || filename == "pyproject.toml" || filename == "setup.py") return "python";
+    return "";
+}
+static std::string detect_lang_in_dir(const std::string &dir) {   // brownfield: scan top-level for a marker
+    std::error_code ec;
+    for (auto it = std::filesystem::directory_iterator(dir, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::string l = lang_from_marker(it->path().filename().string());
+        if (!l.empty()) return l;
+    }
+    return "";
+}
+
 // ── PA.8 §9.1: the session VARIABLE STORE — named key-value facts (resolved stack decisions + DISCOVERED
 // environment facts like "db_engine=mysql"). Persisted ONE LINE PER ITEM (`key = value`) in
 // <project>/.blackboard/memory — git-diffable + hand-editable, and the SAME syntax as the `SET_VAR
@@ -1855,7 +1893,16 @@ static int coord_self_test() {
           js.find("javascript")!=std::string::npos && js.find("console.assert")!=std::string::npos
        && py.find("python")!=std::string::npos && py.find("console.assert")==std::string::npos
        && pyfw.find("pytest")!=std::string::npos); }
-    fprintf(stderr, "  %s (%d/29 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 29-fail);
+    { chk("R30 lang_from_task",                                                   // PA.8 §9.2 user-stated signal
+          lang_from_task("Build a CLI tool in python")=="python"
+       && lang_from_task("a web game in JavaScript")=="javascript"
+       && lang_from_task("design a postgres schema")=="sql"
+       && lang_from_task("build a game").empty()                                  // no explicit signal
+       && lang_from_task("a jszip-like thing").empty()); }                        // whole-word: 'js' not matched in 'jszip'
+    { chk("R31 lang_from_marker",                                                 // PA.8 §9.2 brownfield detect
+          lang_from_marker("package.json")=="javascript" && lang_from_marker("requirements.txt")=="python"
+       && lang_from_marker("pyproject.toml")=="python" && lang_from_marker("README.md").empty()); }
+    fprintf(stderr, "  %s (%d/31 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 31-fail);
     g_stack = _sv_stack;   // restore (the suite pins javascript for its JS fixtures)
     return fail > 0 ? 5 : 0;
 }
@@ -2978,6 +3025,7 @@ int main(int argc, char **argv) {
     bool  plan_only  = false;
     bool  kv_q8      = true;    // Q8 KV default: byte-exactness is a spec-dec artifact, not needed for agents (~2x context)
     bool  no_stream  = false;   // --no-stream: old sequential plan->pool path (for A/B vs streaming)
+    bool  g_lang_explicit = false;   // PA.8 §9.2: did the user pass --lang? (if so, skip task-based resolution)
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-m")   && i+1 < argc) strncpy(model_path, argv[++i], sizeof(model_path)-1);
@@ -3008,7 +3056,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--general")) g_general = true;         // thinking-general temps (1.0)
         else if (!strcmp(argv[i], "--greedy")) g_greedy = true;           // diagnostic: force greedy (no sampling)
         else if (!strcmp(argv[i], "--repair-budget") && i+1 < argc) g_repair_budget = atoi(argv[++i]);  // PA.4c
-        else if (!strcmp(argv[i], "--lang") && i+1 < argc) g_stack = stack_profile(argv[++i]);   // PA.8 §9 stack profile
+        else if (!strcmp(argv[i], "--lang") && i+1 < argc) { g_stack = stack_profile(argv[++i]); g_lang_explicit = true; }   // PA.8 §9
         else if (!strcmp(argv[i], "--blackboard") && i+1 < argc) strncpy(g_blackboard, argv[++i], sizeof(g_blackboard)-1);  // PA.8 §9.1
         else if (!strcmp(argv[i], "--seed") && i+1 < argc) g_seed = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--verbose"))  g_verbose_logs = true;
@@ -3020,7 +3068,19 @@ int main(int argc, char **argv) {
     if (coord_test)  return coord_self_test();   // PA.4c: GPU-free repair-loop bookkeeping self-test
     if (eager_test)  return eager_self_test();   // PA.7: GPU-free eager-scheduling core self-test
     if (!model_path[0]) { fprintf(stderr, "Error: -m required\n"); return 1; }
-    if (g_tools) {   // PA.8 §9.1: seed the variable store from the stack profile, then let .blackboard/memory override
+    if (g_tools) {
+        if (!g_lang_explicit) {   // PA.8 §9.2: resolve the stack from the task (folded into the triage front-end)
+            std::string detected = detect_lang_in_dir(g_work_dir);   // brownfield: real project markers
+            std::string stated   = lang_from_task(task);             // user-stated: explicit mention in the ask
+            std::string chosen   = !stated.empty() ? stated : detected;   // explicit user intent wins; else the project
+            if (!stated.empty() && !detected.empty() && stated != detected)
+                fprintf(stderr, "── PA.8 §9.2: task says '%s' but project looks '%s' — honoring the request, '%s' ──\n",
+                        stated.c_str(), detected.c_str(), stated.c_str());
+            if (!chosen.empty()) { g_stack = stack_profile(chosen);
+                fprintf(stderr, "── PA.8 §9.2 resolved stack: %s (%s) ──\n", chosen.c_str(),
+                        !stated.empty() ? "stated in task" : "detected from project"); }
+        }
+        // PA.8 §9.1: seed the variable store from the (now resolved) stack profile, then let .blackboard/memory override.
         vars_seed_from_stack(); vars_load();
         if (!g_vars.empty()) fprintf(stderr, "── PA.8 vars (%s): %zu loaded ──\n", vars_path().c_str(), g_vars.size());
     }
