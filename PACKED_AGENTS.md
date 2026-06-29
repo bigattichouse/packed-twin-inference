@@ -156,3 +156,22 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   resumable server** (checkpoint coordination state → abandon-and-re-derive); client-declared **stack
   profiles** (de-JS-ify → SQL/Python/…); Board-on-the-wire status. One principle: *client owns the
   environment, server owns the cognition*. See [`spec/PA8_SERVER_DESIGN.md`](spec/PA8_SERVER_DESIGN.md).
+- **Minimal-files directive + measured end-to-end run (2026-06-28)** — added a no-bloat directive to the
+  **worker** preamble ("write the LEAST code that satisfies the spec — no speculative features / defensive
+  bloat / over-engineering; small, cleanly-organized files") and the **test-gen** prompt ("small and focused
+  — pin the contract + key edge cases, no padding"). The boss SIZE FLOOR (≥ a cohesive class/module, never a
+  single function — tiny items waste per-item overhead) is unchanged: the middle ground. Run (staged
+  `--tools`, Qwen3.6-27B-UD-Q6_K_XL, MI50/gfx906, 128k ctx, `-s 3 -n 24000`, KV-store w/ TTL+LRU task):
+  - **Truncation solved.** Tight files (`entry.js` 682 B, `kvstore.js` 2099 B); the prior run's
+    `create_file` cap-truncation (which left **0** tests on disk → verify had nothing to measure) is gone.
+  - **Measurement works end-to-end.** 3 test files materialized (0 untested), node ran them, and the §4.7
+    integration test caught a **real cross-module bug** — `entry.isExpired is not a function`: the DESIGN
+    stage flip-flopped Entry's API (`get expired()` getter vs `isExpired()` method; `lastAccessTime` vs
+    `lastAccessed`) and reconcile missed the getter-vs-method shape mismatch, so Entry and KVStore were
+    built against different contracts.
+  - **Repair did NOT converge (1/3, GIVEN UP).** The L2 arbiter saw the 2 failures but "requested 0 rework
+    items" → no fix issued. Two separable gaps: (a) **design reconciliation** doesn't lint interface-shape
+    mismatches (getter-vs-method, name drift) *before* implement; (b) **arbiter convergence** — it must
+    reliably emit a rework envelope on real, attributable failures instead of punting. The
+    decompose→implement→test→**measure** half is solid and honestly catches real bugs; closing the
+    **repair** half (and pushing reconciliation upstream to prevent the drift) is the next work.

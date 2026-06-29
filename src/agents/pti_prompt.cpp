@@ -184,8 +184,10 @@ static const char *WORKER_PREAMBLE =
     "You implement ONE piece of a larger program. You are given a frozen shared interface and\n"
     "a spec for YOUR PIECE ONLY. Produce just that piece: the implementation (plus a quick\n"
     "inline test only if natural) for your declared exports, in the given language, and nothing\n"
-    "else — no prose, no other functions, no re-declaring the shared interface. Match the\n"
-    "declared signatures exactly. Output only code.";
+    "else — no prose, no other functions, no re-declaring the shared interface. Write the LEAST\n"
+    "code that fully and correctly satisfies the spec: tight, readable, single-responsibility —\n"
+    "no speculative features, no defensive bloat, no over-engineering. Keep the file small and\n"
+    "cleanly organized. Match the declared signatures exactly. Output only code.";
 
 // Tool-call instructions appended to the worker preamble when --tools is set. Format and verb
 // names match nanocoder's XML convention (../nanocoder, source/app/prompts + source/tools):

@@ -245,7 +245,8 @@ std::string test_user(const std::string &relpath, const std::string &content,
             "\nCollaborator modules this one interacts with — so your stubs/mocks match the methods "
             "they ACTUALLY call (e.g. a fake canvas must implement every ctx.* method the real code uses):\n"
             + collaborators) +
-        "\nThe test MUST: be written " + test_directive() + "; import the module via " +
+        "\nThe test MUST: be SMALL and FOCUSED (a handful of meaningful cases that pin the contract "
+        "and the key edge cases — no exhaustive padding or redundant assertions); be written " + test_directive() + "; import the module via " +
         var_or("module_hint", stk_module_hint()) + " (e.g. from '../" + relpath + "'); **stub collaborators "
         "directly** (NO external packages — do NOT pull in jsdom/jest/etc.); follow any TECH DECISIONS in the "
         "contract above. Save it with create_file at path: " + testpath + "\nOutput only the create_file tool call.";
