@@ -168,14 +168,26 @@ $(PTI_4SEQ): pti_4seq.cpp | $(BINDIR)
 4seq-run-base: $(PTI_4SEQ)
 	$(PTI_4SEQ) -m $(MTP_MODEL) -p "$(TEST_PROMPT)" -n $(TEST_TOKENS) -ngl $(NGL) --baseline
 
-# ── pti_agents: PA.0 packed-agents plumbing demo (4 streams, one context) ─────
+# ── pti_agents: packed-agents pipeline — decomposed into src/agents/ (11 files) ─
+SRC_AGENTS := src/agents
 PTI_AGENTS := $(BINDIR)/pti_agents
+PTI_AGENTS_SRCS := $(SRC_AGENTS)/pti_common.cpp \
+                   $(SRC_AGENTS)/pti_stream.cpp \
+                   $(SRC_AGENTS)/pti_mtp.cpp \
+                   $(SRC_AGENTS)/pti_parser.cpp \
+                   $(SRC_AGENTS)/pti_prompt.cpp \
+                   $(SRC_AGENTS)/pti_tools.cpp \
+                   $(SRC_AGENTS)/pti_memory.cpp \
+                   $(SRC_AGENTS)/pti_eager.cpp \
+                   $(SRC_AGENTS)/pti_verify.cpp \
+                   $(SRC_AGENTS)/pti_pipeline.cpp \
+                   $(SRC_AGENTS)/pti_main.cpp
 
 agents: $(PTI_AGENTS)
 
-$(PTI_AGENTS): pti_agents.cpp | $(BINDIR)
-	g++ $(LLAMA_CXXFLAGS) -o $@ $< $(LLAMA_LDFLAGS)
-	@echo "Built $@"
+$(PTI_AGENTS): $(PTI_AGENTS_SRCS) $(SRC_AGENTS)/pti_agents.h | $(BINDIR)
+	g++ $(LLAMA_CXXFLAGS) -I$(SRC_AGENTS) -o $@ $(PTI_AGENTS_SRCS) $(LLAMA_LDFLAGS)
+	@echo "Built $@ (from $(words $(PTI_AGENTS_SRCS)) src/agents/ files)"
 
 agents-run: $(PTI_AGENTS)
 	$(PTI_AGENTS) -m $(MTP_MODEL) -n 96 --text

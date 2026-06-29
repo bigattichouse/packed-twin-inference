@@ -754,3 +754,21 @@ All targets build. All self-tests pass. No source files at repo root except Make
 | `src/agents/pti_prompt.cpp` | ~340 |
 
 The two largest unsplit files (`pti_server.cpp` at ~1,600 and `pti_lookup.cpp` at ~900) are each a single coherent domain. If future splits are desired, they'd be separate refactor efforts.
+
+---
+
+## Completion Status (2026-06-28)
+
+**`src/agents/` split: DONE and validated.** `pti_agents.cpp` (the 3,336-line monolith, kept at repo root as the reference) is decomposed into **11** `.cpp` files + `pti_agents.h` (all ≤480 lines), built by `make agents`.
+
+Deviation from the 13-file plan: `pti_pool.cpp` was dropped. `run_pool()` is interleaved with the MTP draft helpers it calls (`mtp_feed1` / `make_sampler` / `pick`), so it stays with them in `pti_mtp.cpp`. Net: 11 files, not 13.
+
+The prior split was incomplete — it did not compile. Finalization fixes:
+- Rewrote `pti_agents.h`: corrected ~10 drifted signatures; centralized the `EKind` / `RepairAction` enums and `StackProfile` / `Msg` structs that had been duplicated across `.cpp` files; removed 8 phantom / `main`-local externs.
+- Removed `static` from ~25 cross-file functions; de-duplicated ~12 copy-pasted helpers to one home each.
+- Reverted 4 dev divergences to the monolith's behavior: `run_pool` & `qwen_params` (kept the faithful copy, deleted the invented one), `is_dangerous_cmd` (regex guard — its own T4 self-test expects it), `reconcile_groups` (restored the `n<=0` guard — it was a divide-by-zero crash at coord-test R15).
+- Reconciled the pipeline (these were caught only by real runs, not the self-tests): `run_pipeline` had a wrong lane allocation (`nW = n_lanes` vs the monolith's `n_lanes-1`); `run_nonstream_pipeline` double-freed `G.ctx`/model/backend → segfault on `--no-stream`. Both fixed against the monolith.
+
+**Validation:** all 5 GPU-free self-tests pass; every runtime mode (PA.0 demo, pool, streaming, no-stream, staged `--tools`) is byte-identical to the monolith on CPU (deterministic `--greedy` runs on the tiny gemma-270m model); a full staged design→build→verify run completed end-to-end on the MI50 (gfx906) at 128K context. A function-level fidelity diff vs the monolith shows only cosmetic residue (default-args moved to the header, lambda/var renames, stderr wording, `main`'s extraction into `run_packed_demo` / `run_pool_test` / `run_nonstream_pipeline`).
+
+**Remaining (the migration is partial):** only the `agents` target was rewired to `src/`. The `server` / `pti` / `bench` / `kernel` targets still build the **root** copies, and `src/` currently holds duplicate copies of those sources. Finishing the migration — wire all targets to `src/`, delete the root duplicates and the monolith, fix the `src/scripts/*.sh` paths (they still assume the repo-root location), update `.clangd` — is the open follow-up.
