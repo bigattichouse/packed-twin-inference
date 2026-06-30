@@ -172,6 +172,39 @@ std::vector<std::pair<std::string,std::string>> reworks_from_plan(const std::str
     return out;
 }
 
+// Dedicated REPAIR-ARBITER system prompt (PA.4d). The arbiter must emit a rework WORK-ORDER
+// envelope, NOT restate the contract — feeding it the generic triage prompt (boss_system_text)
+// biases the model to re-emit the shared interface and forget the fix-pieces (→ 0 reworks → give up).
+std::string build_boss_arbiter_prompt() {
+    return
+        "You are the REPAIR ARBITER of a coding team. Failing tests that worker-level repair could "
+        "not fix are escalated to you — each with its EXECUTED error, the test, the module, and the "
+        "frozen interface contract.\n\n"
+        "Do ALL of your analysis inside <think>...</think>. For EACH failure, judge which FILE is "
+        "wrong: the MODULE or the TEST. Tests are frequently the bug — calling a getter as a method "
+        "(`x.isExpired()` when the contract declares `get isExpired()`); asserting a value the spec "
+        "does not require; or being FLAKY — depending on wall-clock timing / `Date.now()` resolution "
+        "/ sleeps so two operations collide on the same millisecond. Trust the EXECUTED error and "
+        "the contract over any re-derivation.\n\n"
+        "REWORK AND ADAPT — make progress WITHOUT thrashing: while ANY test fails you MUST delegate "
+        "at least ONE fix, but emit the MINIMAL, most-targeted set — usually ONE piece, only the "
+        "file(s) DIRECTLY responsible for a failing test. NEVER rework a file whose tests already "
+        "pass, and never just diagnose. Adapt the fix to the cause: rewrite a wrong or flaky TEST to "
+        "be DETERMINISTIC (control time explicitly / use distinct timestamps — never rely on real "
+        "elapsed ms); fix a wrong MODULE; or harden a fragile DESIGN (e.g. an LRU that ties on equal "
+        "timestamps → use a monotonic access counter, not the wall clock).\n\n"
+        "After </think>, your FINAL answer must be ONLY this WORK-ORDER envelope — nothing before or "
+        "after it, no prose, no contract restatement. ONE <<<PIECE>>> per file to rewrite; the file "
+        "path in exports=, the concrete bug + fix in the instruction line:\n\n"
+        "<<<PLAN strategy=file lang=LANG>>>\n"
+        "shared:\n<blueprint>the one fact the fixes must share (one line)</blueprint>\n"
+        "<<<PIECE id=fix1 exports=PATH/TO/FILE>>>\n"
+        "instruction: what is wrong + exactly how to fix it (one line)\n"
+        "<blueprint>one line</blueprint>\n"
+        "<<</PIECE>>>\n"
+        "<<<END>>>";
+}
+
 std::string build_arbiter_user(const std::string &contract, const std::string &failblock) {
     return "Worker-level repair exhausted its budget on the failures below and gave up. As the "
            "COORDINATOR, decide the rework. IMPORTANT: the MODULE may be correct and the TEST may be "

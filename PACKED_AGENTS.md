@@ -175,3 +175,17 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
     reliably emit a rework envelope on real, attributable failures instead of punting. The
     decompose→implement→test→**measure** half is solid and honestly catches real bugs; closing the
     **repair** half (and pushing reconciliation upstream to prevent the drift) is the next work.
+- **Repair loop closes — first all-green build (2026-06-29).** `build_boss_arbiter_prompt` was declared but
+  never wired (both split and monolith fed the arbiter the generic triage prompt → it re-emitted the contract
+  instead of fix-pieces → 0 reworks → give up). Implemented it as a dedicated REPAIR-ARBITER prompt: reason in
+  `<think>`, emit ONLY a work-order, MINIMAL/targeted reworks (never touch a passing file), adapt to the cause
+  (flaky test → make deterministic; fragile design → harden). Added **best-result preservation** in
+  `finalize_verify` — snapshot the highest-passing version (a *sibling* dir, out of module discovery) and
+  revert-to-best + stop on any regression, so the bounded loop always gives up at its **best** point, never a
+  thrashed one. Result (Q6, MI50, 128k, `-s3 -n24000`, KV-store task): arbiter went 0 → 2 targeted reworks/round
+  (down from an over-aggressive 4 mid-iteration), fixed the getter-as-method bug AND the flaky
+  timestamp-collision LRU test, and converged **3/3 — DONE (all green)** — the first fully verified end-to-end
+  build. Next: proactive **reviewer agents** (design/code/test review in the queue) to catch interface-shape
+  drift, contract violations, and flaky tests *before* verify; and a side-git history
+  (`.blackboard/history.git`, git-dir excluded from itself) for real per-rework diffs to the arbiter +
+  checkpoint/resumability (PA.8).

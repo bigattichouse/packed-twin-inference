@@ -178,6 +178,28 @@ void finalize_verify(const WorkOrder &wo,
         journal[comp] += "[round " + std::to_string(rnd) + " " + lvl + "] " + (a.empty() ? "(no note)" : a) + "\n";
     };
 
+    // Best-result preservation: snapshot the highest-passing version (in a SIBLING dir so it never
+    // pollutes module discovery) so a later rework that REGRESSES the suite can't degrade the final
+    // output — we revert to the best and stop. Bounds the repair loop to "give up at the best point".
+    int best_passed = -1, best_total = 0;
+    const std::string best_dir = std::string(g_work_dir) + ".best";
+    auto snapshot_best = [&]() {
+        std::error_code e; fs::remove_all(best_dir, e); fs::create_directories(best_dir, e);
+        for (const char *sub : { "src", "test" }) {
+            fs::path s = fs::path(g_work_dir) / sub;
+            if (fs::exists(s, e)) fs::copy(s, fs::path(best_dir) / sub,
+                fs::copy_options::recursive | fs::copy_options::overwrite_existing, e);
+        }
+    };
+    auto restore_best = [&]() {
+        std::error_code e;
+        for (const char *sub : { "src", "test" }) {
+            fs::path s = fs::path(best_dir) / sub;
+            if (fs::exists(s, e)) fs::copy(s, fs::path(g_work_dir) / sub,
+                fs::copy_options::recursive | fs::copy_options::overwrite_existing, e);
+        }
+    };
+
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
         std::vector<std::string> curmods = list_modules(), untested;
@@ -197,6 +219,16 @@ void finalize_verify(const WorkOrder &wo,
         }
         for (auto &m : untested) fprintf(stderr, "  [UNTESTED] %s\n", fs::relative(m, g_work_dir, ec).string().c_str());
         int issues = (int)fails.size() + (int)untested.size();
+        // keep the best version; bail to it if a later rework regressed the passing-test count
+        if (!res.empty() && passed > best_passed) { best_passed = passed; best_total = (int)res.size(); snapshot_best(); }
+        else if (best_passed >= 0 && passed < best_passed && !res.empty()) {
+            fprintf(stderr, "  ⚠ a rework REGRESSED the suite (%d→%d passing) — reverting to the best version and stopping\n",
+                    best_passed, passed);
+            restore_best();
+            fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — STOPPED (kept best; later reworks made it worse) ══\n",
+                    best_passed, best_total);
+            break;
+        }
         RepairAction act = repair_verdict(round, g_repair_budget, issues);
         bool no_progress = (prev_failed >= 0 && issues >= prev_failed && untested.empty());
         if (act == RA_REPAIR && no_progress) {
@@ -242,8 +274,8 @@ void finalize_verify(const WorkOrder &wo,
                     fb += frame_executed_truth(r.out);
                     fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\nERROR:\n" + r.out + "\n";
                 }
-                std::string aprompt = apply_chat_template({ {"system", boss_system_text()}, {"user", build_arbiter_user(contract, fb)} });
-                std::string araw = strip_think(boss_generate(aprompt, 2048));
+                std::string aprompt = apply_chat_template({ {"system", build_boss_arbiter_prompt()}, {"user", build_arbiter_user(contract, fb)} });
+                std::string araw = strip_think(boss_generate(aprompt, 6144));   // room for <think> analysis + the envelope
                 arbiter_diag += "── escalation " + std::to_string(arbiter_rounds) + " ──\n" + araw + "\n\n";
                 auto reworks = reworks_from_plan(araw);
                 fprintf(stderr, "  boss requested %d rework item(s)\n", (int)reworks.size());

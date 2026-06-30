@@ -257,7 +257,7 @@ std::string build_test_prompt(const std::string &module, const std::string &code
 std::string build_repair_prompt(const std::string &module, const std::string &code,
                                 const std::string &test, const std::string &error,
                                 const std::string &journal, const StackProfile &sp);
-std::string build_boss_arbiter_prompt(const std::string &context, const std::string &history);
+std::string build_boss_arbiter_prompt();
 std::vector<std::string> finalize_test_results(const std::string &output);
 bool test_is_passing(const std::string &output);
 std::string test_summary(const std::vector<std::string> &results);
