@@ -1,0 +1,5 @@
+https://github.com/KorroAi/onklaud-5
+paper:
+https://github.com/KorroAi/onklaud-5/blob/master/ONKLAUD_5_RESEARCH_PAPER.pdf
+
+looks like a similar "collection"/"pipeline" of models working together. What can we learn from this to make our model better.

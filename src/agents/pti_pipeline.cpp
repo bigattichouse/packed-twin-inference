@@ -110,6 +110,30 @@ static std::string build_merge_user(const std::string &goal, const std::string &
            "\n\nOutput the unified contract as concise markdown — no preamble, no code.";
 }
 
+// PA.6 DESIGN REVIEW — a quality gate after reconcile. Implementers build DIFFERENT components
+// against ONE contract in ISOLATION (never seeing each other's code), so any ambiguous exported
+// member (esp. getter-vs-method) makes them diverge → `x is not a function`. The reviewer re-pins
+// every member's exact shape + call syntax so the contract is implementer-proof.
+static std::string build_design_reviewer_prompt() {
+    return
+        "You are the DESIGN REVIEWER. Implementers build DIFFERENT components against the ONE contract "
+        "below, in ISOLATION, so any exported member they could mis-call WILL cause divergence — the #1 "
+        "culprit is a getter accessed as a method (`obj.x()` when the contract declares `get x()` → "
+        "`x is not a function`).\n\n"
+        "Scan the contract's exported members and output a SHORT addendum. Begin it with EXACTLY this "
+        "heading line:\n## EXACT CALL SYNTAX — every implementer MUST follow this\n"
+        "then ONE bullet per exported member that could be mis-called, each: `Component.member` — KIND "
+        "(GETTER|METHOD|FIELD) — how to access it, with ✓/✗ for getters. Example:\n"
+        "- `Entry.isExpired` — GETTER — read as `entry.isExpired` (✓), NEVER `entry.isExpired()` (✗)\n"
+        "- `KVStore.set` — METHOD — call as `store.set(key, value, ttl)`\n"
+        "Cover GETTERS especially (the footgun). Do NOT restate the rest of the contract, no prose, "
+        "no code — output ONLY the addendum, a few lines.";
+}
+
+static std::string build_design_review_user(const std::string &contract) {
+    return "Contract:\n" + contract + "\n\nProduce the EXACT CALL SYNTAX addendum now.";
+}
+
 // ─── PA.6: staged design→build pipeline ──────────────────────────────────────
 void run_pipeline_staged(const std::string &task, int n_lanes, int max_new) {
     G.tmpl = llama_model_chat_template(G.model, nullptr);
@@ -198,6 +222,20 @@ void run_pipeline_staged(const std::string &task, int n_lanes, int max_new) {
             FILE *cf = fopen((ddir + "/INTERFACE.md").c_str(), "w");
             if (cf) { fputs(contract.c_str(), cf); fclose(cf);
                 fprintf(stderr, "\n── wrote design/INTERFACE.md (%zu chars) ──\n", contract.size()); }
+
+            // ── DESIGN REVIEW (quality gate): APPEND an exact call-syntax addendum (getter/method/
+            //    field) so isolated implementers can't mis-call a sibling's surface (the isExpired class) ──
+            fprintf(stderr, "\n══ PA.6 DESIGN REVIEW — pinning call syntax (getter/method/field) ══\n");
+            std::string addendum = trim(strip_think(boss_generate(apply_chat_template(
+                { {"system", build_design_reviewer_prompt()}, {"user", build_design_review_user(contract)} }), 2048)));
+            if (addendum.find("CALL SYNTAX") != std::string::npos && addendum.size() > 40) {
+                contract += "\n\n" + addendum + "\n";
+                FILE *rf = fopen((ddir + "/INTERFACE.md").c_str(), "w");
+                if (rf) { fputs(contract.c_str(), rf); fclose(rf); }
+                fprintf(stderr, "── design review: pinned a %zu-char call-syntax addendum ──\n", addendum.size());
+            } else {
+                fprintf(stderr, "── design review: no usable addendum; kept reconciled contract ──\n");
+            }
             goal += "\n\n=== AUTHORITATIVE INTERFACE CONTRACT (obey EXACTLY; overrides individual blueprints) ===\n"
                   + contract + "\n";
         }

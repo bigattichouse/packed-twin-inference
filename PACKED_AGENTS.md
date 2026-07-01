@@ -189,3 +189,14 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   drift, contract violations, and flaky tests *before* verify; and a side-git history
   (`.blackboard/history.git`, git-dir excluded from itself) for real per-rework diffs to the arbiter +
   checkpoint/resumability (PA.8).
+- **Critics land — design / code / test reviewers in the queue (2026-06-30, CPU-validated, GPU-pending).** The
+  "proactive reviewer agents" named above, built as three CONTRACT-anchored critic passes (see PA6 §12): DESIGN
+  REVIEW pins call-syntax into the contract; the CODE CRITIC reviews each module vs the contract (blind); the
+  TEST CRITIC reviews each test vs the contract (never the code — no tautology). All **advisory** — notes feed
+  the arbiter beside the `contradictory_asserts` lint (cheapest-tier-first). A test the critic flags that
+  *currently passes* (the wrong-test class execution + the lint both miss) forces one arbiter adjudication —
+  critic nominates, boss decides — with a one-round `flag_grace` so best-preservation doesn't revert the
+  intended dip. Contract cached into the system turn (`build_critic_system`) so critic pools clone+delta like
+  every other pool. `--coord-test` 34/34; the adjudication loop is integration-level → next is a GPU staged run
+  (plant a getter mis-call + a contract-wrong-but-passing test). Cross-model diversity (2nd same-size model)
+  deferred — this is the single-model reviewer discipline, from the Onklaud-5 pipeline note (`pipelines.txt`).

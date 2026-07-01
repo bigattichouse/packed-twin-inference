@@ -514,7 +514,20 @@ int coord_self_test() {
     { chk("R31 lang_from_marker",
           lang_from_marker("package.json")=="javascript" && lang_from_marker("requirements.txt")=="python"
        && lang_from_marker("pyproject.toml")=="python" && lang_from_marker("README.md").empty()); }
-    fprintf(stderr, "  %s (%d/31 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 31-fail);
+    { chk("R32 test_critic_note",
+          !test_critic_note("## TEST DEFECTS\n- CONTRACT-MISMATCH — foo(1) — spec says 2").empty()
+       && test_critic_note("TESTS OK").empty()
+       && test_critic_note("## TEST DEFECTS").empty()         // bare heading, no bullet → no note
+       && test_critic_note("no verdict at all").empty()); }
+    { chk("R33 code_critic_note",
+          !code_critic_note("## CONTRACT VIOLATIONS\n- CALL-SYNTAX — e.isExpired() — contract declares get isExpired").empty()
+       && code_critic_note("CODE OK").empty()
+       && code_critic_note("## CONTRACT VIOLATIONS").empty()      // bare heading, no bullet → no note
+       && code_critic_note("looks fine to me").empty()); }
+    { std::string sy = build_critic_system("ROLEX", "CONTRACTY");   // contract must survive into the cached system turn
+      chk("R34 build_critic_system carries role+contract",
+          sy.find("ROLEX")!=std::string::npos && sy.find("CONTRACTY")!=std::string::npos); }
+    fprintf(stderr, "  %s (%d/34 passed)\n", fail==0 ? "ALL PASS" : "SOME FAILED", 34-fail);
     g_stack = _sv_stack;
     return fail > 0 ? 5 : 0;
 }

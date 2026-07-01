@@ -36,7 +36,89 @@ std::string stage_item(const std::string &shared, const std::string &user) {
     return s;
 }
 
-// RepairAction enum
+// ─── PA.6 TEST CRITIC ─────────────────────────────────────────────────────────
+// A quality gate on the GENERATED tests — the #1 documented hard-fail class: a test that encodes the
+// WRONG expected, contradicts itself, or asserts on a stubbed collaborator instead of the module. The
+// critic judges each test ONLY against the AUTHORITATIVE CONTRACT + blueprint (the SPEC), NEVER by what
+// the module code happens to do (the code may be buggy; the contract is truth — same rule as
+// frame_executed_truth). It is the model-level generalization of the syntactic contradictory_asserts()
+// lint. Its notes are ADVISORY: injected into the arbiter failblock so repair can tell a wrong TEST from
+// wrong CODE. It never rewrites tests (that would risk tautology — a test bent to match buggy code).
+static std::string build_test_critic_prompt() {
+    return
+        "You are the TEST CRITIC. You judge whether a generated test faithfully encodes the "
+        "AUTHORITATIVE CONTRACT + the module's blueprint (the SPEC). Judge ONLY against the SPEC — "
+        "NEVER against what the module code happens to do, because the module may be buggy and the "
+        "contract is the source of truth. Do NOT run or simulate the code.\n\n"
+        "Flag ONLY concrete, high-confidence defects, each in one of these classes:\n"
+        "- CONTRADICTION: the same input is asserted to two different expected values.\n"
+        "- CONTRACT-MISMATCH: an assertion's expected value contradicts the contract/blueprint's stated behavior.\n"
+        "- OVER-MOCK: the test asserts on a stubbed/mocked collaborator instead of the module under test.\n"
+        "- TAUTOLOGY: the expected value was clearly copied from running the module, not derived from the spec.\n\n"
+        "Do NOT invent style nits, do NOT restate the contract, do NOT emit code. Output EXACTLY one of:\n"
+        "(a) the single literal line `TESTS OK` — if every assertion is spec-faithful; or\n"
+        "(b) a heading line `## TEST DEFECTS` then ONE bullet per defect: "
+        "`- <KIND> — <the offending assertion> — <why it violates the SPEC, citing the contract>`.";
+}
+
+static std::string build_test_critic_user(const std::string &blueprint,
+                                          const std::string &test_rel, const std::string &test_content) {
+    return "=== MODULE BLUEPRINT ===\n" + (blueprint.empty() ? "(none)" : blueprint) +
+           "\n\n=== TEST UNDER REVIEW: " + test_rel + " ===\n" + test_content +
+           "\n\nProduce your verdict now — `TESTS OK` or `## TEST DEFECTS`. Judge against the SPEC (above), not any code.";
+}
+
+// PA.6 CODE CRITIC — reviews each implemented module against the AUTHORITATIVE CONTRACT, BLIND to the
+// author's own reasoning (we pass only the contract + the code, never the worker's <think> — the
+// proofreader can't catch their own typo). Targets the #1 divergence: a module mis-calling a sibling's
+// contract surface (getter-as-method → "x is not a function"), a wrong signature, or a missing export.
+// Advisory + no-critique-dropped; its notes ride into the arbiter failblock per module.
+static std::string build_code_critic_prompt() {
+    return
+        "You are the CODE CRITIC. You review ONE module against the AUTHORITATIVE CONTRACT (the binding "
+        "interface every module shares). You did NOT write this code and you cannot see the author's "
+        "reasoning — judge ONLY the code against the contract.\n\n"
+        "Flag ONLY concrete, high-confidence contract violations, each in one of these classes:\n"
+        "- CALL-SYNTAX: calls a sibling's member the wrong way (e.g. a getter as a method `x.y()` when the contract declares `get y()` → runtime `y is not a function`).\n"
+        "- SIGNATURE: calls or implements an exported function with the wrong arg count/order/return vs the contract.\n"
+        "- MISSING-EXPORT: fails to export a symbol the contract says this module must export, or exports it under a different name.\n"
+        "- CONTRACT-DRIFT: behavior contradicts the contract's stated rule for this module.\n\n"
+        "Do NOT flag style, naming, or internal choices the contract does not constrain. Do NOT emit code. "
+        "Output EXACTLY one of:\n"
+        "(a) the single literal line `CODE OK` — if the module obeys the contract; or\n"
+        "(b) a heading line `## CONTRACT VIOLATIONS` then ONE bullet per violation: "
+        "`- <KIND> — <the offending code> — <the contract rule it breaks>`. List EVERY violation — drop none.";
+}
+
+static std::string build_code_critic_user(const std::string &mod_rel,
+                                          const std::string &mod_code, const std::string &collab) {
+    return "=== MODULE UNDER REVIEW: " + mod_rel + " ===\n" + mod_code +
+           (collab.empty() ? "" : "\n\n=== SIBLING MODULES IT INTEGRATES WITH (check call syntax against these) ===\n" + collab) +
+           "\n\nProduce your verdict now — `CODE OK` or `## CONTRACT VIOLATIONS`. Judge against the contract (above).";
+}
+
+// Shared (CACHEABLE) system turn for a critic: role + the AUTHORITATIVE CONTRACT. The contract is the big
+// chunk reused across every item, so it lives in the SYSTEM turn → run_pool prefix-caches it once and
+// delta-prefills only the per-item user turn (blueprint/test or code/siblings) per lane.
+std::string build_critic_system(const std::string &role, const std::string &contract) {
+    return role + "\n\n=== AUTHORITATIVE CONTRACT (the SPEC — this is truth) ===\n" + (contract.empty() ? "(none)" : contract);
+}
+
+// Extract the defect block under `heading` from a critic verdict; "" = clean verdict / no usable block.
+static std::string critic_defect_block(const std::string &raw, const std::string &heading) {
+    std::string s = trim(raw);
+    size_t h = s.find(heading);
+    if (h == std::string::npos) return "";
+    std::string block = trim(s.substr(h));
+    // Require at least one bullet after the heading line, else it's a bare/parroted heading → no note.
+    size_t nl = block.find('\n');
+    if (nl == std::string::npos) return "";                    // heading only, no body
+    if (block.find('-', nl) == std::string::npos) return "";   // no bullet in the body
+    return block;
+}
+std::string test_critic_note(const std::string &raw) { return critic_defect_block(raw, "## TEST DEFECTS"); }
+std::string code_critic_note(const std::string &raw) { return critic_defect_block(raw, "## CONTRACT VIOLATIONS"); }
+
 // ─── PA.4: finalize + verify→repair loop ─────────────────────────────────────
 void finalize_verify(const WorkOrder &wo,
                      const std::vector<std::pair<std::string,std::string>> &worker_results,
@@ -76,6 +158,40 @@ void finalize_verify(const WorkOrder &wo,
     std::string contract0 = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
     std::string goal_ctx = contract0.empty() ? wo.shared : contract0;
     { std::string vr = vars_render(); if (!vr.empty()) goal_ctx = vr + "\n" + goal_ctx; }
+
+    // ── PA.6 CODE CRITIC (quality gate on implemented modules) — review each module against the CONTRACT,
+    //    BLIND to the author's reasoning; target the #1 divergence (mis-calling a sibling's surface). Notes
+    //    ride into the arbiter failblock per module (symmetric to the test critic below). ──
+    std::map<std::string,std::string> code_critic;
+    if (!mods.empty()) {
+        fprintf(stderr, "\n══ PA.6 CODE CRITIC — reviewing %d module(s) vs the contract ══\n", (int)mods.size());
+        bool sv_dt = g_worker_think; SParams sv_ds = g_worker_sp;   // judgment stage → let it think
+        if (!g_greedy) { g_worker_think = true; g_worker_sp = qwen_params(true, false); }
+        std::string csys = build_critic_system(build_code_critic_prompt(), contract0);
+        std::string cprefix = apply_chat_template({ {"system", csys} }, false);
+        std::vector<std::string> citems, crel;
+        for (auto &m : mods) {
+            std::string rel = fs::relative(m, g_work_dir, ec).string(), code = read_file_str(m);
+            std::string ci = apply_chat_template({ {"system", csys},
+                {"user", build_code_critic_user(rel, code, collab_for(code, m, mods))} }, true);
+            if (!g_worker_think) ci += "<think>\n\n</think>\n\n";
+            citems.push_back(ci); crel.push_back(rel);
+        }
+        std::vector<std::string> couts; run_pool(citems, n_lanes, max_new, &couts, cprefix);
+        std::string review;
+        for (size_t i = 0; i < crel.size() && i < couts.size(); i++) {
+            std::string note = code_critic_note(strip_think(couts[i]));
+            if (note.empty()) { fprintf(stderr, "  ✓ %s — obeys the contract\n", crel[i].c_str()); continue; }
+            code_critic[crel[i]] = note;
+            review += "### " + crel[i] + "\n" + note + "\n\n";
+            fprintf(stderr, "  ⚠ %s — code critic flagged violation(s)\n", crel[i].c_str());
+        }
+        if (!review.empty()) {
+            FILE *rf = fopen((std::string(g_work_dir) + "/design/CODE_REVIEW.md").c_str(), "w");
+            if (rf) { fputs(review.c_str(), rf); fclose(rf); }
+        }
+        g_worker_think = sv_dt; g_worker_sp = sv_ds;
+    }
 
     auto gen_tests_for = [&](const std::vector<std::string> &targets, const std::vector<std::string> &allmods) {
         if (targets.empty()) return;
@@ -129,6 +245,52 @@ void finalize_verify(const WorkOrder &wo,
             std::vector<std::pair<std::string,std::string>> itrs;
             for (size_t i = 0; i < iids.size() && i < iouts.size(); i++) itrs.push_back({ iids[i], strip_think(iouts[i]) });
             run_worker_tools(itrs);
+        }
+    }
+
+    // ── PA.6 TEST CRITIC (quality gate on generated tests) — review each test against the CONTRACT
+    //    (the spec), NEVER the code; hold notes so the arbiter can tell a wrong TEST from wrong CODE.
+    //    The deterministic contradictory_asserts() lint still runs first in the loop below (cheapest
+    //    tier); this is its model-level generalization for semantic test bugs (wrong expected / over-mock). ──
+    std::map<std::string,std::string> test_critic;
+    {
+        std::vector<std::string> tfiles;
+        for (auto it = fs::recursive_directory_iterator(g_work_dir, ec);
+             it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            if (it->is_regular_file(ec)) { std::string n = it->path().filename().string();
+                if (is_test_file(n)) tfiles.push_back(it->path().string()); }
+        }
+        std::sort(tfiles.begin(), tfiles.end());
+        if (!tfiles.empty()) {
+            fprintf(stderr, "\n══ PA.6 TEST CRITIC — reviewing %d test(s) vs the contract ══\n", (int)tfiles.size());
+            bool sv_ct = g_worker_think; SParams sv_cs = g_worker_sp;   // judgment stage → let it think (like reconcile/arbiter)
+            if (!g_greedy) { g_worker_think = true; g_worker_sp = qwen_params(true, false); }
+            std::string csys = build_critic_system(build_test_critic_prompt(), contract0);
+            std::string cprefix = apply_chat_template({ {"system", csys} }, false);
+            std::vector<std::string> citems, crel;
+            for (auto &t : tfiles) {
+                std::string rel = fs::relative(t, g_work_dir, ec).string();
+                std::string bp = read_file_str(std::string(g_work_dir) + "/design/" + integration_base(t) + ".blueprint");
+                std::string ci = apply_chat_template({ {"system", csys},
+                    {"user", build_test_critic_user(bp, rel, read_file_str(t))} }, true);
+                if (!g_worker_think) ci += "<think>\n\n</think>\n\n";
+                citems.push_back(ci); crel.push_back(rel);
+            }
+            std::vector<std::string> couts; run_pool(citems, n_lanes, max_new, &couts, cprefix);
+            std::string review;
+            for (size_t i = 0; i < crel.size() && i < couts.size(); i++) {
+                std::string note = test_critic_note(strip_think(couts[i]));
+                if (note.empty()) { fprintf(stderr, "  ✓ %s — spec-faithful\n", crel[i].c_str()); continue; }
+                test_critic[crel[i]] = note;
+                review += "### " + crel[i] + "\n" + note + "\n\n";
+                fprintf(stderr, "  ⚠ %s — test critic flagged defect(s)\n", crel[i].c_str());
+            }
+            if (!review.empty()) {
+                FILE *rf = fopen((std::string(g_work_dir) + "/design/TEST_REVIEW.md").c_str(), "w");
+                if (rf) { fputs(review.c_str(), rf); fclose(rf); }
+            }
+            g_worker_think = sv_ct; g_worker_sp = sv_cs;
         }
     }
 
@@ -200,6 +362,9 @@ void finalize_verify(const WorkOrder &wo,
         }
     };
 
+    // one-round grace so the best-snapshot guard doesn't revert the INTENDED pass-count dip when the
+    // arbiter reworks a wrong-but-passing test the critic flagged (a correctness fix beats a false green).
+    bool flag_grace = false;
     for (int round = 0; ; round++) {
         std::vector<TestRes> res = run_all_tests();
         std::vector<std::string> curmods = list_modules(), untested;
@@ -221,7 +386,7 @@ void finalize_verify(const WorkOrder &wo,
         int issues = (int)fails.size() + (int)untested.size();
         // keep the best version; bail to it if a later rework regressed the passing-test count
         if (!res.empty() && passed > best_passed) { best_passed = passed; best_total = (int)res.size(); snapshot_best(); }
-        else if (best_passed >= 0 && passed < best_passed && !res.empty()) {
+        else if (best_passed >= 0 && passed < best_passed && !res.empty() && !flag_grace) {
             fprintf(stderr, "  ⚠ a rework REGRESSED the suite (%d→%d passing) — reverting to the best version and stopping\n",
                     best_passed, passed);
             restore_best();
@@ -229,6 +394,15 @@ void finalize_verify(const WorkOrder &wo,
                     best_passed, best_total);
             break;
         }
+        flag_grace = false;   // consume the one-round grace (we didn't revert above)
+        // Test critic flagged a test that currently PASSES → nominate it for arbiter adjudication ONCE
+        // (first escalation): passing+flagged means the TEST and MODULE agree with each other but the critic
+        // says they disagree with the CONTRACT — the wrong-test class that execution + the contradiction-lint
+        // both structurally miss (a self-contradictory test can't pass).
+        std::vector<TestRes> flagged_pass;
+        if (arbiter_rounds == 0)
+            for (auto &r : res) if (r.ok && test_critic.count(r.rel)) flagged_pass.push_back(r);
+        bool force_flag_esc = !flagged_pass.empty();
         RepairAction act = repair_verdict(round, g_repair_budget, issues);
         bool no_progress = (prev_failed >= 0 && issues >= prev_failed && untested.empty());
         if (act == RA_REPAIR && no_progress) {
@@ -251,12 +425,17 @@ void finalize_verify(const WorkOrder &wo,
             }
         }
         prev_failed = issues;
+        if (act == RA_DONE && force_flag_esc && arbiter_rounds < ARBITER_BUDGET) {
+            fprintf(stderr, "  (all tests pass, but the test critic flagged %d passing test(s) — boss adjudicates)\n",
+                    (int)flagged_pass.size());
+            act = RA_GIVEUP;
+        }
         if (act == RA_DONE)   { fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green) ══\n", passed, (int)res.size()); break; }
         if (act == RA_GIVEUP) {
-            if (arbiter_rounds < ARBITER_BUDGET && !fails.empty()) {
+            if (arbiter_rounds < ARBITER_BUDGET && (!fails.empty() || force_flag_esc)) {
                 arbiter_rounds++;
-                fprintf(stderr, "\n══ PA.4d ARBITER (escalation %d/%d) — %d failure(s) to the boss ══\n",
-                        arbiter_rounds, ARBITER_BUDGET, (int)fails.size());
+                fprintf(stderr, "\n══ PA.4d ARBITER (escalation %d/%d) — %d failure(s), %d flagged-passing to the boss ══\n",
+                        arbiter_rounds, ARBITER_BUDGET, (int)fails.size(), (int)flagged_pass.size());
                 std::string contract = read_file_str(std::string(g_work_dir) + "/design/INTERFACE.md");
                 std::vector<std::string> mods = list_modules(); std::string fb;
                 if (!arbiter_diag.empty())
@@ -271,8 +450,27 @@ void finalize_verify(const WorkOrder &wo,
                     if (!modpath.empty()) fb += "MODULE " + modrel + ":\n" + read_file_str(modpath) + "\n";
                     { auto bad = contradictory_asserts(read_file_str(std::string(g_work_dir) + "/" + r.rel));
                       if (!bad.empty()) fb += "⚠ CONTRADICTORY TEST — " + bad[0] + " to MULTIPLE values: the TEST is the bug.\n"; }
+                    { auto tc = test_critic.find(r.rel);
+                      if (tc != test_critic.end()) fb += "⚠ TEST CRITIC (reviewed vs the contract, before running):\n" + tc->second + "\n"; }
+                    { auto cc = code_critic.find(modrel);
+                      if (cc != code_critic.end()) fb += "⚠ CODE CRITIC (module reviewed vs the contract):\n" + cc->second + "\n"; }
                     fb += frame_executed_truth(r.out);
                     fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\nERROR:\n" + r.out + "\n";
+                }
+                for (auto &r : flagged_pass) {   // empty unless this is the first (flag-driven) escalation
+                    std::string testfn = std::filesystem::path(r.rel).filename().string();
+                    std::string modpath = module_for_test(testfn, mods);
+                    std::string modrel = modpath.empty() ? std::string("(none)") : fs::relative(modpath, g_work_dir, ec).string();
+                    auto tc = test_critic.find(r.rel);
+                    fb += "\n--- test " + r.rel + "  (module " + modrel + ") — CURRENTLY PASSES ---\n";
+                    fb += "⚠ TEST CRITIC flagged this PASSING test as violating the contract:\n"
+                        + (tc != test_critic.end() ? tc->second : std::string()) + "\n";
+                    if (!modpath.empty()) fb += "MODULE " + modrel + ":\n" + read_file_str(modpath) + "\n";
+                    fb += "TEST " + r.rel + ":\n" + read_file_str(std::string(g_work_dir) + "/" + r.rel) + "\n";
+                    fb += "It passes today, so TEST and MODULE agree — but the critic says they disagree with the CONTRACT. "
+                          "If the critic is RIGHT, the TEST encodes the wrong expectation: issue a REWORK for the TEST to match "
+                          "the contract (the module may then start failing, exposing a real bug — that is correct and expected). "
+                          "If the critic is WRONG, issue NO rework for this test.\n";
                 }
                 std::string aprompt = apply_chat_template({ {"system", build_boss_arbiter_prompt()}, {"user", build_arbiter_user(contract, fb)} });
                 std::string araw = strip_think(boss_generate(aprompt, 6144));   // room for <think> analysis + the envelope
@@ -305,11 +503,16 @@ void finalize_verify(const WorkOrder &wo,
                         j_append(c, "L2", round, routs[i]);
                     }
                     run_worker_tools(rres);
+                    if (force_flag_esc) flag_grace = true;   // grace the intended dip from a flagged-test rework
                     continue;
                 }
             }
-            fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d round(s) + %d arbiter escalation(s) ══\n",
-                    passed, (int)res.size(), g_repair_budget, arbiter_rounds);
+            if (fails.empty())   // pure flag-driven escalation the boss reviewed and issued no rework for
+                fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — DONE (all green; boss reviewed the test critic's flag(s)) ══\n",
+                        passed, (int)res.size());
+            else
+                fprintf(stderr, "══ VERIFY RESULT: %d/%d passed — GIVEN UP after %d round(s) + %d arbiter escalation(s) ══\n",
+                        passed, (int)res.size(), g_repair_budget, arbiter_rounds);
             break;
         }
         // RA_REPAIR: fill missing tests, then amend

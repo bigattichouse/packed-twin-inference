@@ -268,6 +268,10 @@ std::string build_integration_test_prompt(const std::string &module,
 void finalize_verify(const WorkOrder &wo,
                      const std::vector<std::pair<std::string,std::string>> &worker_results,
                      int n_lanes, int max_new);
+// PA.6 CRITICS — extract the defect block from a critic verdict ("" if the verdict is clean / no bullets)
+std::string test_critic_note(const std::string &raw);   // heading "## TEST DEFECTS"
+std::string code_critic_note(const std::string &raw);   // heading "## CONTRACT VIOLATIONS"
+std::string build_critic_system(const std::string &role, const std::string &contract);  // cacheable system turn
 
 // ── pti_eager.cpp — PA.7 scheduling internals are file-local; these PA.4 repair
 //    / integration helpers + reconcile sizing are shared with verify/pipeline ─

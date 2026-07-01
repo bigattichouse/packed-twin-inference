@@ -39,13 +39,19 @@ Boss TRIAGE (light, fast — little/no deep thinking)
 DESIGN pool   (parallel, THINKING)   each designer writes design/<comp>.blueprint
         ↓
 RECONCILE     (boss, serial-bounded) unify the blueprints → design/INTERFACE.md (the CONTRACT)
+        ↓
+DESIGN REVIEW (boss)                 pin exact call-syntax (getter/method/field) into the CONTRACT  [§12]
         ↓   harness seeds each lane with the goal blueprint + the CONTRACT (+ blueprints)
 IMPLEMENT pool (parallel, instruct)  each writes src/<comp>.js against the CONTRACT
+        ↓
+CODE CRITIC   (parallel, THINKING)   each module vs the CONTRACT, blind → design/CODE_REVIEW.md  [§12]
         ↓
 TEST-GEN pool (parallel)             a test per module (given the goal/CONTRACT + its blueprint + the
                                      file; tests the SPEC, not just the code-as-written)  [PA.4b/4.2]
         ↓
-VERIFY → done when green; failures → repair loop  [PA.4c]
+TEST CRITIC   (parallel, THINKING)   each test vs the CONTRACT → design/TEST_REVIEW.md  [§12]
+        ↓
+VERIFY → done when green; failures → repair loop (critic notes feed the arbiter)  [PA.4c / §12]
 ```
 
 **Why RECONCILE (added 2026-06-15, validated):** the first PA.6 run proved that parallel designers
@@ -338,3 +344,50 @@ integration reds route **straight to L2** (only the arbiter can attribute a mult
 Self-targeting: zero cost on the independent-utils scale task, all value on coupled apps. Restores the boss's
 original `smokeTest` intent. Sequenced **after** A's history/executed-truth work, which is what makes
 integration failures repairable.
+
+---
+
+## 12. Critics — quality gates at design / code / test (2026-06-30; design→build, CPU-validated, GPU-pending)
+
+Three **critic** touchpoints, one per artifact kind, each a bounded pass that judges an artifact **against
+the CONTRACT (the spec), never against sibling artifacts**. This is the ensemble-of-perspectives idea from
+the Onklaud-5 pipeline note (`pipelines.txt`), adapted to our one-model, throughput-bound world: we bank the
+*separate-reviewer* discipline (a fresh context + a reviewer persona + thinking mode breaks the author's
+anchoring) but NOT cross-architecture diversity — that needs a 2nd same-size model (deferred; § future). It
+is also the "proactive reviewer agents" named as *Next* in `PACKED_AGENTS.md` after the first all-green build.
+
+- **DESIGN REVIEW** (after reconcile, `pti_pipeline.cpp`) — appends an EXACT CALL SYNTAX addendum
+  (getter/method/field) to the CONTRACT so isolated implementers can't mis-call a sibling's surface (the
+  `x is not a function` class — directly answers the getter-vs-method drift called out in §11 / PACKED_AGENTS).
+- **CODE CRITIC** (after implement, before test-gen) — reviews each module vs the CONTRACT, **blind** to the
+  author's reasoning (contract + code + siblings only; the worker's `<think>` is already stripped). Classes:
+  CALL-SYNTAX / SIGNATURE / MISSING-EXPORT / CONTRACT-DRIFT. Writes `design/CODE_REVIEW.md`.
+- **TEST CRITIC** (after test-gen, before verify) — reviews each test vs the CONTRACT + blueprint, **never
+  the code** (the executed-truth rule — a test bent to match buggy code is a tautology). Classes:
+  CONTRADICTION / CONTRACT-MISMATCH / OVER-MOCK / TAUTOLOGY. Writes `design/TEST_REVIEW.md`. It is the
+  model-level generalization of the syntactic `contradictory_asserts()` lint (PA4 §4.6).
+
+**Advisory, not destructive.** No critic rewrites an artifact. Their notes ride into the **arbiter
+failblock** (beside the deterministic contradiction lint) so repair can tell a wrong TEST from wrong CODE.
+Cheapest-tier-first is preserved: the $0 lints (compile, `contradictory_asserts`) run first; the model
+critic is the escalation, not the front line.
+
+**Flag adjudication — the one wrong-test class only a spec-anchored critic can catch.** A test that
+CONTRACT-MISMATCHes the spec but *currently passes* means the TEST and MODULE agree with each other while
+both disagree with the CONTRACT — invisible to execution (green) and to the contradiction lint (a
+self-contradictory test can't pass). So a flagged **passing** test now forces ONE arbiter escalation
+(bounded by `ARBITER_BUDGET`): the critic **nominates**, the boss **decides** (rework the test to match the
+contract, or reject the flag). If reworked, the corrected test starts failing → surfaces the real module
+bug → the normal repair cascade. A one-round `flag_grace` stops best-result preservation (§ PA.4c) from
+reverting that INTENDED pass-count dip. A boss-rejected pure-flag escalation ends **DONE**, not GIVEN UP.
+
+**Cost + caching.** Each critic is one thinking-mode pass per artifact — real cost on SSM-taxed HW. The big
+shared chunk (the CONTRACT) is placed in the SYSTEM turn (`build_critic_system`) so `run_pool`
+prefix-caches it once and delta-prefills only the per-item user turn (blueprint/test or code/siblings) — the
+same PA.2.1 clone+delta the other pools use.
+
+**Status.** Parsers (`test_critic_note`/`code_critic_note`) + the cacheable system builder are `--coord-test`
+R32–R34 (34/34, clean build). The adjudication LOOP (flip / grace / gate) is integration-level → **not
+unit-tested, GPU-pending.** Validate with two planted cases: a module that mis-calls a sibling getter (code
+critic fires + arbiter uses it) and a contract-wrong-but-passing test (flag → arbiter → test-rework → module
+bug surfaces). Wiring lives in `finalize_verify` (`pti_verify.cpp`); design review in `run_pipeline_staged`.
