@@ -386,8 +386,15 @@ shared chunk (the CONTRACT) is placed in the SYSTEM turn (`build_critic_system`)
 prefix-caches it once and delta-prefills only the per-item user turn (blueprint/test or code/siblings) — the
 same PA.2.1 clone+delta the other pools use.
 
-**Status.** Parsers (`test_critic_note`/`code_critic_note`) + the cacheable system builder are `--coord-test`
-R32–R34 (34/34, clean build). The adjudication LOOP (flip / grace / gate) is integration-level → **not
-unit-tested, GPU-pending.** Validate with two planted cases: a module that mis-calls a sibling getter (code
-critic fires + arbiter uses it) and a contract-wrong-but-passing test (flag → arbiter → test-rework → module
-bug surfaces). Wiring lives in `finalize_verify` (`pti_verify.cpp`); design review in `run_pipeline_staged`.
+**Status.** Parsers + the cacheable system builder are `--coord-test` R32–R34 (34/34, clean build).
+**GPU-validated 2026-07-01** (27B Qwen, KV-store task with an `isExpired` getter, `-s3 -c49152 --kv-q8`): all
+three critics fired end-to-end with the prefix cache active (529 tok cloned/lane). DESIGN REVIEW pinned the
+call-syntax addendum (`Entry.isExpired — GETTER — read as entry.isExpired (✓), NEVER entry.isExpired() (✗)`)
+and the implementers obeyed it → CODE CRITIC correctly found both modules clean (design review *prevented* the
+getter bug rather than the critic catching it). TEST CRITIC made two correct, spec-anchored CONTRACT-MISMATCH
+catches on generated tests (a negative-TTL test asserting *not expired* vs the contract's `ttlMs<0` = already
+expired; a lazy-delete test whose `Date.now()` stub left the entry un-expired), notes routed to the arbiter.
+**Still unexercised** (both want a planted fixture, not dice): the flagged-**passing** adjudication cascade
+(here the wrong tests *failed* → 0 flagged-passing) and the code-critic-catches-a-real-violation path (design
+review pre-empted it). Wiring lives in `finalize_verify` (`pti_verify.cpp`); design review in
+`run_pipeline_staged`.

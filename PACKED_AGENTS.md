@@ -197,6 +197,10 @@ bin/pti_agents -m model.gguf -p "task description" [-n max-per-piece] [--workers
   *currently passes* (the wrong-test class execution + the lint both miss) forces one arbiter adjudication —
   critic nominates, boss decides — with a one-round `flag_grace` so best-preservation doesn't revert the
   intended dip. Contract cached into the system turn (`build_critic_system`) so critic pools clone+delta like
-  every other pool. `--coord-test` 34/34; the adjudication loop is integration-level → next is a GPU staged run
-  (plant a getter mis-call + a contract-wrong-but-passing test). Cross-model diversity (2nd same-size model)
-  deferred — this is the single-model reviewer discipline, from the Onklaud-5 pipeline note (`pipelines.txt`).
+  every other pool. `--coord-test` 34/34. **GPU-validated (2026-07-01, 27B Qwen, KV-store w/ an `isExpired`
+  getter):** all three critics fired + prefix-cached; DESIGN REVIEW pinned the getter's call-syntax and the
+  implementers obeyed (→ CODE CRITIC correctly clean — the review *prevented* the bug); TEST CRITIC made 2
+  correct CONTRACT-MISMATCH catches on generated tests, routed to the arbiter. Still to prove via a planted
+  fixture (the wrong tests here *failed*, not passed): the flagged-**passing** adjudication cascade + a
+  code-critic *catch*. Cross-model diversity (2nd same-size model) deferred — single-model reviewer
+  discipline, from the Onklaud-5 pipeline note (`pipelines.txt`).
